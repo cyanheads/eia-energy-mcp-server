@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-05-29 05:01:04
+Generated on: 2026-06-02 14:13:47
 
 ```text
 eia-energy-mcp-server/
@@ -30,12 +30,14 @@ eia-energy-mcp-server/
 │   ├── build.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
 ├── skills/
@@ -62,6 +64,8 @@ eia-energy-mcp-server/
 │   ├── api-errors/
 │   │   └── SKILL.md
 │   ├── api-linter/
+│   │   └── SKILL.md
+│   ├── api-mirror/
 │   │   └── SKILL.md
 │   ├── api-services/
 │   │   ├── references/
@@ -90,6 +94,13 @@ eia-energy-mcp-server/
 │   ├── git-wrapup/
 │   │   └── SKILL.md
 │   ├── maintenance/
+│   │   └── SKILL.md
+│   ├── orchestrations/
+│   │   ├── workflows/
+│   │   │   ├── field-test-fix.md
+│   │   │   ├── fix-wrapup-release.md
+│   │   │   ├── greenfield-build.md
+│   │   │   └── maintenance-release.md
 │   │   └── SKILL.md
 │   ├── polish-docs-meta/
 │   │   ├── references/
@@ -140,14 +151,23 @@ eia-energy-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   ├── services/
-│   │   └── route-cache.test.ts
+│   │   ├── canvas-bridge.test.ts
+│   │   ├── normalize-description.test.ts
+│   │   ├── route-cache.test.ts
+│   │   └── sql-gate-extras.test.ts
 │   └── tools/
+│       ├── browse-routes-extra.tool.test.ts
 │       ├── browse-routes.tool.test.ts
+│       ├── dataframe-describe-extra.tool.test.ts
 │       ├── dataframe-describe.tool.test.ts
 │       ├── dataframe-drop.tool.test.ts
+│       ├── dataframe-query-extra.tool.test.ts
 │       ├── dataframe-query.tool.test.ts
+│       ├── describe-route-extra.tool.test.ts
 │       ├── describe-route.tool.test.ts
+│       ├── query-route-extra.tool.test.ts
 │       ├── query-route.tool.test.ts
+│       ├── search-routes-extra.tool.test.ts
 │       └── search-routes.tool.test.ts
 ├── .dockerignore
 ├── .env.example
