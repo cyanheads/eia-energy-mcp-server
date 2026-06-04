@@ -67,8 +67,9 @@ describe('queryRouteTool', () => {
     expect(result.data).toHaveLength(2);
     expect(result.frequency).toBe('monthly');
     expect(result.date_format).toBe('YYYY-MM');
+    expect(result.total).toBe(240);
+    expect(result.returned_count).toBe(2);
 
-    // total and returned_count moved to enrichment
     const enrichment = getEnrichment(ctx);
     expect(enrichment.totalCount).toBe(240);
     expect(enrichment.returnedCount).toBe(2);
@@ -86,7 +87,7 @@ describe('queryRouteTool', () => {
     expect(result.data[0]?.sales).toBe('9.13');
   });
 
-  it('returns structured empty data when filters match zero rows', async () => {
+  it('returns structured empty data when zero rows matched', async () => {
     mockQuery.mockResolvedValue({
       total: 0,
       dateFormat: 'YYYY-MM',
@@ -102,13 +103,13 @@ describe('queryRouteTool', () => {
     });
 
     const result = await queryRouteTool.handler(input, ctx);
+    expect(result.route).toBe('electricity/retail-sales');
+    expect(result.data).toHaveLength(0);
+    expect(result.total).toBe(0);
+    expect(result.returned_count).toBe(0);
+    expect(result.notice).toBeDefined();
+    expect(result.notice).toContain('eia_describe_route');
 
-    expect(result).toMatchObject({
-      route: 'electricity/retail-sales',
-      data: [],
-      frequency: 'monthly',
-      date_format: 'YYYY-MM',
-    });
     const enrichment = getEnrichment(ctx);
     expect(enrichment.totalCount).toBe(0);
     expect(enrichment.returnedCount).toBe(0);
@@ -168,6 +169,8 @@ describe('queryRouteTool', () => {
             'sales-units': 'million kilowatthours',
           },
         ],
+        total: 240,
+        returned_count: 1,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
       };
@@ -183,6 +186,8 @@ describe('queryRouteTool', () => {
       const result = {
         route: 'electricity/retail-sales',
         data: [{ period: '2024-01', value: '9.13' }],
+        total: 5000,
+        returned_count: 100,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
         canvas_id: 'df_ABCDE_FGHIJ',

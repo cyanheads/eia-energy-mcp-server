@@ -602,7 +602,12 @@ class EiaApiService {
 
     const response = resp?.response;
     if (!response) {
-      throw notFound(`Route "${route}" returned no data response.`, { reason: 'no_data' });
+      throw notFound(`Route "${route}" returned no data response.`, {
+        reason: 'no_data',
+        recovery: {
+          hint: 'Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.',
+        },
+      });
     }
 
     const total = parseInt(response.total ?? '0', 10);

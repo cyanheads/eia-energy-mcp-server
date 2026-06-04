@@ -84,8 +84,24 @@ export const queryRouteTool = tool('eia_query_route', {
       .describe(
         'Preview rows. All numeric values are strings per the EIA API (e.g. "9.13"). Cast to DOUBLE in SQL for arithmetic: CAST(value AS DOUBLE). Per-column units appear as {col}-units fields inline in each row. Keys are dynamic column IDs from the EIA route.',
       ),
+    total: z
+      .number()
+      .describe(
+        'Total matching rows in the EIA dataset for this query (may exceed returned rows when pagination or spillover applies).',
+      ),
+    returned_count: z
+      .number()
+      .describe(
+        'Number of rows in this response. When returned_count < total, use offset pagination or DataCanvas for the rest.',
+      ),
     frequency: z.string().describe('Frequency of the returned data.'),
     date_format: z.string().describe('Period format for the returned data (e.g. "YYYY-MM").'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Informational message when zero rows matched the filters — guidance for broadening the query.',
+      ),
     canvas_id: z
       .string()
       .optional()
@@ -159,9 +175,8 @@ export const queryRouteTool = tool('eia_query_route', {
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The requested date range is inverted before querying EIA.',
-      recovery:
-        'Swap start and end dates, or remove date constraints and retry the route query.',
+      when: 'Date range is inverted (start is after end).',
+      recovery: 'Swap start and end values — start must be earlier than or equal to end.',
     },
     {
       reason: 'length_exceeded',
@@ -236,8 +251,11 @@ export const queryRouteTool = tool('eia_query_route', {
     const result: {
       route: string;
       data: Array<Record<string, unknown>>;
+      total: number;
+      returned_count: number;
       frequency: string;
       date_format: string;
+      notice?: string;
       canvas_id?: string;
       dataset?: string;
       canvas_preview_note?: string;
@@ -245,9 +263,18 @@ export const queryRouteTool = tool('eia_query_route', {
     } = {
       route: input.route,
       data: dataResp.data,
+      total: dataResp.total,
+      returned_count: dataResp.data.length,
       frequency: dataResp.frequency,
       date_format: dataResp.dateFormat,
     };
+
+    // Zero-row result is a valid success — return structured empty data with guidance.
+    if (dataResp.total === 0 && dataResp.data.length === 0) {
+      result.notice =
+        'No rows matched the filters. Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.';
+      return result;
+    }
 
     // Forward EIA server-side truncation warnings
     if (dataResp.warnings?.length) {
@@ -302,8 +329,13 @@ export const queryRouteTool = tool('eia_query_route', {
     const lines: string[] = [];
 
     lines.push(`## Query: ${result.route}`);
-    lines.push(`**Frequency:** ${result.frequency} | **Date format:** ${result.date_format}\n`);
+    lines.push(
+      `**Frequency:** ${result.frequency} | **Date format:** ${result.date_format} | **Rows:** ${result.returned_count.toLocaleString()} of ${result.total.toLocaleString()}\n`,
+    );
 
+    if (result.notice) {
+      lines.push(`> ${result.notice}\n`);
+    }
     if (result.canvas_preview_note) {
       lines.push(`> ${result.canvas_preview_note}\n`);
     }
