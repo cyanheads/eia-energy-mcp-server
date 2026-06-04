@@ -116,6 +116,10 @@ describe('queryRouteTool', () => {
     expect(enrichment.notice).toMatch(/No rows matched/);
   });
 
+  it('declares the empty-result notice in the enrichment contract', () => {
+    expect(queryRouteTool.enrichment).toHaveProperty('notice');
+  });
+
   it('forwards truncation_warning from EIA warnings', async () => {
     mockQuery.mockResolvedValue({
       ...SAMPLE_DATA_RESPONSE,

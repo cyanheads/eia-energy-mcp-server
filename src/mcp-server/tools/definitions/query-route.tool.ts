@@ -124,6 +124,12 @@ export const queryRouteTool = tool('eia_query_route', {
       .record(z.string(), z.union([z.string(), z.array(z.string())]))
       .optional()
       .describe('Facet filters applied to the query, when provided.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery hint when a valid route query returns no rows for the supplied filters or date range.',
+      ),
   },
   enrichmentTrailer: {
     appliedFilters: {
