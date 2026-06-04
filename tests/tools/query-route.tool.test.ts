@@ -114,11 +114,21 @@ describe('queryRouteTool', () => {
     expect(enrichment.totalCount).toBe(0);
     expect(enrichment.returnedCount).toBe(0);
     expect(enrichment.appliedFilters).toEqual({ stateid: 'ZZ' });
-    expect(enrichment.notice).toMatch(/No rows matched/);
   });
 
-  it('declares the empty-result notice in the enrichment contract', () => {
-    expect(queryRouteTool.enrichment).toHaveProperty('notice');
+  it('declares the empty-result notice in output without an enrichment collision', () => {
+    const parsed = queryRouteTool.output.parse({
+      route: 'electricity/retail-sales',
+      data: [],
+      total: 0,
+      returned_count: 0,
+      frequency: 'monthly',
+      date_format: 'YYYY-MM',
+      notice: 'No rows matched the filters.',
+    });
+
+    expect(parsed.notice).toBe('No rows matched the filters.');
+    expect(queryRouteTool.enrichment).not.toHaveProperty('notice');
   });
 
   it('forwards truncation_warning from EIA warnings', async () => {

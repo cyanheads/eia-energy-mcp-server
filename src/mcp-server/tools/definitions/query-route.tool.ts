@@ -140,12 +140,6 @@ export const queryRouteTool = tool('eia_query_route', {
       .record(z.string(), z.union([z.string(), z.array(z.string())]))
       .optional()
       .describe('Facet filters applied to the query, when provided.'),
-    notice: z
-      .string()
-      .optional()
-      .describe(
-        'Recovery hint when a valid route query returns no rows for the supplied filters or date range.',
-      ),
   },
   enrichmentTrailer: {
     appliedFilters: {
@@ -242,11 +236,6 @@ export const queryRouteTool = tool('eia_query_route', {
           appliedFilters: input.filters,
         }),
     });
-    if (dataResp.data.length === 0) {
-      ctx.enrich.notice(
-        `No rows matched route "${input.route}" for the supplied filters/date range. Adjust filters or call eia_describe_route to verify valid facet values.`,
-      );
-    }
 
     const result: {
       route: string;
