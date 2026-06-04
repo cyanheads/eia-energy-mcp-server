@@ -310,6 +310,8 @@ describe('queryRouteTool — additional coverage', () => {
       const result = {
         route: 'steo',
         data: [{ period: '2024-01', description: 'value | with | pipes' }],
+        total: 1,
+        returned_count: 1,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
       };
@@ -322,6 +324,8 @@ describe('queryRouteTool — additional coverage', () => {
       const result = {
         route: 'steo',
         data: [],
+        total: 0,
+        returned_count: 0,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
       };
@@ -340,6 +344,8 @@ describe('queryRouteTool — additional coverage', () => {
             'sales-units': 'million kilowatthours',
           },
         ],
+        total: 1,
+        returned_count: 1,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
       };
@@ -355,6 +361,8 @@ describe('queryRouteTool — additional coverage', () => {
       const result = {
         route: 'steo',
         data: [{ period: '2024-01', value: '1.23' }],
+        total: 1,
+        returned_count: 1,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
         truncation_warning: 'Results may be truncated near the 5000 row limit',
@@ -368,6 +376,8 @@ describe('queryRouteTool — additional coverage', () => {
       const result = {
         route: 'steo',
         data: [{ period: '2024-01', value: null }],
+        total: 1,
+        returned_count: 1,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
       };
