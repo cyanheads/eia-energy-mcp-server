@@ -153,9 +153,9 @@ export const queryRouteTool = tool('eia_query_route', {
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Route exists but filters yield zero rows.',
+      when: 'The requested date range is inverted before querying EIA.',
       recovery:
-        'Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.',
+        'Swap start and end dates, or remove date constraints and retry the route query.',
     },
     {
       reason: 'length_exceeded',
@@ -211,17 +211,6 @@ export const queryRouteTool = tool('eia_query_route', {
       ctx,
     );
 
-    if (dataResp.total === 0 && dataResp.data.length === 0) {
-      throw ctx.fail(
-        'no_data',
-        `Route "${input.route}" returned zero rows for the given filters.`,
-        {
-          route: input.route,
-          ...ctx.recoveryFor('no_data'),
-        },
-      );
-    }
-
     // Populate enrichment — reaches both structuredContent and content[] trailer.
     ctx.enrich({
       effectiveRoute: input.route,
@@ -232,6 +221,11 @@ export const queryRouteTool = tool('eia_query_route', {
           appliedFilters: input.filters,
         }),
     });
+    if (dataResp.data.length === 0) {
+      ctx.enrich.notice(
+        `No rows matched route "${input.route}" for the supplied filters/date range. Adjust filters or call eia_describe_route to verify valid facet values.`,
+      );
+    }
 
     const result: {
       route: string;

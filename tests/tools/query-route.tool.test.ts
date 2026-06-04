@@ -86,7 +86,7 @@ describe('queryRouteTool', () => {
     expect(result.data[0]?.sales).toBe('9.13');
   });
 
-  it('throws no_data when zero rows returned', async () => {
+  it('returns structured empty data when filters match zero rows', async () => {
     mockQuery.mockResolvedValue({
       total: 0,
       dateFormat: 'YYYY-MM',
@@ -101,10 +101,19 @@ describe('queryRouteTool', () => {
       filters: { stateid: 'ZZ' },
     });
 
-    await expect(queryRouteTool.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_data' },
+    const result = await queryRouteTool.handler(input, ctx);
+
+    expect(result).toMatchObject({
+      route: 'electricity/retail-sales',
+      data: [],
+      frequency: 'monthly',
+      date_format: 'YYYY-MM',
     });
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(0);
+    expect(enrichment.returnedCount).toBe(0);
+    expect(enrichment.appliedFilters).toEqual({ stateid: 'ZZ' });
+    expect(enrichment.notice).toMatch(/No rows matched/);
   });
 
   it('forwards truncation_warning from EIA warnings', async () => {
