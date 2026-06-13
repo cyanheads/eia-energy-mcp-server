@@ -1,8 +1,8 @@
 /**
  * @fileoverview Tool definition for eia_dataframe_query. Runs a single-statement
- * SELECT against canvas dataframes registered by eia_query_route. Four-layer
- * read-only enforcement: text deny-list, statement count, statement type, and
- * EXPLAIN-plan walk in the framework; plus bridge-layer system-catalog deny.
+ * SELECT against canvas dataframes registered by eia_query_route. Read-only
+ * enforcement in the framework SQL gate: text deny-list, statement count,
+ * statement type, EXPLAIN-plan walk, and system-catalog deny (denySystemCatalogs).
  * EIA data values are VARCHAR — cast to DOUBLE for arithmetic.
  * @module mcp-server/tools/definitions/dataframe-query.tool
  */
@@ -14,7 +14,7 @@ import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 export const dataframeQueryTool = tool('eia_dataframe_query', {
   title: 'Query EIA Dataframes',
   description:
-    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied at the bridge layer. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh TTL.',
+    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh TTL.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [

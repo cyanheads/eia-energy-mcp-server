@@ -69,8 +69,8 @@ describe('dataframeQueryTool — additional coverage', () => {
 
   describe('system catalog injection', () => {
     it('blocks information_schema access', async () => {
-      // The bridge calls assertNoSystemCatalogAccess before query execution.
-      // The mock simulates the bridge throwing a ValidationError as it would.
+      // The bridge passes denySystemCatalogs to the framework SQL gate, which
+      // throws a ValidationError on catalog references. The mock simulates that.
       const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
       mockQuery.mockRejectedValue(
         validationError('SQL references a denied system catalog: information_schema.', {

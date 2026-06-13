@@ -18,7 +18,6 @@ import {
 } from '@cyanheads/mcp-ts-core/canvas';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { assertNoSystemCatalogAccess } from './sql-gate-extras.js';
 
 /** Per-table provenance + TTL metadata persisted in ctx.state. */
 export interface DataframeMeta {
@@ -143,11 +142,11 @@ export class CanvasBridge {
     sql: string,
     options: BridgeQueryOptions = {},
   ): Promise<{ result: QueryResult; meta?: DataframeMeta }> {
-    assertNoSystemCatalogAccess(sql);
     await this.sweepExpired(ctx);
     const instance = await this.acquireSharedCanvas(ctx);
 
     const result = await instance.query(sql, {
+      denySystemCatalogs: true,
       ...(options.preview !== undefined && { preview: options.preview }),
       ...(options.rowLimit !== undefined && { rowLimit: options.rowLimit }),
       ...(options.registerAs !== undefined && { registerAs: options.registerAs }),
