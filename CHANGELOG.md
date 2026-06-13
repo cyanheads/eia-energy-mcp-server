@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.7](changelog/0.2.x/0.2.7.md) — 2026-06-13
+
+Fix DataCanvas spillover for EIA's {col}-units columns; echo applied query inputs in eia_query_route and the executed SQL in eia_dataframe_query; declare system_catalog_access in the error contract
+
 ## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-06-12
 
 Adopt @cyanheads/mcp-ts-core ^0.10.6; server-level instructions; eia_search_routes truncation fields; canvas-bridge uses the framework system-catalog gate

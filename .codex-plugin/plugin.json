@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/eia-energy-mcp-server",
-  "version": "0.2.2",
+  "version": "0.2.7",
   "description": "Browse and query the U.S. Energy Information Administration API v2 — electricity, petroleum, natural gas, coal, forecasts, and more via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",

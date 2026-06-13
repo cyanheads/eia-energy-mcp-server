@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** @cyanheads/eia-energy-mcp-server
-**Version:** 0.2.6
+**Version:** 0.2.7
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.6`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 
@@ -222,7 +222,7 @@ src/
 
 **Retry / rate limits:** Wrap fetch + parse in `withRetry`. DEMO_KEY hits limits quickly; production keys have higher caps. Detect EIA's `OVER_RATE_LIMIT` response and classify as `ServiceUnavailable` (retryable).
 
-**DataCanvas:** Opt-in via `CANVAS_PROVIDER_TYPE=duckdb`. Check `ctx.core.canvas?` at runtime; degrade gracefully to preview-only when absent. Large result sets (total > length) spill to canvas and return a `canvas_id` for SQL queries.
+**DataCanvas:** Opt-in via `CANVAS_PROVIDER_TYPE=duckdb`. Check `ctx.core.canvas?` at runtime; degrade gracefully to preview-only when absent. Large result sets (total > length) spill to canvas and return a `canvas_id` for SQL queries. Column names are sanitized to the canvas identifier shape before registration — EIA's hyphenated `{col}-units` companions become `{col}_units` in the staged table (the inline preview keeps the hyphenated names); query the sanitized names, which `eia_dataframe_describe` reports.
 
 ---
 
