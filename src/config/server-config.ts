@@ -17,7 +17,7 @@ const ServerConfigSchema = z.object({
     .default(86400)
     .describe('Per-table TTL for canvas dataframes in seconds (default 24 h)'),
   dataframeDropEnabled: z
-    .preprocess((v) => v === 'true' || v === true, z.boolean())
+    .stringbool()
     .default(false)
     .describe('Expose eia_dataframe_drop when true'),
 });
