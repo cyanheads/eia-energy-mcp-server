@@ -24,6 +24,12 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       when: 'DataCanvas service is not configured for this deployment.',
       recovery: 'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable dataframes.',
     },
+    {
+      reason: 'system_catalog_access',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'SQL references a denied system catalog (information_schema, pg_catalog, sqlite_master, duckdb_*).',
+      recovery: 'Query only df_<id> tables — list them with eia_dataframe_describe.',
+    },
   ],
 
   input: z.object({
@@ -82,6 +88,9 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       .number()
       .describe('Total rows the query produced (may exceed rows.length when capped by row_limit).'),
     returnedRows: z.number().describe('Rows included in this response.'),
+    executedSql: z
+      .string()
+      .describe('Echo of the SQL statement that was executed — confirms the exact query that ran.'),
     notice: z
       .string()
       .optional()
@@ -110,7 +119,11 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       registeredAs: meta?.tableName,
     });
 
-    ctx.enrich({ totalRows: result.rowCount, returnedRows: result.rows.length });
+    ctx.enrich({
+      totalRows: result.rowCount,
+      returnedRows: result.rows.length,
+      executedSql: input.sql,
+    });
     if (result.rowCount > result.rows.length) {
       ctx.enrich.notice(
         `Showing ${result.rows.length.toLocaleString()} of ${result.rowCount.toLocaleString()} rows — increase row_limit or use register_as to chain into a new dataframe.`,

@@ -190,6 +190,40 @@ describe('queryRouteTool — additional coverage', () => {
     expect(enrichment.appliedFilters).toBeUndefined();
   });
 
+  it('echoes appliedStart/appliedEnd/appliedFrequency/appliedColumns when provided', async () => {
+    mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      start: '2024-01',
+      end: '2024-12',
+      frequency: 'monthly',
+      columns: ['sales', 'revenue'],
+    });
+    await queryRouteTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.appliedStart).toBe('2024-01');
+    expect(enrichment.appliedEnd).toBe('2024-12');
+    expect(enrichment.appliedFrequency).toBe('monthly');
+    expect(enrichment.appliedColumns).toEqual(['sales', 'revenue']);
+  });
+
+  it('omits applied-echo enrichment fields when not provided', async () => {
+    mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    await queryRouteTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.appliedStart).toBeUndefined();
+    expect(enrichment.appliedEnd).toBeUndefined();
+    expect(enrichment.appliedFrequency).toBeUndefined();
+    expect(enrichment.appliedColumns).toBeUndefined();
+  });
+
   // ------------------------------------------------------------------
   // Canvas: spillover with explicit canvas_id reuse
   // ------------------------------------------------------------------

@@ -140,6 +140,22 @@ export const queryRouteTool = tool('eia_query_route', {
       .record(z.string(), z.union([z.string(), z.array(z.string())]))
       .optional()
       .describe('Facet filters applied to the query, when provided.'),
+    appliedStart: z
+      .string()
+      .optional()
+      .describe('Echo of the start period as applied, when a start was provided.'),
+    appliedEnd: z
+      .string()
+      .optional()
+      .describe('Echo of the end period as applied, when an end was provided.'),
+    appliedFrequency: z
+      .string()
+      .optional()
+      .describe('Echo of the frequency as applied, when a frequency was provided.'),
+    appliedColumns: z
+      .array(z.string())
+      .optional()
+      .describe('Echo of the column projection as applied, when columns were provided.'),
   },
   enrichmentTrailer: {
     appliedFilters: {
@@ -150,6 +166,12 @@ export const queryRouteTool = tool('eia_query_route', {
           .join('\n');
         return `**Applied Filters:**\n${entries}`;
       },
+    },
+    appliedColumns: {
+      render: (columns) =>
+        columns && columns.length > 0
+          ? `**Applied Columns:** ${columns.join(', ')}`
+          : (null as unknown as string),
     },
   },
 
@@ -235,6 +257,11 @@ export const queryRouteTool = tool('eia_query_route', {
         Object.keys(input.filters).length > 0 && {
           appliedFilters: input.filters,
         }),
+      ...(input.start !== undefined && { appliedStart: input.start }),
+      ...(input.end !== undefined && { appliedEnd: input.end }),
+      ...(input.frequency !== undefined && { appliedFrequency: input.frequency }),
+      ...(input.columns !== undefined &&
+        input.columns.length > 0 && { appliedColumns: input.columns }),
     });
 
     const result: {

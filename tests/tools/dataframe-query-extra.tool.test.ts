@@ -6,7 +6,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import * as canvasBridge from '@/services/canvas-bridge/canvas-bridge.js';
@@ -85,6 +85,7 @@ describe('dataframeQueryTool — additional coverage', () => {
 
       await expect(dataframeQueryTool.handler(input, ctx)).rejects.toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'system_catalog_access' },
       });
     });
 
@@ -100,6 +101,12 @@ describe('dataframeQueryTool — additional coverage', () => {
       const input = dataframeQueryTool.input.parse({ sql: 'SELECT * FROM duckdb_tables()' });
 
       await expect(dataframeQueryTool.handler(input, ctx)).rejects.toBeDefined();
+    });
+
+    it('declares system_catalog_access in the errors[] contract (#21)', () => {
+      const entry = dataframeQueryTool.errors?.find((e) => e.reason === 'system_catalog_access');
+      expect(entry).toBeDefined();
+      expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
     });
   });
 
@@ -129,6 +136,24 @@ describe('dataframeQueryTool — additional coverage', () => {
     // Tool output object (if any) must not contain the secret
     const errStr = JSON.stringify(caught);
     expect(errStr).not.toContain('SECRET_DB_PASSWORD_XYZ');
+  });
+
+  // ------------------------------------------------------------------
+  // Enrichment: executed SQL echo (#23)
+  // ------------------------------------------------------------------
+
+  it('echoes the executed SQL in enrichment', async () => {
+    mockQuery.mockResolvedValue({
+      result: { columns: ['period'], rows: [{ period: '2024-01' }], rowCount: 1 },
+    });
+
+    const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+    const sql = 'WITH t AS (SELECT period FROM df_TEST) SELECT * FROM t ORDER BY period';
+    const input = dataframeQueryTool.input.parse({ sql });
+    await dataframeQueryTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.executedSql).toBe(sql);
   });
 
   // ------------------------------------------------------------------
