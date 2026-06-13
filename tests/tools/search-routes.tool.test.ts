@@ -60,10 +60,14 @@ describe('searchRoutesTool', () => {
     expect(result.results[0]?.score).toBe(0.05);
     expect(result.results[0]?.isLeaf).toBe(true);
 
-    // totalIndexed moved to enrichment
+    // totalIndexed moved to enrichment; truncation fields always populated
     const enrichment = getEnrichment(ctx);
     expect(enrichment.totalIndexed).toBe(150);
     expect(enrichment.effectiveQuery).toBe('retail electricity');
+    // 2 results under the default cap of 10 — not truncated.
+    expect(enrichment.truncated).toBe(false);
+    expect(enrichment.shown).toBe(2);
+    expect(enrichment.cap).toBe(10);
   });
 
   it('returns empty results on no match', async () => {
@@ -75,10 +79,38 @@ describe('searchRoutesTool', () => {
 
     expect(result.results).toHaveLength(0);
 
-    // totalIndexed and notice in enrichment
+    // totalIndexed and notice in enrichment; required truncation fields still
+    // populated so the effective-output parse does not reject the empty result.
     const enrichment = getEnrichment(ctx);
     expect(enrichment.totalIndexed).toBe(150);
     expect(enrichment.notice).toMatch(/No routes matched/);
+    expect(enrichment.truncated).toBe(false);
+    expect(enrichment.shown).toBe(0);
+    expect(enrichment.cap).toBe(10);
+  });
+
+  it('flags truncation when results reach the limit', async () => {
+    const entries = Array.from({ length: 5 }, (_, i) => ({
+      entry: {
+        route: `electricity/r${i}`,
+        name: `Route ${i}`,
+        description: 'desc',
+        isLeaf: true,
+        category: 'electricity',
+      },
+      score: 0.1,
+    }));
+    mockSearch.mockResolvedValue({ results: entries, totalIndexed: 150 });
+
+    const ctx = createMockContext();
+    const input = searchRoutesTool.input.parse({ query: 'electricity', limit: 5 });
+    await searchRoutesTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.shown).toBe(5);
+    expect(enrichment.cap).toBe(5);
+    expect(enrichment.notice).toMatch(/More matches may exist/);
   });
 
   it('respects limit parameter', async () => {

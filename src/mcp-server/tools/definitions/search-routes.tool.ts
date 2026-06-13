@@ -64,6 +64,9 @@ export const searchRoutesTool = tool('eia_search_routes', {
     totalIndexed: z
       .number()
       .describe('Total entries in the search index (routes + STEO series names).'),
+    truncated: z.boolean().describe('True when matches were capped at limit; more may exist.'),
+    shown: z.number().describe('Number of results returned.'),
+    cap: z.number().describe('The limit that was applied.'),
     notice: z
       .string()
       .optional()
@@ -78,11 +81,17 @@ export const searchRoutesTool = tool('eia_search_routes', {
     const { results, totalIndexed } = await service.search(input.query, input.limit, ctx);
 
     ctx.enrich.echo(input.query);
-    ctx.enrich({ totalIndexed });
+    ctx.enrich({ totalIndexed, shown: results.length, cap: input.limit, truncated: false });
     if (results.length === 0) {
       ctx.enrich.notice(
         `No routes matched "${input.query}". Try different search terms or use eia_browse_routes to explore the taxonomy.`,
       );
+    } else if (results.length >= input.limit) {
+      ctx.enrich.truncated({
+        shown: results.length,
+        cap: input.limit,
+        guidance: 'More matches may exist — narrow the query or raise limit (max 30).',
+      });
     }
 
     return {
