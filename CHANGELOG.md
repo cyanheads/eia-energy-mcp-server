@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-06-12
+
+Adopt @cyanheads/mcp-ts-core ^0.10.6; server-level instructions; eia_search_routes truncation fields; canvas-bridge uses the framework system-catalog gate
+
 ## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-06-04
 
 eia_query_route: zero-row results return structured data instead of throwing; total and returned_count added to output

@@ -1,9 +1,10 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-06-02 14:13:47
+Generated on: 2026-06-12 03:35:07
 
 ```text
 eia-energy-mcp-server/
+├── .agents/
 ├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
@@ -32,6 +33,7 @@ eia-energy-mcp-server/
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
@@ -119,6 +121,10 @@ eia-energy-mcp-server/
 │   │   └── SKILL.md
 │   ├── setup/
 │   │   └── SKILL.md
+│   ├── techniques/
+│   │   ├── references/
+│   │   │   └── outline-on-overflow.md
+│   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
 ├── src/
@@ -140,8 +146,7 @@ eia-energy-mcp-server/
 │   │           └── search-routes.tool.ts
 │   ├── services/
 │   │   ├── canvas-bridge/
-│   │   │   ├── canvas-bridge.ts
-│   │   │   └── sql-gate-extras.ts
+│   │   │   └── canvas-bridge.ts
 │   │   └── eia/
 │   │       ├── eia-service.ts
 │   │       ├── route-cache.ts
@@ -153,8 +158,7 @@ eia-energy-mcp-server/
 │   ├── services/
 │   │   ├── canvas-bridge.test.ts
 │   │   ├── normalize-description.test.ts
-│   │   ├── route-cache.test.ts
-│   │   └── sql-gate-extras.test.ts
+│   │   └── route-cache.test.ts
 │   └── tools/
 │       ├── browse-routes-extra.tool.test.ts
 │       ├── browse-routes.tool.test.ts
