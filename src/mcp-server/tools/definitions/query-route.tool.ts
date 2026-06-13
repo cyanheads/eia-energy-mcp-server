@@ -168,7 +168,7 @@ export const queryRouteTool = tool('eia_query_route', {
     },
     {
       reason: 'no_data',
-      code: JsonRpcErrorCode.NotFound,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Date range is inverted (start is after end).',
       recovery: 'Swap start and end values — start must be earlier than or equal to end.',
     },

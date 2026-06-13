@@ -108,7 +108,7 @@ describe('queryRouteTool — additional coverage', () => {
       });
 
       await expect(queryRouteTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.NotFound,
+        code: JsonRpcErrorCode.ValidationError,
         data: { reason: 'no_data' },
       });
 
