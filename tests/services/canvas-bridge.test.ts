@@ -6,7 +6,11 @@
 
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it, vi } from 'vitest';
-import { CanvasBridge, deriveAllNullableSchema } from '@/services/canvas-bridge/canvas-bridge.js';
+import {
+  CanvasBridge,
+  deriveAllNullableSchema,
+  sanitizeColumnName,
+} from '@/services/canvas-bridge/canvas-bridge.js';
 
 // ---------------------------------------------------------------------------
 // deriveAllNullableSchema — pure logic
@@ -48,6 +52,35 @@ describe('deriveAllNullableSchema', () => {
     for (const col of schema) {
       expect(col.nullable).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sanitizeColumnName — canvas identifier normalization (#25)
+// ---------------------------------------------------------------------------
+
+describe('sanitizeColumnName', () => {
+  it('replaces the hyphen in {col}-units companion columns with an underscore', () => {
+    expect(sanitizeColumnName('revenue-units')).toBe('revenue_units');
+    expect(sanitizeColumnName('value-units')).toBe('value_units');
+  });
+
+  it('leaves already-valid identifiers unchanged', () => {
+    expect(sanitizeColumnName('period')).toBe('period');
+    expect(sanitizeColumnName('value_2')).toBe('value_2');
+    expect(sanitizeColumnName('_hidden')).toBe('_hidden');
+  });
+
+  it('prefixes an underscore when the name starts with a digit', () => {
+    expect(sanitizeColumnName('2024total')).toBe('_2024total');
+  });
+
+  it('replaces every character outside [A-Za-z0-9_]', () => {
+    expect(sanitizeColumnName('a.b c-d')).toBe('a_b_c_d');
+  });
+
+  it('caps the result at the 63-char identifier limit', () => {
+    expect(sanitizeColumnName('x'.repeat(100))).toHaveLength(63);
   });
 });
 
@@ -124,6 +157,57 @@ describe('CanvasBridge', () => {
       });
 
       expect(result).toBeUndefined();
+    });
+
+    // Regression for #25: EIA's {col}-units companion columns carry a hyphen the
+    // canvas identifier gate rejects, which previously made registration silently
+    // return undefined (canvas_id: null) for nearly every data query.
+    it('sanitizes hyphenated {col}-units columns before registration', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      mockInstance.registerTable.mockResolvedValue({ tableName: 'df_AB_CD', rowCount: 2 });
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+
+      const result = await bridge.registerDataframe(ctx, {
+        rows: [
+          { period: '2024-01', revenue: '9.13', 'revenue-units': 'million dollars' },
+          { period: '2024-02', revenue: '8.45', 'revenue-units': 'million dollars' },
+        ],
+        sourceTool: 'eia_query_route',
+        queryParams: { route: 'electricity/retail-sales' },
+      });
+
+      expect(result).toBeDefined();
+      expect(mockInstance.registerTable).toHaveBeenCalledTimes(1);
+      const [, rows, opts] = mockInstance.registerTable.mock.calls[0] as [
+        string,
+        Record<string, unknown>[],
+        { schema: { name: string }[] },
+      ];
+      const schemaNames = opts.schema.map((c) => c.name);
+      expect(schemaNames).toContain('revenue_units');
+      expect(schemaNames).not.toContain('revenue-units');
+      // The appender reads row[col.name], so the row keys must match the schema.
+      expect(Object.keys(rows[0] ?? {})).toContain('revenue_units');
+      expect(rows[0]?.revenue_units).toBe('million dollars');
+      // Stored metadata advertises the sanitized names via eia_dataframe_describe.
+      expect(result?.columnSchema.map((c) => c.name)).toContain('revenue_units');
+    });
+
+    it('does not mutate the caller rows (inline preview keeps {col}-units keys)', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      mockInstance.registerTable.mockResolvedValue({ tableName: 'df_X', rowCount: 1 });
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+
+      const original = [{ period: '2024-01', 'value-units': 'MMBtu' }];
+      await bridge.registerDataframe(ctx, {
+        rows: original,
+        sourceTool: 'eia_query_route',
+        queryParams: {},
+      });
+
+      expect(Object.keys(original[0] ?? {})).toContain('value-units');
     });
   });
 

@@ -1,8 +1,10 @@
 /**
  * @fileoverview Adapter between EIA tools and the framework DataCanvas
- * primitive. Mints df_<id> table handles, derives all-nullable column schemas
- * (EIA data values are all strings), tracks per-table TTL and provenance in
- * ctx.state, and lazy-sweeps expired tables on every public operation.
+ * primitive. Mints df_<id> table handles, sanitizes column identifiers to the
+ * canvas identifier shape (EIA's {col}-units companion columns carry a hyphen
+ * the gate rejects), derives all-nullable column schemas (EIA data values are
+ * all strings), tracks per-table TTL and provenance in ctx.state, and
+ * lazy-sweeps expired tables on every public operation.
  * Best-effort: failed canvas operations log a warning and return undefined so
  * the caller's inline response remains useful.
  * @module services/canvas-bridge/canvas-bridge
@@ -68,6 +70,54 @@ export function deriveAllNullableSchema(rows: Record<string, unknown>[]): Column
   return inferSchemaFromRows(rows).map((col) => ({ ...col, nullable: true }));
 }
 
+/**
+ * Sanitize a column name to the canvas identifier shape
+ * (`/^[A-Za-z_][A-Za-z0-9_]{0,62}$/`). EIA emits paired `{col}` / `{col}-units`
+ * companion columns; the framework's canvas identifier gate rejects the hyphen
+ * (`reason: 'identifier_shape'`). Characters outside `[A-Za-z0-9_]` become
+ * underscores, a leading non-letter/underscore gets an underscore prefix, and
+ * the result is capped at the 63-char identifier limit.
+ */
+export function sanitizeColumnName(name: string): string {
+  const replaced = name.replace(/[^A-Za-z0-9_]/g, '_');
+  const prefixed = /^[A-Za-z_]/.test(replaced) ? replaced : `_${replaced}`;
+  return prefixed.slice(0, 63);
+}
+
+/**
+ * Remap row keys to canvas-safe column identifiers, returning new row objects so
+ * the caller's inline preview keeps the original `{col}-units` keys for display.
+ * The original→safe map is built once from the union of all row keys, so the
+ * DuckDB appender — which reads `row[col.name]` per schema column — finds every
+ * value even when a column is sparse; collisions (two source columns sanitizing
+ * to the same identifier) are disambiguated with a numeric suffix.
+ */
+export function sanitizeRowsForCanvas(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  const renameMap = new Map<string, string>();
+  const used = new Set<string>();
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (renameMap.has(key)) continue;
+      let safe = sanitizeColumnName(key);
+      if (used.has(safe)) {
+        let suffix = 2;
+        while (used.has(`${safe}_${suffix}`)) suffix++;
+        safe = `${safe}_${suffix}`;
+      }
+      used.add(safe);
+      renameMap.set(key, safe);
+    }
+  }
+
+  return rows.map((row) => {
+    const remapped: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      remapped[renameMap.get(key) ?? key] = value;
+    }
+    return remapped;
+  });
+}
+
 export class CanvasBridge {
   constructor(private readonly canvas: DataCanvas) {}
 
@@ -86,9 +136,13 @@ export class CanvasBridge {
       await this.sweepExpired(ctx);
       const instance = await this.acquireSharedCanvas(ctx);
       const tableName = this.mintTableName();
-      const schema = deriveAllNullableSchema(options.rows);
+      // EIA's {col}-units companion columns carry a hyphen the canvas identifier
+      // gate rejects; sanitize keys before registration. options.rows (the
+      // caller's inline preview) keeps the original names.
+      const safeRows = sanitizeRowsForCanvas(options.rows);
+      const schema = deriveAllNullableSchema(safeRows);
 
-      const result = await instance.registerTable(tableName, options.rows, { schema });
+      const result = await instance.registerTable(tableName, safeRows, { schema });
 
       const now = Date.now();
       const ttlMs = getServerConfig().datasetTtlSeconds * 1000;
