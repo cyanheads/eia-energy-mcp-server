@@ -1,5 +1,5 @@
 {
-  "@cyanheads/eia-energy-mcp-server": {
+  "eia-energy-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/eia-energy-mcp-server"],
     "env": {

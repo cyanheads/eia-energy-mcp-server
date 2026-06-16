@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/eia-energy-mcp-server",
+  "name": "eia-energy-mcp-server",
   "version": "0.2.7",
   "description": "Browse and query the U.S. Energy Information Administration API v2 — electricity, petroleum, natural gas, coal, forecasts, and more via MCP. STDIO or Streamable HTTP.",
   "author": {
@@ -13,7 +13,7 @@
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "eia", "energy", "electricity"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/eia-energy-mcp-server",
+    "displayName": "eia-energy-mcp-server",
     "shortDescription": "Browse and query the U.S. Energy Information Administration API v2 — electricity, petroleum, natural gas, coal, forecasts, and more via MCP.",
     "longDescription": "",
     "developerName": "cyanheads",
