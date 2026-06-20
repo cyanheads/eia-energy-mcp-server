@@ -1,6 +1,6 @@
 {
   "name": "eia-energy-mcp-server",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Browse and query the U.S. Energy Information Administration API v2 — electricity, petroleum, natural gas, coal, forecasts, and more via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "eia-energy-mcp-server",
     "shortDescription": "Browse and query the U.S. Energy Information Administration API v2 — electricity, petroleum, natural gas, coal, forecasts, and more via MCP.",
-    "longDescription": "",
+    "longDescription": "Browse and query the U.S. Energy Information Administration (EIA) API v2 across electricity, petroleum, natural gas, coal, and short-term energy forecasts. A two-phase workflow drives discovery before retrieval: browse or search the dataset route taxonomy, describe a leaf route to surface its facets and columns, then query it with facet-ID filters. Large result sets spill to a DuckDB-backed canvas table you can analyze with SQL. Runs over STDIO or Streamable HTTP and requires a free EIA_API_KEY.",
     "developerName": "cyanheads",
     "category": "data",
     "capabilities": ["Read"],
