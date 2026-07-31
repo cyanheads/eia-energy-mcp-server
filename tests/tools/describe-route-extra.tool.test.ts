@@ -6,7 +6,8 @@
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { _resetServerConfig } from '@/config/server-config.js';
 import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
 import * as eiaService from '@/services/eia/eia-service.js';
 
@@ -20,10 +21,17 @@ const mockDescribe = vi.fn();
 
 describe('describeRouteTool — additional coverage', () => {
   beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    _resetServerConfig();
     vi.mocked(eiaService.getEiaApiService).mockReturnValue({
       describe: mockDescribe,
     } as unknown as ReturnType<typeof eiaService.getEiaApiService>);
     mockDescribe.mockReset();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    _resetServerConfig();
   });
 
   // ------------------------------------------------------------------
@@ -39,6 +47,22 @@ describe('describeRouteTool — additional coverage', () => {
       expect(() =>
         describeRouteTool.input.parse({ route: 'electricity/retail-sales' }),
       ).not.toThrow();
+    });
+
+    it('rejects an empty facet string (min 1)', () => {
+      expect(() => describeRouteTool.input.parse({ route: 'steo', facet: '' })).toThrow();
+    });
+
+    it('rejects a negative values_offset', () => {
+      expect(() => describeRouteTool.input.parse({ route: 'steo', values_offset: -1 })).toThrow();
+    });
+
+    it('rejects a fractional values_offset', () => {
+      expect(() => describeRouteTool.input.parse({ route: 'steo', values_offset: 1.5 })).toThrow();
+    });
+
+    it('defaults values_offset to 0', () => {
+      expect(describeRouteTool.input.parse({ route: 'steo' }).values_offset).toBe(0);
     });
   });
 
@@ -139,7 +163,16 @@ describe('describeRouteTool — additional coverage', () => {
     const result = {
       route: 'electricity/retail-sales',
       description: 'Retail sales',
-      facets: [{ id: 'stateid', description: 'State', values }],
+      values_offset: 0,
+      facets: [
+        {
+          id: 'stateid',
+          description: 'State',
+          values,
+          value_count: 10,
+          values_truncated: false,
+        },
+      ],
       data_columns: [],
       frequencies: [],
       date_range: { start: '2001-01', end: '2024-11' },
@@ -149,13 +182,17 @@ describe('describeRouteTool — additional coverage', () => {
 
     const blocks = describeRouteTool.format!(result);
     const text = (blocks[0] as { text: string }).text;
+    // Under the structured cap but over the prose preview — content[] still
+    // needs a retrieval path for the tail it did not print.
     expect(text).toContain('+5 more');
+    expect(text).toContain('values_offset=5');
   });
 
   it('format renders empty facets section gracefully', () => {
     const result = {
       route: 'steo',
       description: 'STEO',
+      values_offset: 0,
       facets: [],
       data_columns: [{ id: 'value', alias: 'Value', units: 'Various' }],
       frequencies: [{ id: 'monthly', description: 'Monthly', query: 'monthly', format: 'YYYY-MM' }],

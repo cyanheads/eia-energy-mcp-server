@@ -24,6 +24,12 @@ const ServerConfigSchema = z.object({
     .describe(
       'Cumulative row ceiling for eia_query_route canvas accumulation (default 25000 = 5 EIA requests)',
     ),
+  facetValueCap: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(50)
+    .describe('Facet values eia_describe_route returns per facet before truncating (default 50)'),
   dataframeDropEnabled: z
     .stringbool()
     .default(false)
@@ -40,6 +46,7 @@ export function getServerConfig(): ServerConfig {
     baseUrl: 'EIA_BASE_URL',
     datasetTtlSeconds: 'EIA_DATASET_TTL_SECONDS',
     canvasMaxRows: 'EIA_CANVAS_MAX_ROWS',
+    facetValueCap: 'EIA_FACET_VALUE_CAP',
     dataframeDropEnabled: 'EIA_DATAFRAME_DROP_ENABLED',
   });
   return _config;

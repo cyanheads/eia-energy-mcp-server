@@ -1,8 +1,10 @@
 /**
  * @fileoverview Tool definition for eia_search_routes. Fuzzy text search across
  * route names, descriptions, and category labels using an in-memory Fuse.js
- * index. Resolves natural-language queries to route paths. STEO series names
- * (1,469 entries) are included in the index for series discovery.
+ * index. Resolves natural-language queries to route paths. Two further entry
+ * classes join the index and answer with a `filter_hint`: STEO series names
+ * (1,469 entries) and facet values — fuel types, sectors, coal ranks — so a
+ * query naming a value resolves to the route that exposes it.
  * @module mcp-server/tools/definitions/search-routes.tool
  */
 
@@ -21,6 +23,11 @@ import { getEiaApiService } from '@/services/eia/eia-service.js';
  * scores shifted upward wholesale between 7.4.2 and 7.5.0 (the raw key weights
  * are now normalized before they become score exponents), so a threshold left
  * at the old scale labels perfect matches weak.
+ *
+ * Growing the corpus does not move it: Fuse scores each entry against the
+ * pattern on its own, so adding an entry class leaves every existing score
+ * unchanged. Editing `FUSE_OPTIONS` in `route-cache.ts` does move it, because
+ * key weights are normalized against each other across the whole index.
  * `tests/services/route-cache.test.ts` guards the calibration.
  */
 export const WEAK_MATCH_SCORE = 0.9;
@@ -28,7 +35,7 @@ export const WEAK_MATCH_SCORE = 0.9;
 export const searchRoutesTool = tool('eia_search_routes', {
   title: 'Search EIA Routes',
   description:
-    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. STEO series names are indexed so queries like "ethanol net imports" or "crude oil production forecast" also resolve. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.9 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy.',
+    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. STEO series names are indexed so queries like "ethanol net imports" or "crude oil production forecast" also resolve, and so are facet values, so a fuel type or sector term like "wind" or "anthracite coal" resolves to the route that exposes it, with filter_hint carrying the filter to pass on. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.9 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
@@ -69,7 +76,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
               .record(z.string(), z.string())
               .optional()
               .describe(
-                'Pre-built filter for eia_query_route when a specific facet value is required. Present on STEO series results — pass directly as filters (e.g. eia_query_route(route="steo", filters=filter_hint)).',
+                'Pre-built filter for eia_query_route when a specific facet value is required. Present on STEO series and facet-value results — pass directly as filters (e.g. eia_query_route(route="steo", filters=filter_hint)).',
               ),
           })
           .describe('A search result entry.'),
@@ -81,7 +88,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
     effectiveQuery: z.string().describe('Query as submitted to the Fuse.js index.'),
     totalIndexed: z
       .number()
-      .describe('Total entries in the search index (routes + STEO series names).'),
+      .describe('Total entries in the search index (routes + STEO series names + facet values).'),
     truncated: z.boolean().describe('True when matches were capped at limit; more may exist.'),
     shown: z.number().describe('Number of results returned.'),
     cap: z.number().describe('The limit that was applied.'),

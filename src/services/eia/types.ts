@@ -28,8 +28,14 @@ export interface RawRouteNode {
   endPeriod?: string;
   /** Present on leaf nodes */
   facets?: RawFacetMeta[];
-  /** Present on leaf nodes */
-  frequency?: RawFrequency[];
+  /**
+   * Present on leaf nodes. Two shapes exist in the wild, mirroring `data`:
+   *   Standard: `[{ id, description, query, format }, ...]`
+   *   Object-map: `{ monthly: { id: 'monthly', ... }, ... }` — keyed by frequency id
+   * Normalized to an array at the service boundary before it reaches
+   * `RouteMetadata.frequencies`.
+   */
+  frequency?: RawFrequency[] | Record<string, RawFrequency>;
   id: string;
   name: string;
   routes?: RawRouteNode[];
@@ -133,8 +139,9 @@ export interface SearchIndexEntry {
   description: string;
   /**
    * Pre-built filter hint for routes that require a specific facet value to
-   * query. Present on STEO series entries so callers can pass the seriesId
-   * directly to eia_query_route without parsing the description string.
+   * query. Present on STEO series entries (`{ seriesId }`) and facet-value
+   * entries (`{ <facetId>: <valueId> }`) so callers can pass it straight to
+   * eia_query_route without parsing the description string.
    */
   filter_hint?: Record<string, string>;
   isLeaf: boolean;

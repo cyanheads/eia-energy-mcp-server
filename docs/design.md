@@ -59,9 +59,22 @@ Exposes the U.S. Energy Information Administration's API v2 as a navigable, quer
 - Parse failure: detect HTML error pages and classify as transient `ServiceUnavailable`, not `SerializationError`
 - Field selection: pass EIA's `data[]` param to request only needed columns
 
-**Route search strategy:** Fetch the full route tree lazily and cache in-process at startup (warm on first `eia_browse_routes` or `eia_search_routes` call). The route tree is stable between EIA releases. In-memory Fuse.js fuzzy index built once; no build-time pre-indexing needed. Include STEO's 1,469 `seriesId` values in the search index (fetched once via `/v2/steo/facet/seriesId`) so natural-language queries like "ethanol net imports" resolve to the right series ID.
+**Route search strategy:** Fetch the full route tree lazily and cache in-process at startup (warm on first `eia_browse_routes` or `eia_search_routes` call). The route tree is stable between EIA releases. In-memory Fuse.js fuzzy index built once; no build-time pre-indexing needed. Two further entry classes join the index after the tree, each carrying a `filter_hint` so a hit is directly queryable: STEO's 1,469 `seriesId` values (fetched once via `/v2/steo/facet/seriesId`) so queries like "ethanol net imports" resolve to the right series ID, and facet values so a fuel-type or sector term resolves to the route that exposes it.
 
-**Facet value cache:** `eia_describe_route` fans out `Promise.all` calls to `/v2/{route}/facet/{facetId}` (one per facet). Results are merged into the route metadata and cached per-route — key `{route}` → merged metadata object — to avoid repeat fan-out on subsequent describe or query calls. Retry boundary wraps the full fan-out, not individual facet calls, so a single facet 5xx doesn't partially poison the merged result.
+`FUSE_OPTIONS` — keys, weights, threshold — is corpus-wide, because Fuse normalizes key weights against each other. Editing it moves every entry's score at once and invalidates `WEAK_MATCH_SCORE`; appending entries under an unchanged config does not, since Fuse scores each entry against the pattern on its own. That property is what lets an entry class join the index without recalibration, and `tests/services/route-cache.test.ts` pins both halves.
+
+**Facet value indexing:** Facet values reach the index from two directions, both bounded:
+
+1. **Vocabulary pass at warm time.** The cached tree already names every leaf's facet IDs, so selecting targets costs nothing upstream. `VOCABULARY_FACET_IDS` in `route-cache.ts` allowlists the fuel / sector / technology / coal-rank dimensions, comparing IDs with case and punctuation stripped — EIA names the same dimension `fueltypeid`, `fuelTypeId`, `fuelType`, and `energy_source_code` across different routes. Fetches run in batches of `FACET_INDEX_CONCURRENCY` in the background once the tree is ready, and a facet that fails is skipped.
+2. **Opportunistically, per described route.** `fetchAndCacheMetadata()` already holds the values, so folding them into the index costs nothing upstream. This is what makes a route's vocabulary searchable when its facets sit outside the allowlist.
+
+Both paths skip facets above `MAX_INDEXED_FACET_VALUES` (200) — those are opaque-identifier dimensions (mine IDs, plant codes, `duoarea` area codes) that nobody searches by name, and indexing them would swamp the corpus. Entries dedupe on route + `filter_hint`, so the two paths overlapping is a no-op.
+
+**Facet value fetch cost.** Measured against the live taxonomy: 232 leaf routes carry 892 facets in aggregate, across 82 distinct facet IDs. Four of them — `duoarea`, `product`, `process`, `series` — appear on 165 routes each and account for most of the volume. A single `/facet/{id}` fetch runs 0.12–3.5 s and 0.3–283 KB. Fetching all 892 would more than quadruple the ~270 requests the tree warm already costs, and EIA answers `OVER_RATE_LIMIT` to an unbounded burst on top of that warm — which is why the pass is batched rather than fanned out with one `Promise.all`. The allowlist resolves to 40 fetches carrying 460 values and 28 KB, about 7 s of wall-clock at concurrency 4.
+
+**Facet value cache:** `eia_describe_route` fans out `Promise.all` calls to `/v2/{route}/facet/{facetId}` (one per facet). Results are merged into the route metadata and cached per-route — key `{route}` → merged metadata object — to avoid repeat fan-out on subsequent describe or query calls. Retry boundary wraps the full fan-out, not individual facet calls, so a single facet 5xx doesn't partially poison the merged result. The cache always holds the **full, uncapped** value set: `EIA_FACET_VALUE_CAP` shapes `eia_describe_route`'s response only, and both its offset paging and the search index read from the uncapped cache.
+
+**Upstream shape variance:** EIA does not honor a single shape for every metadata field. `data` arrives either keyed by column ID or as `{ value: [] }`, and `frequency` is an array on every route in the standard taxonomy but is not contractually one. Both are normalized in `fetchAndCacheMetadata()` before they reach `RouteMetadata`, so a describe call degrades to empty rather than throwing a `TypeError` downstream.
 
 ## Config
 
@@ -73,6 +86,7 @@ Exposes the U.S. Energy Information Administration's API v2 as a navigable, quer
 | `EIA_DATASET_TTL_SECONDS` | No | Per-table TTL for canvas-registered dataframes. Default `86400` (24 h), sliding — touched on every dataframe operation. Independent from the canvas-level TTL. |
 | `EIA_DATAFRAME_DROP_ENABLED` | No | Set to `true` to expose `eia_dataframe_drop`. Default `false`; TTL handles cleanup in normal operation. |
 | `EIA_CANVAS_MAX_ROWS` | No | Cumulative row ceiling for `eia_query_route` canvas accumulation. Default `25000` — five requests at EIA's 5,000-row-per-request ceiling, ~4 MB of upstream JSON and ~8.5 s of tool latency when it binds. Lower it to keep exploratory calls snappy, raise it for wider staged analyses. |
+| `EIA_FACET_VALUE_CAP` | No | Facet values `eia_describe_route` returns per facet before truncating. Default `50` — STEO's `seriesId` alone has 1,469 values, ~130 KB of JSON in one describe call. Paged past with the tool's `facet` and `values_offset` inputs; the per-route cache is unaffected. |
 
 ## Implementation Order
 
@@ -117,22 +131,28 @@ Full schema for a leaf route. Required reading before constructing facet filters
 
 **Input schema:**
 - `route: string` — Leaf route path (e.g. `"electricity/retail-sales"`)
+- `facet?: string` — Restrict the response to one facet by ID; pair with `values_offset` to page it
+- `values_offset?: number` — Index of the first facet value to return, applied to every facet in the response (default `0`)
 
 **Implementation note:** The EIA v2 API does NOT embed facet values in the route metadata response — they are fetched via separate calls to `/v2/{route}/facet/{facetId}` (one per facet). The service method must fan out these calls in parallel (`Promise.all`) and merge results. Cache the merged metadata per-route in-process to avoid repeat fan-out.
 
 **Output:**
 - `route: string`
 - `description: string`
-- `facets: Array<{ id, description, values: Array<{ id, name, alias }> }>` — filterable dimensions with valid values (merged from per-facet calls)
+- `values_offset: number` — echoes the requested offset, so a reader knows where the returned window starts
+- `facets: Array<{ id, description, values: Array<{ id, name, alias }>, value_count, values_truncated }>` — filterable dimensions with a window of their valid values (merged from per-facet calls). `values` is sliced `[values_offset, values_offset + EIA_FACET_VALUE_CAP)`; `value_count` is the untruncated total and `values_truncated` says whether more remain. Restricted to one entry when `facet` is set.
 - `data_columns: Array<{ id, alias, units }>` — numeric columns available for the `data[]` param; sourced from the metadata `data` object (keyed by column id, each entry has `alias` and `units`)
 - `frequencies: Array<{ id, description, query, format }>` — valid frequency options with their API query codes and period format strings
 - `date_range: { start: string, end: string }` — from `startPeriod`/`endPeriod` in the API response
 - `default_frequency: string` — the route's default frequency (from `defaultFrequency`)
 - `default_date_format: string` — period format for the default frequency (e.g. `"YYYY-MM"`)
 
+**Surface split:** `content[]` previews five values per facet — a readability budget inside a prose block — while `structuredContent` carries the full capped window. The two therefore stop at different offsets, so `format()` computes its own next call from its own preview length. A single shared next-offset would strand every value between the preview and the cap for clients that forward only `content[]`, which is the defect the cap would otherwise introduce.
+
 **Errors:**
 - `route_not_found` (`NotFound`) — not a known leaf route; suggest `eia_browse_routes` or `eia_search_routes`
 - `route_not_queryable` (`InvalidParams`) — path exists but is a category, not a leaf
+- `facet_not_found` (`NotFound`) — the `facet` input names an ID the route does not expose; the error data lists the route's facet IDs
 - `rate_limited` (`ServiceUnavailable`, retryable) — EIA rate limit hit during facet fan-out; back off and retry
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: false`
@@ -150,6 +170,7 @@ Fuzzy search across the in-memory route index. Useful when the caller doesn't kn
 **Output:**
 - `results: Array<{ route, name, description, score }>` — ranked matches; `route` is directly usable in `eia_describe_route` or `eia_query_route` if `isLeaf`
 - `isLeaf` field per result — callers know whether to browse further or query directly
+- `filter_hint` per result, when the entry is a STEO series or a facet value — the filter to pass straight to `eia_query_route`
 - `total_indexed: number` — size of the search index (orientation signal)
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: false`
@@ -341,6 +362,10 @@ Addresses the prior "no bulk multi-route queries" limitation. Every dataset a te
 - **Should callers thread a `canvas_id` between `eia_query_route` calls?** → No, and the parameter was removed. `CanvasBridge.acquireSharedCanvas` routes every registration to one canvas per tenant with no scoping argument, so accumulation was already automatic; the input was echoed back and otherwise ignored, and the output field carried the table name rather than a canvas ID. `dataset` is the genuine join handle and is now the only one documented. Per-call canvas isolation would be the alternative, but nothing in the workflow wants it — cross-route joins are the point.
 - **Why cap canvas accumulation at 25,000 rows?** → Registering only the previewed page made the "query canvas for the full dataset" note false, so the service now pages forward. The bound is a latency and memory trade, sized from measurement: EIA caps a request at 5,000 rows, and a 5,000-row page of `electricity/retail-sales` measures ~830 KB and ~1 s round trip. A full 25,000-row accumulation on that route is five requests, ~4 MB of upstream JSON, and ~8.5 s of end-to-end tool latency (upstream fetch plus JSON parse plus DuckDB append). Unbounded accumulation would put a six-figure-row route — retail sales monthly is ~113,000 — well past any reasonable tool latency. `EIA_CANVAS_MAX_ROWS` moves the bound either way: lower it to keep exploratory calls snappy, raise it for wider staged analyses.
 
+- **Why cap facet values in `eia_describe_route` at 50?** → The uncapped response returned every value of every facet: `eia_describe_route("steo")` alone shipped all 1,469 `seriesId` values, ~130 KB of JSON, on every call. The cap is a response-shaping step at the tool boundary, not a cache change — the per-route metadata cache still holds the full set, which is what `values_offset` pages through and what the search index reads. 50 clears most ordinary dimensions in one call — sectors run to 15, fuel types to 45 — while bounding the pathological ones; a 62-value `stateid` costs one extra page.
+- **How do facet values get into the search index without an eager fan-out?** → An allowlisted vocabulary pass at warm time plus opportunistic indexing of every described route. Fetching all 892 facets in the taxonomy was measured and ruled out: it would more than quadruple the ~270 requests the tree warm already costs and draws `OVER_RATE_LIMIT` when burst. The allowlist covers the fuel / sector / technology / coal-rank dimensions callers actually search with and resolves to 40 fetches, 460 values, 28 KB.
+- **Did adding facet values to the index require re-calibrating `WEAK_MATCH_SCORE`?** → No, and this is a property of Fuse rather than luck: it scores each entry against the pattern independently, so appending entries under an unchanged key/weight config leaves every existing score byte-identical. Measured across 31 on- and off-target queries, drift was exactly zero, and separation held — worst on-target top score 0.875, best off-target top score 0.947, with the 0.9 threshold between them. What *would* move the scale is editing `FUSE_OPTIONS`; see the option declined below.
+
 ### Options declined
 
 - **Build-time pre-indexed search file** → Adds a build artifact, requires regeneration on EIA updates, and complicates deployment. In-memory lazy cache is simpler and adequate for the dataset size.
@@ -348,6 +373,8 @@ Addresses the prior "no bulk multi-route queries" limitation. Every dataset a te
 - **App tools / resources for route browsing** → Route tree is dynamic and session-state-free; a resource URI can't capture arbitrary browse position. Standard tools handle the workflow cleanly.
 - **Per-route facet cache with invalidation logic** → The facet cache is write-once per process lifetime (no TTL, no ETag-based invalidation). EIA facet catalogs are stable and not versioned in API responses; a server restart is the appropriate refresh mechanism. Adding cache invalidation would add complexity with no practical benefit.
 - **`eia_compare_routes` multi-route query tool** → Agents can call `eia_query_route` N times. A cross-route join tool adds significant complexity (schema reconciliation, unit mismatch handling) for a workflow the agent can orchestrate itself via canvas SQL.
+- **A separate `FUSE_OPTIONS` weight tier for facet-value entries** → Measured as unnecessary and actively harmful. Route entries already outrank their own facet values on route-shaped queries ("electricity retail sales by state" → the route at 0.731, its `sectorid` values at 0.800), so the tier has nothing to fix; and because Fuse normalizes key weights against each other, adding a key shifts every entry's score at once and invalidates the weak-match threshold. Same reason `ignoreLocation: true` was declined: it improves multi-term matching against long descriptions, but it drops the top no-match score from 0.947 to 0.883 — under the threshold — so genuine noise stops being flagged weak. It is also not the fix for `electricity price residential`: with the option on, `electricity/retail-sales` still never enters the candidate set (130 candidates instead of 38, STEO-only at the top), so all the option moves is the score of series that were already leading.
+- **Truncation hints as a `structuredContent` field** → A per-surface call string cannot exist in `structuredContent`: `format()` must render every output field (the `format-parity` linter rule), and `content[]` stops at five values while `structuredContent` stops at the cap, so one string is wrong on one surface. `structuredContent` therefore carries `value_count`, `values_truncated`, and `values_offset`, from which the next call follows directly, and `format()` renders the concrete call for its own offset.
 
 ### Verified against live API (2026-05-21)
 

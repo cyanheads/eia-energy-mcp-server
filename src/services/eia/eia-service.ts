@@ -4,8 +4,12 @@
  * search. Exposes browse, describe, query, and search methods consumed by MCP
  * tool handlers. `query()` also walks `offset` pages past the inline preview
  * when the caller wants a canvas-bound row set, bounded by EIA_CANVAS_MAX_ROWS.
- * Rate-limit detection: EIA returns `OVER_RATE_LIMIT` in the response body —
- * classified as ServiceUnavailable (retryable).
+ * Facet values reach the search index from two directions: a bounded background
+ * pass over the vocabulary facets named in the route tree, and every route the
+ * caller describes. Both feed the per-route metadata cache, which always holds
+ * the full uncapped value set — the cap in eia_describe_route shapes its own
+ * response only. Rate-limit detection: EIA returns `OVER_RATE_LIMIT` in the
+ * response body — classified as ServiceUnavailable (retryable).
  * @module services/eia/eia-service
  */
 
@@ -19,13 +23,15 @@ import {
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import {
-  addSteoSeriesToIndex,
+  addEntriesToIndex,
   getChildren,
   getIndexSize,
   getNode,
+  indexFacetValues,
   initRouteCache,
   isLeafNode,
   isRouteCacheReady,
+  listVocabularyFacets,
   normalizeDescription,
   searchRoutes,
 } from './route-cache.js';
@@ -35,6 +41,7 @@ import type {
   DataRow,
   EiaWarning,
   Facet,
+  RawFacetMeta,
   RawFacetResponse,
   RawFrequency,
   RawRouteNode,
@@ -48,6 +55,14 @@ import type {
  * returns the first 5,000 rows plus a `parameter out of range: length` warning.
  */
 const EIA_MAX_ROWS_PER_REQUEST = 5000;
+
+/**
+ * Parallel `/facet/{id}` fetches allowed during the background vocabulary pass.
+ * EIA answers `OVER_RATE_LIMIT` to an unbounded burst on top of the ~270
+ * requests the route-tree warm already issues, so the pass is deliberately
+ * paced rather than fanned out with a single `Promise.all`.
+ */
+const FACET_INDEX_CONCURRENCY = 4;
 
 /**
  * EIA 400 bodies name the rejected dimension verbatim ("Invalid data 'bogus'
@@ -236,9 +251,16 @@ class EiaApiService {
     // Build route map and index (without STEO series initially)
     initRouteCache(fullTree, []);
 
-    // Fetch STEO series in the background to populate the index
+    // Both index-widening passes run in the background — the tree alone is
+    // enough to answer browse and route-name search, and neither pass should
+    // hold the first call.
     this.fetchSteoSeries(ctx).catch((err) => {
       ctx.log.warning('Failed to index STEO series', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    this.indexVocabularyFacets(ctx).catch((err) => {
+      ctx.log.warning('Failed to index facet values', {
         error: err instanceof Error ? err.message : String(err),
       });
     });
@@ -315,8 +337,66 @@ class EiaApiService {
       filter_hint: { seriesId: f.id },
     }));
 
-    addSteoSeriesToIndex(entries);
-    ctx.log.info('STEO series indexed', { count: entries.length });
+    ctx.log.info('STEO series indexed', { count: addEntriesToIndex(entries) });
+  }
+
+  /**
+   * Fetch one `/facet/{id}` endpoint and normalize it to a `Facet`. EIA returns
+   * null `id`/`name` for some values (e.g. the international route); those carry
+   * no usable filter value and are dropped. Throws on transport failure — each
+   * caller decides what a single failing facet endpoint means for it.
+   */
+  private async fetchFacet(route: string, meta: RawFacetMeta, ctx: Context): Promise<Facet> {
+    const resp = await this.fetchJson<{ response: RawFacetResponse }>(
+      `${route}/facet/${meta.id}`,
+      {},
+      ctx,
+    );
+    return {
+      id: meta.id,
+      description: meta.description,
+      values: (resp?.response?.facets ?? [])
+        .filter((v) => v.id != null && v.name != null)
+        .map((v) => ({ id: v.id, name: v.name, ...(v.alias !== undefined && { alias: v.alias }) })),
+    };
+  }
+
+  /**
+   * Fetch and index the values of the vocabulary facets named in the route
+   * tree — fuel types, sectors, coal ranks — so a query naming one resolves to
+   * the route that exposes it. Bounded on both sides: `listVocabularyFacets()`
+   * selects a fraction of the taxonomy's facets, and each fetch is paced by
+   * `FACET_INDEX_CONCURRENCY`. A facet that fails is skipped, matching how
+   * `fetchAndCacheMetadata` tolerates a single failing facet endpoint.
+   */
+  private async indexVocabularyFacets(ctx: Context): Promise<void> {
+    const targets = listVocabularyFacets();
+    if (targets.length === 0) return;
+
+    let indexed = 0;
+    let failed = 0;
+    for (let i = 0; i < targets.length; i += FACET_INDEX_CONCURRENCY) {
+      const batch = targets.slice(i, i + FACET_INDEX_CONCURRENCY);
+      const counts = await Promise.all(
+        batch.map(async ({ route, facetId, description }): Promise<number> => {
+          try {
+            const facet = await this.fetchFacet(route, { id: facetId, description }, ctx);
+            return indexFacetValues(route, [facet]);
+          } catch {
+            failed++;
+            return 0;
+          }
+        }),
+      );
+      for (const count of counts) indexed += count;
+    }
+
+    ctx.log.info('Facet values indexed', {
+      facets: targets.length,
+      failed,
+      values: indexed,
+      indexSize: getIndexSize(),
+    });
   }
 
   /**
@@ -460,25 +540,7 @@ class EiaApiService {
     const facetResults = await Promise.all(
       facetMetas.map(async (f): Promise<Facet> => {
         try {
-          const resp = await this.fetchJson<{ response: RawFacetResponse }>(
-            `${route}/facet/${f.id}`,
-            {},
-            ctx,
-          );
-          const values = resp?.response?.facets ?? [];
-          return {
-            id: f.id,
-            description: f.description,
-            // Filter null id/name entries — EIA returns null for some facet
-            // values (e.g. international route), which carry no usable filter value.
-            values: values
-              .filter((v) => v.id != null && v.name != null)
-              .map((v) => ({
-                id: v.id,
-                name: v.name,
-                ...(v.alias !== undefined && { alias: v.alias }),
-              })),
-          };
+          return await this.fetchFacet(route, f, ctx);
         } catch {
           // If a single facet fetch fails, return with empty values
           return { id: f.id, description: f.description, values: [] };
@@ -505,7 +567,17 @@ class EiaApiService {
       dataColumns.push({ id: 'value', alias: 'Value', units: '' });
     }
 
-    const frequencies: RawFrequency[] = rawNode.frequency ?? [];
+    // EIA returns `frequency` as an array on every route in the standard
+    // taxonomy, but the field is not contractually an array — the same
+    // shape-variance the `data` handling above absorbs. An object map is
+    // flattened to its values; anything else degrades to an empty list rather
+    // than reaching `frequencies.map` downstream as a non-array.
+    const rawFrequency = rawNode.frequency;
+    const frequencies: RawFrequency[] = Array.isArray(rawFrequency)
+      ? rawFrequency
+      : rawFrequency && typeof rawFrequency === 'object'
+        ? Object.values(rawFrequency)
+        : [];
 
     const meta: RouteMetadata = {
       route,
@@ -522,6 +594,12 @@ class EiaApiService {
     };
 
     _routeMetaCache.set(route, meta);
+
+    // The facet values are already in hand, so folding them into the search
+    // index costs nothing upstream. This is what makes a described route's
+    // vocabulary searchable even when its facets are outside the warm-time set.
+    const added = indexFacetValues(route, facetResults);
+    if (added > 0) ctx.log.debug('Facet values indexed from describe', { route, values: added });
   }
 
   /**

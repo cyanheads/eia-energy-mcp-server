@@ -80,6 +80,37 @@ describe('searchRoutesTool — additional coverage', () => {
     expect(result.results[0]?.filter_hint).toEqual({ seriesId: 'COPRPUS' });
   });
 
+  it('carries a facet-value hit back with its facet filter', async () => {
+    mockSearch.mockResolvedValue({
+      results: [
+        {
+          entry: {
+            route: 'electricity/electric-power-operational-data',
+            name: 'solar photovoltaic',
+            description:
+              'Energy Source value of Electric Power Operations (electricity/electric-power-operational-data) — filter with fueltypeid="SPV".',
+            isLeaf: true,
+            category: 'electricity',
+            filter_hint: { fueltypeid: 'SPV' },
+          },
+          score: 0.76,
+        },
+      ],
+      totalIndexed: 2103,
+    });
+
+    const ctx = createMockContext();
+    const input = searchRoutesTool.input.parse({ query: 'solar photovoltaic generation' });
+    const result = await searchRoutesTool.handler(input, ctx);
+
+    expect(result.results[0]?.route).toBe('electricity/electric-power-operational-data');
+    expect(result.results[0]?.filter_hint).toEqual({ fueltypeid: 'SPV' });
+
+    const text = (searchRoutesTool.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('"fueltypeid": "SPV"');
+    expect(text).toContain('eia_query_route');
+  });
+
   it('omits filter_hint when entry does not have one', async () => {
     mockSearch.mockResolvedValue({
       results: [

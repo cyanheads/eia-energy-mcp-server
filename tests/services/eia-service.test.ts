@@ -1,8 +1,10 @@
 /**
- * @fileoverview Tests for EiaApiService.query() against a mocked `fetch` — the
- * offset-paging accumulation loop, the top-level `warnings` envelope, and the
- * typed reasons the 404/400 remaps produce. These paths are invisible to the
- * tool-level suites, which mock `getEiaApiService()` wholesale.
+ * @fileoverview Tests for EiaApiService against a mocked `fetch` — the
+ * offset-paging accumulation loop, the top-level `warnings` envelope, the typed
+ * reasons the 404/400 remaps produce, upstream shape-variance normalization,
+ * and the facet-value search indexing driven from route metadata. These paths
+ * are invisible to the tool-level suites, which mock `getEiaApiService()`
+ * wholesale.
  * @module tests/services/eia-service.test
  */
 
@@ -14,7 +16,12 @@ import {
   getEiaApiService,
   initEiaApiService,
 } from '@/services/eia/eia-service.js';
-import { _resetRouteCache, initRouteCache } from '@/services/eia/route-cache.js';
+import {
+  _resetRouteCache,
+  getIndexSize,
+  initRouteCache,
+  searchRoutes,
+} from '@/services/eia/route-cache.js';
 import type { DataRow, EiaWarning } from '@/services/eia/types.js';
 
 const LEAF = 'electricity/retail-sales';
@@ -492,5 +499,298 @@ describe('EiaApiService.query', () => {
       ).resolves.toBeDefined();
       expect(calls[0]?.length).toBe(6000);
     });
+  });
+});
+
+/**
+ * Route metadata and facet endpoints, keyed by the API path so a test can
+ * describe the exact upstream shape each one answers with. Records every path
+ * fetched so a test can assert what was *not* requested.
+ */
+function stubApiPaths(bodies: Record<string, unknown>) {
+  const paths: string[] = [];
+  const fetchMock = vi.fn(async (input: string | URL) => {
+    const url = new URL(String(input));
+    const path = url.pathname.replace(/^\/v2\/?/, '').replace(/\/$/, '');
+    paths.push(path);
+    const body = bodies[path];
+    if (body === undefined) return httpResponse({ status: 404, body: { error: 'not found' } });
+    return httpResponse({ body });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { paths, fetchMock };
+}
+
+describe('EiaApiService.describe — upstream shape variance', () => {
+  const ROUTE = 'electricity/retail-sales';
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+    seedRouteCache();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  /** Route metadata with a caller-chosen `frequency` shape and no facets. */
+  function metaWith(frequency: unknown) {
+    return {
+      [ROUTE]: {
+        response: {
+          id: 'electricity',
+          name: 'Retail sales',
+          description: 'Retail electricity sales',
+          facets: [],
+          frequency,
+          data: { price: { alias: 'Price', units: 'cents per kilowatt-hour' } },
+          startPeriod: '2001-01',
+          endPeriod: '2024-11',
+          defaultFrequency: 'monthly',
+          defaultDateFormat: 'YYYY-MM',
+        },
+      },
+    };
+  }
+
+  const MONTHLY = {
+    id: 'monthly',
+    description: 'Monthly',
+    query: 'monthly',
+    format: 'YYYY-MM',
+  };
+
+  it('passes an array frequency through unchanged', async () => {
+    stubApiPaths(metaWith([MONTHLY]));
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(meta.frequencies).toEqual([MONTHLY]);
+    expect(meta.defaultFrequency).toBe('monthly');
+  });
+
+  it('flattens an object-map frequency to an array', async () => {
+    // The crash shape: `?? []` leaves a non-null object in place under a
+    // RawFrequency[] annotation, and describe-route's frequencies.map() throws.
+    stubApiPaths(metaWith({ monthly: MONTHLY }));
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(Array.isArray(meta.frequencies)).toBe(true);
+    expect(meta.frequencies).toEqual([MONTHLY]);
+  });
+
+  it('degrades a scalar frequency to an empty array', async () => {
+    stubApiPaths(metaWith('monthly'));
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(meta.frequencies).toEqual([]);
+  });
+
+  it('degrades a null frequency to an empty array', async () => {
+    stubApiPaths(metaWith(null));
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(meta.frequencies).toEqual([]);
+  });
+
+  it('falls back to the first normalized frequency when defaultFrequency is absent', async () => {
+    const bodies = metaWith({ monthly: MONTHLY }) as Record<
+      string,
+      { response: Record<string, unknown> }
+    >;
+    delete bodies[ROUTE]?.response.defaultFrequency;
+    stubApiPaths(bodies);
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(meta.defaultFrequency).toBe('monthly');
+  });
+});
+
+describe('EiaApiService — facet values in the search index', () => {
+  const ROUTE = 'electricity/retail-sales';
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+    seedRouteCache();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  const FUEL_FACET_META = {
+    [ROUTE]: {
+      response: {
+        id: 'electricity',
+        name: 'Retail sales',
+        description: 'Retail electricity sales',
+        facets: [{ id: 'fueltypeid', description: 'Fuel Type' }],
+        frequency: [],
+        data: { price: { alias: 'Price', units: 'cents' } },
+      },
+    },
+    [`${ROUTE}/facet/fueltypeid`]: {
+      response: {
+        totalFacets: 2,
+        facets: [
+          { id: 'WND', name: 'wind' },
+          { id: 'SPV', name: 'solar photovoltaic' },
+        ],
+      },
+    },
+  };
+
+  it("indexes a described route's facet values with a ready-to-use filter_hint", async () => {
+    stubApiPaths(FUEL_FACET_META);
+    const before = getIndexSize();
+
+    await getEiaApiService().describe(ROUTE, createMockContext());
+
+    expect(getIndexSize()).toBe(before + 2);
+    const [hit] = searchRoutes('solar photovoltaic', 5);
+    expect(hit?.entry.route).toBe(ROUTE);
+    expect(hit?.entry.filter_hint).toEqual({ fueltypeid: 'SPV' });
+  });
+
+  it('does not re-add facet values when the same route is described again', async () => {
+    stubApiPaths(FUEL_FACET_META);
+    const ctx = createMockContext();
+
+    await getEiaApiService().describe(ROUTE, ctx);
+    const afterFirst = getIndexSize();
+    // The metadata cache short-circuits the second call; even if it did not,
+    // the index dedupes on route + filter_hint.
+    await getEiaApiService().describe(ROUTE, ctx);
+
+    expect(getIndexSize()).toBe(afterFirst);
+  });
+
+  it('indexes vocabulary facets during the background warm pass', async () => {
+    _resetRouteCache();
+    const { paths } = stubApiPaths({
+      '': {
+        response: {
+          routes: [
+            {
+              id: 'electricity',
+              name: 'Electricity',
+              routes: [
+                {
+                  id: 'electric-power-operational-data',
+                  name: 'Electric Power Operations',
+                  facets: [
+                    { id: 'fueltypeid', description: 'Energy Source' },
+                    { id: 'duoarea', description: 'DuoArea' },
+                  ],
+                  frequency: [],
+                  data: {},
+                },
+              ],
+            },
+          ],
+        },
+      },
+      'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'electricity/electric-power-operational-data/facet/fueltypeid': {
+        response: {
+          totalFacets: 2,
+          facets: [
+            { id: 'WND', name: 'wind' },
+            { id: 'SPV', name: 'solar photovoltaic' },
+          ],
+        },
+      },
+    });
+
+    await getEiaApiService().search('electricity', 5, createMockContext());
+
+    await vi.waitFor(() => {
+      const [hit] = searchRoutes('solar photovoltaic', 5);
+      expect(hit?.entry.filter_hint).toEqual({ fueltypeid: 'SPV' });
+      expect(hit?.entry.route).toBe('electricity/electric-power-operational-data');
+    });
+    // The vocabulary facet is fetched; the 165-route volume facet never is.
+    expect(paths).toContain('electricity/electric-power-operational-data/facet/fueltypeid');
+    expect(paths).not.toContain('electricity/electric-power-operational-data/facet/duoarea');
+  });
+
+  it('keeps indexing when one facet endpoint fails during the warm pass', async () => {
+    _resetRouteCache();
+    stubApiPaths({
+      '': {
+        response: {
+          routes: [
+            {
+              id: 'coal',
+              name: 'Coal',
+              routes: [
+                {
+                  id: 'mine-production',
+                  name: 'Mine Production',
+                  // No stub for coalRankId — the path 404s.
+                  facets: [{ id: 'coalRankId', description: 'Coal Rank' }],
+                  frequency: [],
+                  data: {},
+                },
+                {
+                  id: 'consumption-and-quality',
+                  name: 'Consumption and Quality',
+                  facets: [{ id: 'sector', description: 'Sector' }],
+                  frequency: [],
+                  data: {},
+                },
+              ],
+            },
+          ],
+        },
+      },
+      'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'coal/consumption-and-quality/facet/sector': {
+        response: { totalFacets: 1, facets: [{ id: 'IND', name: 'industrial' }] },
+      },
+    });
+
+    await getEiaApiService().search('coal', 5, createMockContext());
+
+    await vi.waitFor(() => {
+      const [hit] = searchRoutes('industrial', 5);
+      expect(hit?.entry.filter_hint).toEqual({ sector: 'IND' });
+    });
+  });
+
+  it('leaves the cached metadata uncapped for high-cardinality facets', async () => {
+    const values = Array.from({ length: 400 }, (_, i) => ({ id: `V${i}`, name: `Value ${i}` }));
+    stubApiPaths({
+      [ROUTE]: {
+        response: {
+          id: 'electricity',
+          name: 'Retail sales',
+          facets: [{ id: 'mineMSHAId', description: 'Mine' }],
+          frequency: [],
+          data: {},
+        },
+      },
+      [`${ROUTE}/facet/mineMSHAId`]: { response: { totalFacets: 400, facets: values } },
+    });
+    const before = getIndexSize();
+
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+
+    // The cache keeps every value — #29's cap lives at the tool boundary.
+    expect(meta.facets[0]?.values).toHaveLength(400);
+    // But an opaque-identifier facet that size stays out of the index.
+    expect(getIndexSize()).toBe(before);
   });
 });
