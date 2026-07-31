@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/eia-energy-mcp-server/releases/latest/download/eia-energy-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=eia-energy-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZWlhLWVuZXJneS1tY3Atc2VydmVyIl0sImVudiI6eyJFSUFfQVBJX0tFWSI6InlvdXItYXBpLWtleSJ9fQ==) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22eia-energy-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads/eia-energy-mcp-server%22%5D%2C%22env%22%3A%7B%22EIA_API_KEY%22%3A%22your-api-key%22%7D%7D)
 
@@ -30,8 +30,8 @@ Seven tools covering the two-phase EIA workflow — find the right dataset route
 | Tool | Description |
 |:-----|:------------|
 | `eia_browse_routes` | Lists child routes under a given path in the EIA dataset taxonomy. Start at root to see top-level categories, then drill into subcategories and leaf routes. |
-| `eia_describe_route` | Returns full metadata for a leaf route: available facets with valid values, data column names, frequency options, units, and date range. Call before `eia_query_route` to understand filter options. |
-| `eia_search_routes` | Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. |
+| `eia_describe_route` | Returns metadata for a leaf route: available facets with valid values, data column names, frequency options, units, and date range. Call before `eia_query_route` to understand filter options. Facet values come back capped, with `facet` and `values_offset` to page one facet. |
+| `eia_search_routes` | Fuzzy text search across route names, descriptions, category labels, STEO series names, and facet values. Resolves natural-language queries like "electricity retail sales by state" or a fuel type like "wind" to matching route paths. |
 | `eia_query_route` | Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Pages past the inline preview to stage large result sets as a DataCanvas table for SQL analysis. |
 | `eia_dataframe_describe` | Lists active DataCanvas dataframes created by prior `eia_query_route` calls. Shows table name, column names and types, row count, TTL, and the query that produced it. |
 | `eia_dataframe_query` | Runs a read-only SQL SELECT across DataCanvas dataframes, referenced by their `df_<id>` table names. |
@@ -53,6 +53,7 @@ Full schema for a leaf route. Required before constructing facet filters.
 
 - Returns facets with valid values (fetched via per-facet API calls and cached in-process)
 - Returns data column names, units, frequency options, and date range
+- Each facet returns at most `EIA_FACET_VALUE_CAP` values, alongside `value_count` and `values_truncated`. Pass `facet` with `values_offset` to page one facet past the cap — the cap shapes this tool's response only, and the in-process cache keeps every value
 - `eia_search_routes` and `eia_browse_routes` resolve the route path; this tool provides the filter vocabulary
 
 ---
@@ -61,8 +62,8 @@ Full schema for a leaf route. Required before constructing facet filters.
 
 Fuzzy search across the in-memory route index.
 
-- Indexes route names, descriptions, and category labels — plus STEO's 1,469 series names
-- Resolves natural language ("natural gas spot prices", "ethanol net imports") to queryable route paths
+- Indexes route names, descriptions, and category labels — plus STEO's 1,469 series names and facet values
+- Resolves natural language ("natural gas spot prices", "ethanol net imports") to queryable route paths, and a fuel-type or sector term ("wind", "anthracite coal") to the route that exposes it, with a `filter_hint` to pass straight to `eia_query_route`
 - Route tree is cached in-process at first call; subsequent searches hit the Fuse.js index with no upstream cost
 
 ---
@@ -92,6 +93,7 @@ EIA-specific:
 
 - Full coverage of EIA API v2 — all 14 top-level dataset categories
 - In-process route tree cache with Fuse.js fuzzy index — built once at startup, no repeated upstream calls
+- Facet values are searchable: a bounded background pass indexes the fuel-type, sector, and technology vocabulary named in the route tree, and every described route folds its own values in at no upstream cost
 - Per-route facet cache via `Promise.all` fan-out — valid filter values available without re-fetching
 - STEO series names (1,469 entries) indexed for natural-language discovery
 - DataCanvas (DuckDB) opt-in for tabular spillover — graceful degradation when unavailable
@@ -205,6 +207,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `EIA_DATASET_TTL_SECONDS` | Per-table TTL for DataCanvas dataframes in seconds. | `86400` (24 h) |
 | `EIA_DATAFRAME_DROP_ENABLED` | Set to `true` to expose `eia_dataframe_drop`. Off by default to avoid accidental canvas cleanup. | `false` |
 | `EIA_CANVAS_MAX_ROWS` | Cumulative row ceiling for `eia_query_route` canvas staging — five requests at EIA's 5,000-row-per-request ceiling, adding ~8.5 s to a call when it binds. Lower it for snappier exploration, raise it for wider staged analyses. | `25000` |
+| `EIA_FACET_VALUE_CAP` | Facet values `eia_describe_route` returns per facet before truncating. Bounds the response on high-cardinality facets — STEO's `seriesId` alone has 1,469 values. Page past it with the tool's `facet` and `values_offset` inputs. | `50` |
 | `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas spillover for large result sets (Node only). | — |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |

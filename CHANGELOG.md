@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-07-31
+
+Cap eia_describe_route facet values with offset paging, index facet values for eia_search_routes, fix a crash on non-array upstream frequency
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-07-31 · ⚠️ Breaking
 
 Fix eia_query_route canvas spillover to stage the full accumulated result set, forward EIA's top-level warnings, and correct error reasons; drop the inert canvas_id parameter; adopt mcp-ts-core ^0.11.0

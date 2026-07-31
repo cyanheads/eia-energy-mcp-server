@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/eia-energy-mcp-server",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.3.1",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eia-energy-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -59,6 +59,13 @@
           "default": "25000"
         },
         {
+          "name": "EIA_FACET_VALUE_CAP",
+          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs.",
+          "format": "string",
+          "isRequired": false,
+          "default": "50"
+        },
+        {
           "name": "CANVAS_PROVIDER_TYPE",
           "description": "Set to 'duckdb' to enable DataCanvas spillover for large query result sets (Node.js only).",
           "format": "string",
@@ -81,7 +88,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eia-energy-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -119,6 +126,13 @@
           "format": "string",
           "isRequired": false,
           "default": "25000"
+        },
+        {
+          "name": "EIA_FACET_VALUE_CAP",
+          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs.",
+          "format": "string",
+          "isRequired": false,
+          "default": "50"
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
