@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 11:08:07
+Generated on: 2026-07-31 18:04:56
 
 ```text
 eia-energy-mcp-server/
@@ -12,17 +12,21 @@ eia-energy-mcp-server/
 │   ├── mcp.json
 │   └── plugin.json
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
+├── data/
 ├── docs/
 │   ├── design.md
 │   └── idea.md
@@ -158,6 +162,7 @@ eia-energy-mcp-server/
 │   ├── resources/
 │   ├── services/
 │   │   ├── canvas-bridge.test.ts
+│   │   ├── eia-service.test.ts
 │   │   ├── normalize-description.test.ts
 │   │   └── route-cache.test.ts
 │   └── tools/
@@ -176,6 +181,7 @@ eia-energy-mcp-server/
 │       └── search-routes.tool.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── biome.json

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/eia-energy-mcp-server/releases/latest/download/eia-energy-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=eia-energy-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZWlhLWVuZXJneS1tY3Atc2VydmVyIl0sImVudiI6eyJFSUFfQVBJX0tFWSI6InlvdXItYXBpLWtleSJ9fQ==) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22eia-energy-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads/eia-energy-mcp-server%22%5D%2C%22env%22%3A%7B%22EIA_API_KEY%22%3A%22your-api-key%22%7D%7D)
 
@@ -31,10 +31,10 @@ Seven tools covering the two-phase EIA workflow — find the right dataset route
 |:-----|:------------|
 | `eia_browse_routes` | Lists child routes under a given path in the EIA dataset taxonomy. Start at root to see top-level categories, then drill into subcategories and leaf routes. |
 | `eia_describe_route` | Returns full metadata for a leaf route: available facets with valid values, data column names, frequency options, units, and date range. Call before `eia_query_route` to understand filter options. |
-| `eia_search_routes` | Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "gasoline retail prices" or "solar capacity by state" to matching route paths. |
-| `eia_query_route` | Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Spills large result sets to a DataCanvas table for SQL analysis. |
-| `eia_dataframe_describe` | Lists active DataCanvas dataframes created by prior `eia_query_route` calls. Shows table name, column names and types, row count, and canvas ID. |
-| `eia_dataframe_query` | Runs a read-only SQL SELECT against a DataCanvas dataframe by canvas ID or table name. |
+| `eia_search_routes` | Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. |
+| `eia_query_route` | Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Pages past the inline preview to stage large result sets as a DataCanvas table for SQL analysis. |
+| `eia_dataframe_describe` | Lists active DataCanvas dataframes created by prior `eia_query_route` calls. Shows table name, column names and types, row count, TTL, and the query that produced it. |
+| `eia_dataframe_query` | Runs a read-only SQL SELECT across DataCanvas dataframes, referenced by their `df_<id>` table names. |
 | `eia_dataframe_drop` | Drops a DataCanvas dataframe, freeing its memory. Only exposed when `EIA_DATAFRAME_DROP_ENABLED=true`. |
 
 ### `eia_browse_routes`
@@ -75,7 +75,7 @@ Pull data from a leaf route.
 - Date range and frequency selection; valid values discoverable via `eia_describe_route`
 - Pagination via `offset`/`length` (max 5,000 rows per page); total row count in response
 - All numeric values arrive as strings from the EIA API — units appear as inline `{col}-units` fields per row
-- DataCanvas spillover when result set exceeds `length`: returns `canvas_id` for SQL queries over the full dataset
+- DataCanvas spillover when the result set exceeds `length`: further pages are fetched and the accumulated rows are staged as a `dataset` (`df_<id>`) for SQL, bounded by `EIA_CANVAS_MAX_ROWS`. The response note names how many rows actually reached the table.
 
 ## Features
 
@@ -204,6 +204,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `EIA_BASE_URL` | EIA API base URL. | `https://api.eia.gov/v2` |
 | `EIA_DATASET_TTL_SECONDS` | Per-table TTL for DataCanvas dataframes in seconds. | `86400` (24 h) |
 | `EIA_DATAFRAME_DROP_ENABLED` | Set to `true` to expose `eia_dataframe_drop`. Off by default to avoid accidental canvas cleanup. | `false` |
+| `EIA_CANVAS_MAX_ROWS` | Cumulative row ceiling for `eia_query_route` canvas staging — five requests at EIA's 5,000-row-per-request ceiling, adding ~8.5 s to a call when it binds. Lower it for snappier exploration, raise it for wider staged analyses. | `25000` |
 | `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas spillover for large result sets (Node only). | — |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
