@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/eia-energy-mcp-server/releases/latest/download/eia-energy-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=eia-energy-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZWlhLWVuZXJneS1tY3Atc2VydmVyIl0sImVudiI6eyJFSUFfQVBJX0tFWSI6InlvdXItYXBpLWtleSJ9fQ==) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22eia-energy-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads/eia-energy-mcp-server%22%5D%2C%22env%22%3A%7B%22EIA_API_KEY%22%3A%22your-api-key%22%7D%7D)
 
@@ -64,7 +64,8 @@ Fuzzy search across the in-memory route index.
 
 - Indexes route names, descriptions, and category labels — plus STEO's 1,469 series names and facet values
 - Resolves natural language ("natural gas spot prices", "ethanol net imports") to queryable route paths, and a fuel-type or sector term ("wind", "anthracite coal") to the route that exposes it, with a `filter_hint` to pass straight to `eia_query_route`
-- Route tree is cached in-process at first call; subsequent searches hit the Fuse.js index with no upstream cost
+- The first call waits for the whole corpus to warm — 24–30 s measured against the live API from cold, and never more than 45 s, so a degraded upstream cannot hold the call past a client's request timeout. Every later search is served from the in-process Fuse.js index in tens of milliseconds, with no upstream cost
+- `indexComplete` reports whether the answer was ranked against the whole corpus; when it is false, `indexGaps` names the routes and index passes that are missing, so a short result set is never mistaken for a settled one
 
 ---
 
@@ -92,8 +93,9 @@ Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp
 EIA-specific:
 
 - Full coverage of EIA API v2 — all 14 top-level dataset categories
-- In-process route tree cache with Fuse.js fuzzy index — built once at startup, no repeated upstream calls
-- Facet values are searchable: a bounded background pass indexes the fuel-type, sector, and technology vocabulary named in the route tree, and every described route folds its own values in at no upstream cost
+- In-process route tree cache with Fuse.js fuzzy index — built once on first use at a paced request rate, no repeated upstream calls
+- Facet values are searchable: a bounded pass indexes the fuel-type, sector, and technology vocabulary named in the route tree, and every described route folds its own values in at no upstream cost
+- Warm gaps are tracked, not swallowed: a route whose metadata could not be fetched is held as an incomplete stub rather than passed off as a queryable leaf, reported through `eia_search_routes`, and re-fetched by the next `eia_browse_routes` call that reaches it
 - Per-route facet cache via `Promise.all` fan-out — valid filter values available without re-fetching
 - STEO series names (1,469 entries) indexed for natural-language discovery
 - DataCanvas (DuckDB) opt-in for tabular spillover — graceful degradation when unavailable

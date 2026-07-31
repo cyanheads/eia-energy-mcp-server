@@ -5,6 +5,13 @@
  * classes join the index and answer with a `filter_hint`: STEO series names
  * (1,469 entries) and facet values — fuel types, sectors, coal ranks — so a
  * query naming a value resolves to the route that exposes it.
+ *
+ * The first call waits for the whole corpus to warm, because a ranking over a
+ * half-filled index is indistinguishable from a ranking over the full one: the
+ * entry that belongs in the top slot is simply absent, and a mediocre hit takes
+ * its place. That wait is capped, so an upstream slow enough to outlast the
+ * caller still gets an answer out. `indexComplete` reports whether the wait
+ * ended in a complete corpus; `indexGaps` names what is missing when it did not.
  * @module mcp-server/tools/definitions/search-routes.tool
  */
 
@@ -35,7 +42,7 @@ export const WEAK_MATCH_SCORE = 0.9;
 export const searchRoutesTool = tool('eia_search_routes', {
   title: 'Search EIA Routes',
   description:
-    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. STEO series names are indexed so queries like "ethanol net imports" or "crude oil production forecast" also resolve, and so are facet values, so a fuel type or sector term like "wind" or "anthracite coal" resolves to the route that exposes it, with filter_hint carrying the filter to pass on. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.9 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy.',
+    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. STEO series names are indexed so queries like "ethanol net imports" or "crude oil production forecast" also resolve, and so are facet values, so a fuel type or sector term like "wind" or "anthracite coal" resolves to the route that exposes it, with filter_hint carrying the filter to pass on. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.9 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy. The first call after server start waits 24-30s while the index warms, and at most 45s; every later call returns in milliseconds. Check indexComplete before reading anything into a short or empty result set.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
@@ -89,6 +96,17 @@ export const searchRoutesTool = tool('eia_search_routes', {
     totalIndexed: z
       .number()
       .describe('Total entries in the search index (routes + STEO series names + facet values).'),
+    indexComplete: z
+      .boolean()
+      .describe(
+        'True when this answer was ranked against the complete corpus. False means part of it is missing (see indexGaps) — results may be short, and a better match may exist that was never scored.',
+      ),
+    indexGaps: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Present only when indexComplete is false: route paths whose metadata could not be fetched (call eia_browse_routes on one to re-fetch it) and index passes that did not land ("steo_series", "facet_values").',
+      ),
     truncated: z.boolean().describe('True when matches were capped at limit; more may exist.'),
     shown: z.number().describe('Number of results returned.'),
     cap: z.number().describe('The limit that was applied.'),
@@ -100,16 +118,32 @@ export const searchRoutesTool = tool('eia_search_routes', {
       ),
   },
 
+  /** A custom render supplies the whole trailer line, label included. */
+  enrichmentTrailer: {
+    indexGaps: { render: (gaps: string[]) => `**indexGaps:** ${gaps.join(', ')}` },
+  },
+
   async handler(input, ctx) {
     ctx.log.info('Executing eia_search_routes', { query: input.query, limit: input.limit });
     const service = getEiaApiService();
-    const { results, totalIndexed } = await service.search(input.query, input.limit, ctx);
+    const { results, status } = await service.search(input.query, input.limit, ctx);
+
+    const gaps = [...status.incompleteRoutes, ...status.pendingPasses];
 
     ctx.enrich.echo(input.query);
-    ctx.enrich({ totalIndexed, shown: results.length, cap: input.limit, truncated: false });
+    ctx.enrich({
+      totalIndexed: status.size,
+      shown: results.length,
+      cap: input.limit,
+      truncated: false,
+      indexComplete: status.complete,
+      ...(gaps.length > 0 && { indexGaps: gaps }),
+    });
     if (results.length === 0) {
       ctx.enrich.notice(
-        `No routes matched "${input.query}". Try different search terms or use eia_browse_routes to explore the taxonomy.`,
+        status.complete
+          ? `No routes matched "${input.query}". Try different search terms or use eia_browse_routes to explore the taxonomy.`
+          : `No routes matched "${input.query}", but part of the corpus is missing (see indexGaps) — a match may exist that was never scored. Try eia_browse_routes to explore the taxonomy directly.`,
       );
     } else if (results.length >= input.limit) {
       ctx.enrich.truncated({

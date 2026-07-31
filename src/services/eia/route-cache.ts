@@ -7,22 +7,52 @@
  * both carry a `filter_hint`: STEO series names, and facet values (fuel types,
  * sectors, coal ranks) so natural-language queries naming a value resolve to
  * the route that exposes it.
+ *
+ * Completeness is tracked, not assumed. A node whose warm-time metadata fetch
+ * failed is held as an incomplete stub — never classified as a leaf, listed by
+ * `getIndexStatus()`, and replaced in place by `replaceNode()` once it is
+ * re-fetched. `getIndexStatus().complete` is what lets a caller tell a ranking
+ * computed over the whole corpus from one computed over part of it.
  * @module services/eia/route-cache
  */
 
 import Fuse, { type IFuseOptions } from 'fuse.js';
 import type { Facet, RawRouteNode, SearchIndexEntry } from './types.js';
 
+/** An index-widening pass that runs after the route tree is built. */
+export type IndexPass = 'facet_values' | 'steo_series';
+
+/** Every pass that must land before the corpus counts as complete. */
+const INDEX_PASSES: readonly IndexPass[] = ['facet_values', 'steo_series'];
+
+/** Warm-time completeness of the search corpus. */
+export interface IndexStatus {
+  /** True when the tree built in full and every index-widening pass landed in full. */
+  complete: boolean;
+  /** Route paths whose metadata fetch failed — their subtrees are absent from the corpus. */
+  incompleteRoutes: string[];
+  /** Passes that have not landed in full, either still running or given up on. */
+  pendingPasses: IndexPass[];
+  /** Entries currently in the index. */
+  size: number;
+}
+
 /** Holds the in-process route tree state. */
 interface CacheState {
-  /** All index entries, in insertion order, for the total_indexed count. */
-  entries: SearchIndexEntry[];
+  /** Entries appended after the tree — STEO series and facet values. */
+  appendedEntries: SearchIndexEntry[];
   /** Fuse.js index built over routes + STEO series + facet values. */
   fuseIndex: Fuse<SearchIndexEntry>;
+  /** Route paths whose warm-time metadata fetch failed — subtrees unknown. */
+  incompleteRoutes: Set<string>;
   /** Identity of every indexed entry, so repeat appends are no-ops. */
   indexedKeys: Set<string>;
   /** Flat map of route path → raw node (all nodes in the tree). */
   nodeMap: Map<string, RawRouteNode>;
+  /** Entries derived from the route tree, rebuilt whenever the tree changes. */
+  routeEntries: SearchIndexEntry[];
+  /** Index-widening passes that have landed in full. */
+  settledPasses: Set<IndexPass>;
 }
 
 let _cache: CacheState | undefined;
@@ -126,8 +156,13 @@ export function buildNodeMap(
  * `facets`, or `data` fields (queryable data endpoint) rather than a `routes`
  * array. Root-level nodes with no sub-routes and no data fields are treated as
  * leaves (e.g. steo).
+ *
+ * An incomplete node is never a leaf. It carries none of the leaf markers only
+ * because its metadata never arrived, and the bare-stub rule at the bottom of
+ * this function would otherwise read that absence as a queryable endpoint.
  */
 export function isLeafNode(node: RawRouteNode): boolean {
+  if (node.incomplete) return false;
   if (node.frequency !== undefined) return true;
   if (node.facets !== undefined) return true;
   if (node.data !== undefined) return true;
@@ -172,6 +207,28 @@ const FUSE_OPTIONS: IFuseOptions<SearchIndexEntry> = {
   minMatchCharLength: 2,
 };
 
+/** Route paths in the map whose metadata fetch failed during the warm. */
+function collectIncompleteRoutes(nodeMap: Map<string, RawRouteNode>): Set<string> {
+  const paths = new Set<string>();
+  for (const [path, node] of nodeMap) {
+    if (node.incomplete) paths.add(path);
+  }
+  return paths;
+}
+
+/**
+ * Rebuild the Fuse index over the current entry set. Route entries always lead
+ * the appended ones, so the class order — and with it Fuse's tie-breaking
+ * between an entry class and the next — is the one `initRouteCache` produced.
+ * Within the route entries, a subtree `replaceNode` re-inserted sorts last,
+ * which moves nothing but the order of an exact score tie.
+ */
+function reindex(cache: CacheState): void {
+  const allEntries = [...cache.routeEntries, ...cache.appendedEntries];
+  cache.fuseIndex = new Fuse(allEntries, FUSE_OPTIONS);
+  cache.indexedKeys = new Set(allEntries.map(entryKey));
+}
+
 /** Initialize the cache with the fetched route tree and optional STEO entries. */
 export function initRouteCache(
   topLevelNodes: RawRouteNode[],
@@ -180,14 +237,67 @@ export function initRouteCache(
   const nodeMap = new Map<string, RawRouteNode>();
   buildNodeMap(topLevelNodes, '', nodeMap);
 
-  const routeEntries = buildEntries(nodeMap);
-  const allEntries = [...routeEntries, ...steoSeriesEntries];
-
-  _cache = {
+  const cache: CacheState = {
+    appendedEntries: [...steoSeriesEntries],
+    fuseIndex: new Fuse<SearchIndexEntry>([], FUSE_OPTIONS),
+    incompleteRoutes: collectIncompleteRoutes(nodeMap),
+    indexedKeys: new Set(),
     nodeMap,
-    fuseIndex: new Fuse(allEntries, FUSE_OPTIONS),
-    entries: allEntries,
-    indexedKeys: new Set(allEntries.map(entryKey)),
+    routeEntries: buildEntries(nodeMap),
+    settledPasses: new Set(),
+  };
+  reindex(cache);
+  _cache = cache;
+}
+
+/**
+ * Splice a re-fetched node and its subtree into the cached tree, replacing the
+ * stub a failed warm-time fetch left behind. Route entries are rebuilt from the
+ * updated map so the stub's stale `isLeaf` claim does not survive; the appended
+ * STEO and facet entries are untouched.
+ */
+export function replaceNode(path: string, node: RawRouteNode): void {
+  if (!_cache) return;
+
+  const prefix = `${path}/`;
+  for (const key of _cache.nodeMap.keys()) {
+    if (key === path || key.startsWith(prefix)) _cache.nodeMap.delete(key);
+  }
+  const parentPath = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+  buildNodeMap([node], parentPath, _cache.nodeMap);
+
+  _cache.routeEntries = buildEntries(_cache.nodeMap);
+  _cache.incompleteRoutes = collectIncompleteRoutes(_cache.nodeMap);
+  reindex(_cache);
+}
+
+/** Record that an index-widening pass landed in full. */
+export function markIndexPassSettled(pass: IndexPass): void {
+  _cache?.settledPasses.add(pass);
+}
+
+/**
+ * What the corpus is missing, if anything. `complete` is the single signal a
+ * caller needs: false means a route subtree or a whole vocabulary pass is
+ * absent, so a result set may be short or ranked against the wrong corpus.
+ */
+export function getIndexStatus(): IndexStatus {
+  const cache = _cache;
+  if (!cache) {
+    return {
+      complete: false,
+      incompleteRoutes: [],
+      pendingPasses: [...INDEX_PASSES],
+      size: 0,
+    };
+  }
+  const incompleteRoutes = [...cache.incompleteRoutes].sort();
+  const pendingPasses = INDEX_PASSES.filter((pass) => !cache.settledPasses.has(pass));
+  return {
+    complete: incompleteRoutes.length === 0 && pendingPasses.length === 0,
+    incompleteRoutes,
+    pendingPasses,
+    size: getIndexSize(),
   };
 }
 
@@ -263,7 +373,8 @@ export function searchRoutes(
 
 /** Total number of indexed entries. */
 export function getIndexSize(): number {
-  return _cache?.entries.length ?? 0;
+  if (!_cache) return 0;
+  return _cache.routeEntries.length + _cache.appendedEntries.length;
 }
 
 /**
@@ -276,9 +387,8 @@ export function addEntriesToIndex(entries: SearchIndexEntry[]): number {
   if (!_cache) return 0;
   const fresh = entries.filter((e) => !_cache?.indexedKeys.has(entryKey(e)));
   if (fresh.length === 0) return 0;
-  for (const entry of fresh) _cache.indexedKeys.add(entryKey(entry));
-  _cache.entries.push(...fresh);
-  _cache.fuseIndex = new Fuse(_cache.entries, FUSE_OPTIONS);
+  _cache.appendedEntries.push(...fresh);
+  reindex(_cache);
   return fresh.length;
 }
 

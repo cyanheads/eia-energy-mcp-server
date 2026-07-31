@@ -15,14 +15,18 @@ import {
   _resetEiaApiService,
   getEiaApiService,
   initEiaApiService,
+  TREE_BUILD_CONCURRENCY,
 } from '@/services/eia/eia-service.js';
 import {
   _resetRouteCache,
   getIndexSize,
+  getIndexStatus,
+  getNode,
   initRouteCache,
+  isLeafNode,
   searchRoutes,
 } from '@/services/eia/route-cache.js';
-import type { DataRow, EiaWarning } from '@/services/eia/types.js';
+import type { DataRow, EiaWarning, RawRouteNode } from '@/services/eia/types.js';
 
 const LEAF = 'electricity/retail-sales';
 const CATEGORY = 'electricity';
@@ -677,7 +681,7 @@ describe('EiaApiService — facet values in the search index', () => {
     expect(getIndexSize()).toBe(afterFirst);
   });
 
-  it('indexes vocabulary facets during the background warm pass', async () => {
+  it('holds the search until the facet vocabulary is in the index', async () => {
     _resetRouteCache();
     const { paths } = stubApiPaths({
       '': {
@@ -714,19 +718,23 @@ describe('EiaApiService — facet values in the search index', () => {
       },
     });
 
-    await getEiaApiService().search('electricity', 5, createMockContext());
+    // The very first search — no waiting, no second call. A facet value the
+    // vocabulary pass supplies is already rankable when it returns.
+    const { results, status } = await getEiaApiService().search(
+      'solar photovoltaic',
+      5,
+      createMockContext(),
+    );
 
-    await vi.waitFor(() => {
-      const [hit] = searchRoutes('solar photovoltaic', 5);
-      expect(hit?.entry.filter_hint).toEqual({ fueltypeid: 'SPV' });
-      expect(hit?.entry.route).toBe('electricity/electric-power-operational-data');
-    });
+    expect(status.complete).toBe(true);
+    expect(results[0]?.entry.filter_hint).toEqual({ fueltypeid: 'SPV' });
+    expect(results[0]?.entry.route).toBe('electricity/electric-power-operational-data');
     // The vocabulary facet is fetched; the 165-route volume facet never is.
     expect(paths).toContain('electricity/electric-power-operational-data/facet/fueltypeid');
     expect(paths).not.toContain('electricity/electric-power-operational-data/facet/duoarea');
   });
 
-  it('keeps indexing when one facet endpoint fails during the warm pass', async () => {
+  it('keeps indexing when one facet endpoint fails, and reports the pass as short', async () => {
     _resetRouteCache();
     stubApiPaths({
       '': {
@@ -762,12 +770,14 @@ describe('EiaApiService — facet values in the search index', () => {
       },
     });
 
-    await getEiaApiService().search('coal', 5, createMockContext());
+    const { status } = await getEiaApiService().search('coal', 5, createMockContext());
 
-    await vi.waitFor(() => {
-      const [hit] = searchRoutes('industrial', 5);
-      expect(hit?.entry.filter_hint).toEqual({ sector: 'IND' });
-    });
+    // The surviving facet still lands...
+    expect(searchRoutes('industrial', 5)[0]?.entry.filter_hint).toEqual({ sector: 'IND' });
+    // ...but the corpus is short by one facet's vocabulary, and says so.
+    expect(status.complete).toBe(false);
+    expect(status.pendingPasses).toEqual(['facet_values']);
+    expect(status.incompleteRoutes).toEqual([]);
   });
 
   it('leaves the cached metadata uncapped for high-cardinality facets', async () => {
@@ -792,5 +802,332 @@ describe('EiaApiService — facet values in the search index', () => {
     expect(meta.facets[0]?.values).toHaveLength(400);
     // But an opaque-identifier facet that size stays out of the index.
     expect(getIndexSize()).toBe(before);
+  });
+});
+
+/**
+ * A warm-time metadata fetch that fails past its retry budget used to fall back
+ * to the parent's stub, which carries no routes/facets/data and so read as a
+ * queryable leaf — hiding both the real subtree and the fact that anything went
+ * wrong, for the life of the process.
+ */
+describe('EiaApiService — a route the warm could not fetch', () => {
+  /** Root advertises two bare stubs; only `electricity` has a metadata stub. */
+  function fixture(): Record<string, unknown> {
+    return {
+      '': {
+        response: {
+          routes: [
+            { id: 'electricity', name: 'Electricity' },
+            { id: 'coal', name: 'Coal' },
+          ],
+        },
+      },
+      electricity: {
+        response: {
+          id: 'electricity',
+          name: 'Electricity',
+          routes: [
+            {
+              id: 'retail-sales',
+              name: 'Retail Sales',
+              facets: [],
+              frequency: [],
+              data: {},
+            },
+          ],
+        },
+      },
+      'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+    };
+  }
+
+  const COAL_METADATA = {
+    response: {
+      id: 'coal',
+      name: 'Coal',
+      routes: [
+        { id: 'mine-production', name: 'Mine Production', facets: [], frequency: [], data: {} },
+      ],
+    },
+  };
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  it('marks the node incomplete rather than passing the stub off as a leaf', async () => {
+    stubApiPaths(fixture());
+
+    const { status } = await getEiaApiService().search('coal', 5, createMockContext());
+
+    expect(isLeafNode(getNode('coal') as RawRouteNode)).toBe(false);
+    // Both index passes landed — the corpus is incomplete purely because of the
+    // missing subtree, and the two conditions are reported apart.
+    expect(status.pendingPasses).toEqual([]);
+    expect(status.incompleteRoutes).toEqual(['coal']);
+    expect(status.complete).toBe(false);
+  });
+
+  it('sweeps only the node that missed, and stops after one sweep', async () => {
+    const { paths } = stubApiPaths(fixture());
+
+    await getEiaApiService().search('coal', 5, createMockContext());
+
+    // `electricity` answered on the first pass, so the sweep leaves it alone;
+    // `coal` is tried once more and then given up on rather than swept again.
+    expect(paths.filter((p) => p === 'electricity')).toHaveLength(1);
+    expect(paths.filter((p) => p === 'coal')).toHaveLength(2);
+  });
+
+  it('re-fetches the node on the next browse instead of caching the miss', async () => {
+    const bodies = fixture();
+    stubApiPaths(bodies);
+    const ctx = createMockContext();
+    await getEiaApiService().search('coal', 5, ctx);
+
+    // The route answers on a later call — as an intermittent failure would.
+    bodies.coal = COAL_METADATA;
+    const result = await getEiaApiService().browse('coal', ctx);
+
+    expect(result.isLeaf).toBe(false);
+    expect(result.children.map((c) => c.route)).toEqual(['coal/mine-production']);
+    // The repaired subtree joins the corpus, and the gap closes.
+    expect(searchRoutes('mine production', 5)[0]?.entry.route).toBe('coal/mine-production');
+    expect(getIndexStatus().incompleteRoutes).toEqual([]);
+    expect(getIndexStatus().complete).toBe(true);
+  });
+
+  it('drops the stale leaf claim the stub left in the index', async () => {
+    const bodies = fixture();
+    stubApiPaths(bodies);
+    const ctx = createMockContext();
+    await getEiaApiService().search('coal', 5, ctx);
+
+    bodies.coal = COAL_METADATA;
+    await getEiaApiService().browse('coal', ctx);
+
+    const [coalEntry] = searchRoutes('Coal', 10).filter((r) => r.entry.route === 'coal');
+    expect(coalEntry?.entry.isLeaf).toBe(false);
+  });
+
+  it('fails the browse when the re-fetch fails too, rather than answering from the stub', async () => {
+    stubApiPaths(fixture());
+    const ctx = createMockContext();
+    await getEiaApiService().search('coal', 5, ctx);
+
+    await expect(getEiaApiService().browse('coal', ctx)).rejects.toThrow(
+      /did not return metadata for route "coal"/,
+    );
+  });
+
+  it('leaves an incomplete node to the live fetch instead of rejecting it as a category', async () => {
+    const bodies = fixture();
+    stubApiPaths(bodies);
+    const ctx = createMockContext();
+    await getEiaApiService().search('coal', 5, ctx);
+
+    // `coal` is a leaf after all — the cached classification must not pre-empt
+    // that, in either direction.
+    bodies.coal = {
+      response: {
+        id: 'coal',
+        name: 'Coal',
+        facets: [],
+        frequency: [],
+        data: { value: { alias: 'Value', units: 'tons' } },
+      },
+    };
+
+    const meta = await getEiaApiService().describe('coal', ctx);
+    expect(meta.route).toBe('coal');
+    expect(meta.dataColumns.map((c) => c.id)).toEqual(['value']);
+  });
+});
+
+/**
+ * The tree build paces its metadata fetches through one gate shared by the
+ * whole recursion, and a node's children are fetched from inside its own task.
+ * That is the shape that deadlocks if a parent holds its slot across the
+ * recursion: once every slot belongs to a parent waiting on a child, no child
+ * can ever acquire one. The gate is only ever held around the leaf fetch, and
+ * these fixtures are wide and deep enough to wedge it if that stops being true.
+ */
+describe('EiaApiService — tree-build pacing under recursive fan-out', () => {
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  /**
+   * A taxonomy of bare stubs — every node costs a metadata fetch. `childCounts`
+   * gives the fan-out per level; a node past the last level answers as a leaf.
+   */
+  function nestedTaxonomy(rootWidth: number, childCounts: number[]): Record<string, unknown> {
+    const bodies: Record<string, unknown> = {
+      'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+    };
+    const stub = (id: string) => ({ id, name: id });
+
+    const expand = (path: string, level: number): void => {
+      const fanOut = childCounts[level];
+      if (fanOut === undefined) {
+        bodies[path] = { response: { id: path, name: path, facets: [], frequency: [], data: {} } };
+        return;
+      }
+      const childIds = Array.from(
+        { length: fanOut },
+        (_, i) => `${path.replaceAll('/', '-')}-${i}`,
+      );
+      bodies[path] = { response: { id: path, name: path, routes: childIds.map(stub) } };
+      for (const childId of childIds) expand(`${path}/${childId}`, level + 1);
+    };
+
+    const rootIds = Array.from({ length: rootWidth }, (_, i) => `cat${i}`);
+    bodies[''] = { response: { routes: rootIds.map(stub) } };
+    for (const id of rootIds) expand(id, 0);
+    return bodies;
+  }
+
+  /** `stubApiPaths`, with each response deferred a tick so overlap is observable. */
+  function stubPacedApiPaths(bodies: Record<string, unknown>) {
+    let inFlight = 0;
+    let peak = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        inFlight--;
+        const path = new URL(String(input)).pathname.replace(/^\/v2\/?/, '').replace(/\/$/, '');
+        const body = bodies[path];
+        return body === undefined
+          ? httpResponse({ status: 404, body: { error: 'not found' } })
+          : httpResponse({ body });
+      }),
+    );
+    return { peak: () => peak };
+  }
+
+  // A hang here IS the failure — it means a parent held its gate slot while
+  // awaiting the children queued behind it.
+  it('builds a tree wider at the root than the gate allows in flight', {
+    timeout: 10_000,
+  }, async () => {
+    stubApiPaths(nestedTaxonomy(12, [3, 2]));
+
+    const { status } = await getEiaApiService().search('cat', 5, createMockContext());
+
+    // 12 categories + 36 children + 72 grandchildren.
+    expect(status.size).toBe(120);
+    expect(status.complete).toBe(true);
+  });
+
+  it('holds the whole recursion to one gate rather than one per level', async () => {
+    const { peak } = stubPacedApiPaths(nestedTaxonomy(12, [3, 2]));
+
+    await getEiaApiService().search('cat', 5, createMockContext());
+
+    // 120 nodes want a metadata fetch; a per-level bound would let a level's
+    // full width run at once, and no bound at all would run 72.
+    expect(peak()).toBe(TREE_BUILD_CONCURRENCY);
+  });
+});
+
+/**
+ * The whole warm lands well inside the budget on a healthy run, so this path is
+ * about the degraded one: an upstream slow enough to outlast the caller's own
+ * request timeout must not turn a slow answer into a transport error that
+ * carries none of the tool's recovery hint.
+ */
+describe('EiaApiService — the search wait is bounded', () => {
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  it('answers from what is indexed when a pass outlasts the budget', async () => {
+    let releaseSteo: () => void = () => {};
+    const steoHeld = new Promise<void>((resolve) => {
+      releaseSteo = resolve;
+    });
+    const bodies: Record<string, unknown> = {
+      '': { response: { routes: [{ id: 'electricity', name: 'Electricity' }] } },
+      electricity: {
+        response: {
+          id: 'electricity',
+          name: 'Electricity',
+          routes: [
+            { id: 'retail-sales', name: 'Retail Sales', facets: [], frequency: [], data: {} },
+          ],
+        },
+      },
+      'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL) => {
+        const path = new URL(String(input)).pathname.replace(/^\/v2\/?/, '').replace(/\/$/, '');
+        if (path === 'steo/facet/seriesId') await steoHeld;
+        return httpResponse({ body: bodies[path] });
+      }),
+    );
+
+    await getEiaApiService().ensureIndexWarmed(createMockContext(), 25);
+
+    // The tree landed, so the answer is real — it is just short one pass, and
+    // says which one rather than reporting a settled corpus.
+    const status = getIndexStatus();
+    expect(status.complete).toBe(false);
+    expect(status.pendingPasses).toEqual(['steo_series']);
+    expect(searchRoutes('retail sales', 5)[0]?.entry.route).toBe('electricity/retail-sales');
+
+    releaseSteo();
+  });
+
+  it('still surfaces a failed tree build rather than answering empty', async () => {
+    stubApiPaths({});
+
+    await expect(
+      getEiaApiService().ensureIndexWarmed(createMockContext(), 5_000),
+    ).rejects.toThrow();
   });
 });

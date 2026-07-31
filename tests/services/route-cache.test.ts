@@ -11,12 +11,15 @@ import {
   buildNodeMap,
   getChildren,
   getIndexSize,
+  getIndexStatus,
   getNode,
   indexFacetValues,
   initRouteCache,
   isLeafNode,
   isRouteCacheReady,
   listVocabularyFacets,
+  markIndexPassSettled,
+  replaceNode,
   searchRoutes,
 } from '@/services/eia/route-cache.js';
 import type { Facet, RawRouteNode } from '@/services/eia/types.js';
@@ -108,6 +111,13 @@ describe('route-cache', () => {
     it('treats node with no routes and no data fields as leaf', () => {
       const node: RawRouteNode = { id: 'orphan', name: 'Orphan' };
       expect(isLeafNode(node)).toBe(true);
+    });
+
+    it('never treats an incomplete node as a leaf', () => {
+      // Identical to the orphan above but for the flag — the absence of leaf
+      // markers is unfetched metadata, not evidence of a data endpoint.
+      const node: RawRouteNode = { id: 'coal', name: 'Coal', incomplete: true };
+      expect(isLeafNode(node)).toBe(false);
     });
   });
 
@@ -244,6 +254,115 @@ describe('route-cache', () => {
       // Same identity, different display text — still a duplicate.
       expect(addEntriesToIndex([{ ...ENTRY, name: 'Crude Oil Production, U.S.' }])).toBe(0);
       expect(getIndexSize()).toBe(7);
+    });
+  });
+
+  describe('getIndexStatus / markIndexPassSettled', () => {
+    it('reports both passes pending before init', () => {
+      expect(getIndexStatus()).toEqual({
+        complete: false,
+        incompleteRoutes: [],
+        pendingPasses: ['facet_values', 'steo_series'],
+        size: 0,
+      });
+    });
+
+    it('is complete only once every pass has landed', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      expect(getIndexStatus().complete).toBe(false);
+
+      markIndexPassSettled('steo_series');
+      expect(getIndexStatus().pendingPasses).toEqual(['facet_values']);
+      expect(getIndexStatus().complete).toBe(false);
+
+      markIndexPassSettled('facet_values');
+      expect(getIndexStatus()).toEqual({
+        complete: true,
+        incompleteRoutes: [],
+        pendingPasses: [],
+        size: 6,
+      });
+    });
+
+    it('stays incomplete while a route subtree is missing, whatever the passes did', () => {
+      initRouteCache([{ id: 'coal', name: 'Coal', incomplete: true }], []);
+      markIndexPassSettled('steo_series');
+      markIndexPassSettled('facet_values');
+
+      const status = getIndexStatus();
+      expect(status.incompleteRoutes).toEqual(['coal']);
+      expect(status.pendingPasses).toEqual([]);
+      expect(status.complete).toBe(false);
+    });
+  });
+
+  describe('replaceNode', () => {
+    const WITH_GAP: RawRouteNode[] = [
+      { id: 'coal', name: 'Coal', description: 'Coal data', incomplete: true },
+      ...SAMPLE_TREE,
+    ];
+
+    const REPAIRED: RawRouteNode = {
+      id: 'coal',
+      name: 'Coal',
+      description: 'Coal data',
+      routes: [
+        {
+          id: 'mine-production',
+          name: 'Mine Production',
+          description: 'Coal production by mine',
+          facets: [],
+          frequency: [],
+          data: {},
+        },
+      ],
+    };
+
+    it('is a no-op before init', () => {
+      expect(() => replaceNode('coal', REPAIRED)).not.toThrow();
+    });
+
+    it('splices the subtree in and clears the gap', () => {
+      initRouteCache(WITH_GAP, []);
+      expect(getIndexStatus().incompleteRoutes).toEqual(['coal']);
+
+      replaceNode('coal', REPAIRED);
+
+      expect(getNode('coal/mine-production')).toBeDefined();
+      expect(getChildren('coal').map((c) => c.route)).toEqual(['coal/mine-production']);
+      expect(getIndexStatus().incompleteRoutes).toEqual([]);
+      expect(searchRoutes('mine production', 5)[0]?.entry.route).toBe('coal/mine-production');
+    });
+
+    it('replaces the stub entry rather than leaving its stale leaf claim indexed', () => {
+      initRouteCache(WITH_GAP, []);
+      replaceNode('coal', REPAIRED);
+
+      const coalEntries = searchRoutes('Coal', 10).filter((r) => r.entry.route === 'coal');
+      expect(coalEntries).toHaveLength(1);
+      expect(coalEntries[0]?.entry.isLeaf).toBe(false);
+    });
+
+    it('leaves appended STEO and facet entries in place', () => {
+      initRouteCache(WITH_GAP, []);
+      indexFacetValues('electricity/retail-sales', [
+        { id: 'fueltypeid', description: 'Fuel Type', values: [{ id: 'WND', name: 'wind' }] },
+      ]);
+
+      replaceNode('coal', REPAIRED);
+
+      expect(searchRoutes('wind', 5)[0]?.entry.filter_hint).toEqual({ fueltypeid: 'WND' });
+      // 8 route nodes after the repair, plus the one facet value.
+      expect(getIndexSize()).toBe(9);
+    });
+
+    it('drops the old subtree instead of stacking a second copy on it', () => {
+      initRouteCache(WITH_GAP, []);
+      replaceNode('coal', REPAIRED);
+      replaceNode('coal', REPAIRED);
+
+      expect(getChildren('coal')).toHaveLength(1);
+      expect(getIndexSize()).toBe(8);
     });
   });
 

@@ -8,12 +8,18 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import * as eiaService from '@/services/eia/eia-service.js';
+import type { IndexStatus } from '@/services/eia/route-cache.js';
 
 vi.mock('@/services/eia/eia-service.js', () => ({
   getEiaApiService: vi.fn(),
   initEiaApiService: vi.fn(),
   _resetEiaApiService: vi.fn(),
 }));
+
+/** A fully warmed corpus of the given size — what search returns normally. */
+function settled(size: number): IndexStatus {
+  return { complete: true, incompleteRoutes: [], pendingPasses: [], size };
+}
 
 const mockSearch = vi.fn();
 
@@ -70,7 +76,7 @@ describe('searchRoutesTool — additional coverage', () => {
           score: 0.05,
         },
       ],
-      totalIndexed: 1500,
+      status: settled(1500),
     });
 
     const ctx = createMockContext();
@@ -96,7 +102,7 @@ describe('searchRoutesTool — additional coverage', () => {
           score: 0.76,
         },
       ],
-      totalIndexed: 2103,
+      status: settled(2103),
     });
 
     const ctx = createMockContext();
@@ -125,7 +131,7 @@ describe('searchRoutesTool — additional coverage', () => {
           score: 0.1,
         },
       ],
-      totalIndexed: 150,
+      status: settled(150),
     });
 
     const ctx = createMockContext();
@@ -216,7 +222,7 @@ describe('searchRoutesTool — additional coverage', () => {
   // ------------------------------------------------------------------
 
   it('handles unicode query without crashing', async () => {
-    mockSearch.mockResolvedValue({ results: [], totalIndexed: 100 });
+    mockSearch.mockResolvedValue({ results: [], status: settled(100) });
 
     const ctx = createMockContext();
     const input = searchRoutesTool.input.parse({ query: 'électricité données' });

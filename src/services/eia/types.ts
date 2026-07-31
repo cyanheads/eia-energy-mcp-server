@@ -37,6 +37,12 @@ export interface RawRouteNode {
    */
   frequency?: RawFrequency[] | Record<string, RawFrequency>;
   id: string;
+  /**
+   * Set when the node's own metadata fetch failed during the warm. The node is
+   * the stub its parent advertised — its children and leaf status are unknown,
+   * so it is neither a leaf nor a category until it is re-fetched.
+   */
+  incomplete?: boolean;
   name: string;
   routes?: RawRouteNode[];
   startPeriod?: string;

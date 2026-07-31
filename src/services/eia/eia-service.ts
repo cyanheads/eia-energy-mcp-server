@@ -4,12 +4,21 @@
  * search. Exposes browse, describe, query, and search methods consumed by MCP
  * tool handlers. `query()` also walks `offset` pages past the inline preview
  * when the caller wants a canvas-bound row set, bounded by EIA_CANVAS_MAX_ROWS.
- * Facet values reach the search index from two directions: a bounded background
- * pass over the vocabulary facets named in the route tree, and every route the
- * caller describes. Both feed the per-route metadata cache, which always holds
- * the full uncapped value set — the cap in eia_describe_route shapes its own
+ * Facet values reach the search index from two directions: a bounded pass over
+ * the vocabulary facets named in the route tree, and every route the caller
+ * describes. Both feed the per-route metadata cache, which always holds the
+ * full uncapped value set — the cap in eia_describe_route shapes its own
  * response only. Rate-limit detection: EIA returns `OVER_RATE_LIMIT` in the
  * response body — classified as ServiceUnavailable (retryable).
+ *
+ * The warm has two milestones. `ensureTreeWarmed` resolves once the route tree
+ * is built — all browse, describe, and query need. `ensureIndexWarmed` also
+ * awaits the two index-widening passes, so `search` never ranks against a
+ * half-filled corpus; that wait is bounded by `SEARCH_WARM_BUDGET_MS` so a
+ * degraded upstream cannot hold a call past the client's own request timeout.
+ * Fetches that fail past their retry budget are recorded rather than swallowed:
+ * the node is kept as an incomplete stub, named in `getIndexStatus()`, and
+ * re-fetched by `repairNode` on the next browse that needs it.
  * @module services/eia/eia-service
  */
 
@@ -26,13 +35,17 @@ import {
   addEntriesToIndex,
   getChildren,
   getIndexSize,
+  getIndexStatus,
   getNode,
+  type IndexStatus,
   indexFacetValues,
   initRouteCache,
   isLeafNode,
   isRouteCacheReady,
   listVocabularyFacets,
+  markIndexPassSettled,
   normalizeDescription,
+  replaceNode,
   searchRoutes,
 } from './route-cache.js';
 import type {
@@ -57,12 +70,97 @@ import type {
 const EIA_MAX_ROWS_PER_REQUEST = 5000;
 
 /**
- * Parallel `/facet/{id}` fetches allowed during the background vocabulary pass.
- * EIA answers `OVER_RATE_LIMIT` to an unbounded burst on top of the ~270
- * requests the route-tree warm already issues, so the pass is deliberately
+ * Parallel `/facet/{id}` fetches allowed during the vocabulary pass. EIA
+ * answers `OVER_RATE_LIMIT` to an unbounded burst, so the pass is deliberately
  * paced rather than fanned out with a single `Promise.all`.
  */
 const FACET_INDEX_CONCURRENCY = 4;
+
+/**
+ * Parallel metadata fetches allowed during the route-tree build. The build
+ * costs ~270 requests, and fanning them out with an unbounded `Promise.all` is
+ * what drew the `OVER_RATE_LIMIT` rejections that used to leave whole subtrees
+ * missing from the corpus. Measured against the live taxonomy: unbounded loses
+ * up to 3 nodes on 1 cold start in 5, 8 loses none. Halving it to 4 costs ~9 s
+ * of warm and clears no additional misses — the residual ones are cleared by
+ * the serial sweep in `buildTree` instead.
+ */
+export const TREE_BUILD_CONCURRENCY = 8;
+
+/**
+ * Ceiling on how long `search` waits for the corpus. The whole warm lands in
+ * 24–30 s measured over seven cold runs against the live API, so this never
+ * fires on a healthy run. It bounds the degraded one: the serial sweep spends
+ * up to four attempts and ~7 s of backoff on each node it still cannot reach,
+ * so the warm that loses nodes is also the warm that takes longest, and a call
+ * held past the client's request timeout (60 s in the MCP SDK) fails as a
+ * transport error carrying none of the recovery hint the tool would otherwise
+ * return. On expiry the search answers from what is indexed so far, reported as
+ * usual by `indexComplete`.
+ */
+const SEARCH_WARM_BUDGET_MS = 45_000;
+
+/**
+ * Await `promise`, giving up at `deadline`. Resolves true when the promise won
+ * and false when the deadline did; a rejection still propagates. A promise the
+ * deadline beat is left running — the warm it stands for keeps filling the
+ * index for the next caller.
+ */
+function raceDeadline(promise: Promise<void>, deadline: number): Promise<boolean> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.resolve(false);
+  return new Promise<boolean>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(false), remaining);
+    promise.then(() => resolve(true), reject).finally(() => clearTimeout(timer));
+  });
+}
+
+/**
+ * Caps how many fetches run at once across a whole recursive tree build. A
+ * shared gate rather than a per-level `Promise.all` bound, because a node's
+ * children are fetched from inside its own task — the recursion would otherwise
+ * multiply each level's width.
+ *
+ * That same shape is why a slot must cover the fetch and nothing more. Hold one
+ * across the recursion and the build wedges as soon as every slot belongs to a
+ * parent waiting on a child that can never acquire one; `tests/services/
+ * eia-service.test.ts` builds a tree wide enough to prove it does not.
+ */
+class ConcurrencyGate {
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.active >= this.limit) {
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    }
+    this.active++;
+    try {
+      return await fn();
+    } finally {
+      this.active--;
+      this.waiting.shift()?.();
+    }
+  }
+}
+
+/** Message text for a caught value of unknown type. */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Route paths in a built tree whose metadata fetch failed. */
+function incompletePaths(nodes: RawRouteNode[], parentPath = ''): string[] {
+  const paths: string[] = [];
+  for (const node of nodes) {
+    const path = parentPath ? `${parentPath}/${node.id}` : node.id;
+    if (node.incomplete) paths.push(path);
+    if (node.routes?.length) paths.push(...incompletePaths(node.routes, path));
+  }
+  return paths;
+}
 
 /**
  * EIA 400 bodies name the rejected dimension verbatim ("Invalid data 'bogus'
@@ -100,8 +198,16 @@ interface DataPage {
 /** Per-route merged metadata cache (populated by describe). */
 const _routeMetaCache = new Map<string, RouteMetadata>();
 
-/** Pending initialization promise (prevents duplicate warm-up). */
-let _initPromise: Promise<void> | undefined;
+/** The two milestones of a single in-flight warm, shared by every caller. */
+interface WarmHandles {
+  /** Resolves once both index-widening passes have settled — and through a failed tree build. */
+  index: Promise<void>;
+  /** Resolves once the route tree is built; rejects when the build fails. */
+  tree: Promise<void>;
+}
+
+/** The one warm in flight or already done (prevents duplicate warm-up). */
+let _warm: WarmHandles | undefined;
 
 class EiaApiService {
   private get baseUrl(): string {
@@ -207,31 +313,73 @@ class EiaApiService {
   }
 
   /**
-   * Warm the route tree cache. Called lazily on first browse/search.
-   * Fetches top-level routes, recursively discovers children via the cache
-   * structure from GET /v2/ and per-node GETs, then builds the Fuse.js index.
-   * STEO series are fetched in parallel and appended to the index.
+   * Await the route tree — everything browse, describe, and query need. The
+   * index-widening passes may still be running when this resolves.
    */
-  async ensureCacheWarmed(ctx: Context): Promise<void> {
+  async ensureTreeWarmed(ctx: Context): Promise<void> {
     if (isRouteCacheReady()) return;
+    await this.warm(ctx).tree;
+  }
 
-    if (_initPromise) {
-      await _initPromise;
+  /**
+   * Await the fully warmed corpus — the tree plus both index-widening passes.
+   * Search takes this path so a caller is never handed a ranking computed over
+   * a half-filled index, which reads exactly like a ranking over the whole one.
+   * The wait is paid once per process; every later search is served from memory.
+   *
+   * `budgetMs` caps the wait, so an upstream slow enough to outlast the client's
+   * own request timeout degrades to a partial answer the caller can recognize
+   * rather than to a transport error. A build failure still rejects.
+   */
+  async ensureIndexWarmed(ctx: Context, budgetMs: number): Promise<void> {
+    const warm = this.warm(ctx);
+    const deadline = Date.now() + budgetMs;
+
+    if (!(await raceDeadline(warm.tree, deadline))) {
+      ctx.log.warning('Answering before the EIA route tree finished warming', { budgetMs });
       return;
     }
-
-    _initPromise = this.warmCache(ctx);
-    try {
-      await _initPromise;
-    } finally {
-      _initPromise = undefined;
+    if (!(await raceDeadline(warm.index, deadline))) {
+      ctx.log.warning('Answering before the EIA search index finished warming', { budgetMs });
     }
   }
 
-  private async warmCache(ctx: Context): Promise<void> {
+  /**
+   * The single warm, started on demand. `index` resolves through a build
+   * failure rather than rejecting, so a caller awaiting only the tree still
+   * sees the error and nothing rejects unobserved.
+   */
+  private warm(ctx: Context): WarmHandles {
+    if (_warm) return _warm;
+
+    const tree = (async () => {
+      if (isRouteCacheReady()) return;
+      try {
+        await this.buildTree(ctx);
+      } catch (err) {
+        // Let the next call retry the warm rather than caching the failure.
+        _warm = undefined;
+        throw err;
+      }
+    })();
+
+    _warm = {
+      tree,
+      index: tree.then(
+        () => this.runIndexPasses(ctx),
+        () => undefined,
+      ),
+    };
+    return _warm;
+  }
+
+  /**
+   * Fetch top-level routes, recursively discover children via per-node GETs,
+   * and build the node map plus the Fuse.js index over it.
+   */
+  private async buildTree(ctx: Context): Promise<void> {
     ctx.log.info('Warming EIA route tree cache');
 
-    // Fetch root to get top-level route IDs
     const rootResponse = await this.fetchJson<{ response: { routes: RawRouteNode[] } }>(
       '',
       {},
@@ -243,33 +391,57 @@ class EiaApiService {
       throw serviceUnavailable('EIA root endpoint returned no routes.');
     }
 
-    // For each top-level node, fetch its metadata to discover sub-routes and
-    // leaf status. We do this recursively until we hit leaf nodes.
-    // Strategy: fetch each top-level node and recurse into non-leaf children.
-    const fullTree = await this.buildRouteTree(topLevelNodes, ctx);
+    let tree = await this.buildRouteTree(
+      topLevelNodes,
+      new ConcurrencyGate(TREE_BUILD_CONCURRENCY),
+      ctx,
+    );
 
-    // Build route map and index (without STEO series initially)
-    initRouteCache(fullTree, []);
+    // What the pass above misses is EIA rate-limiting the burst it is itself
+    // making, so retrying inside it only adds to the pressure. Sweep once the
+    // burst is over, one request at a time — the second pass re-fetches only
+    // the nodes still missing metadata and leaves the rest untouched.
+    const missed = incompletePaths(tree);
+    if (missed.length > 0) {
+      ctx.log.info('Re-fetching route metadata the tree build could not reach', { routes: missed });
+      tree = await this.buildRouteTree(tree, new ConcurrencyGate(1), ctx);
+    }
 
-    // Both index-widening passes run in the background — the tree alone is
-    // enough to answer browse and route-name search, and neither pass should
-    // hold the first call.
-    this.fetchSteoSeries(ctx).catch((err) => {
-      ctx.log.warning('Failed to index STEO series', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-    this.indexVocabularyFacets(ctx).catch((err) => {
-      ctx.log.warning('Failed to index facet values', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+    initRouteCache(tree, []);
 
-    ctx.log.info('EIA route tree cache warmed', { indexSize: getIndexSize() });
+    const { incompleteRoutes } = getIndexStatus();
+    ctx.log.info('EIA route tree built', { indexSize: getIndexSize(), incompleteRoutes });
+  }
+
+  /**
+   * Run both index-widening passes and record which of them landed in full.
+   * A pass that fails leaves the corpus short, which `getIndexStatus()` then
+   * reports — it never takes the tree down with it.
+   */
+  private async runIndexPasses(ctx: Context): Promise<void> {
+    await Promise.all([
+      this.fetchSteoSeries(ctx).then(
+        () => markIndexPassSettled('steo_series'),
+        (err: unknown) => {
+          ctx.log.warning('Failed to index STEO series', { error: errorMessage(err) });
+        },
+      ),
+      this.indexVocabularyFacets(ctx).then(
+        (failed) => {
+          if (failed === 0) markIndexPassSettled('facet_values');
+        },
+        (err: unknown) => {
+          ctx.log.warning('Failed to index facet values', { error: errorMessage(err) });
+        },
+      ),
+    ]);
+
+    ctx.log.info('EIA search corpus warmed', { ...getIndexStatus() });
   }
 
   private async buildRouteTree(
     nodes: RawRouteNode[],
+    gate: ConcurrencyGate,
     ctx: Context,
     depth = 0,
     parentPath = '',
@@ -284,37 +456,87 @@ class EiaApiService {
         // If the node already has sub-routes or leaf indicators, use as-is
         if (node.routes?.length || node.frequency || node.facets || node.data) {
           if (node.routes?.length) {
-            const children = await this.buildRouteTree(node.routes, ctx, depth + 1, nodePath);
+            const children = await this.buildRouteTree(node.routes, gate, ctx, depth + 1, nodePath);
             return { ...node, routes: children };
           }
           return node;
         }
 
-        // Otherwise fetch the node's metadata using its full path.
-        // Preserve node.id — EIA leaf responses return the domain category in
-        // their top-level `id` field (e.g. "petroleum"), not the route segment
-        // (e.g. "gnd"). Without this guard the merge would overwrite the
-        // segment ID and corrupt the path when buildNodeMap runs later.
+        // Otherwise fetch the node's metadata using its full path. A failure
+        // here has already exhausted fetchJson's retry budget, so the node is
+        // marked incomplete rather than kept as a bare stub — a stub carries
+        // none of routes/facets/data and would read as a queryable leaf, hiding
+        // both the real children and the fact that anything went wrong.
+        let fetched: RawRouteNode | undefined;
         try {
-          const resp = await this.fetchJson<{ response: RawRouteNode }>(nodePath, {}, ctx);
-          const fetched = resp?.response;
-          if (!fetched) return node;
-
-          // Preserve id and name from the stub — EIA leaf responses use the
-          // domain category as `id` (not the route segment) and often omit `name`.
-          const merged = { ...fetched, id: node.id, name: node.name ?? fetched.id };
-          if (merged.routes?.length) {
-            const children = await this.buildRouteTree(merged.routes, ctx, depth + 1, nodePath);
-            return { ...merged, routes: children };
-          }
-          return merged;
-        } catch {
-          return node;
+          const resp = await gate.run(() =>
+            this.fetchJson<{ response: RawRouteNode }>(nodePath, {}, ctx),
+          );
+          fetched = resp?.response;
+        } catch (err) {
+          ctx.log.warning('EIA route metadata fetch failed — subtree unknown', {
+            route: nodePath,
+            error: errorMessage(err),
+          });
+          return { ...node, incomplete: true };
         }
+        if (!fetched) {
+          ctx.log.warning('EIA route metadata was empty — subtree unknown', { route: nodePath });
+          return { ...node, incomplete: true };
+        }
+
+        // Preserve id and name from the stub — EIA leaf responses use the
+        // domain category as `id` (e.g. "petroleum") rather than the route
+        // segment (e.g. "gnd"), and often omit `name`. Without this guard the
+        // merge would corrupt the path when buildNodeMap runs later.
+        const merged = { ...fetched, id: node.id, name: node.name ?? fetched.id };
+        if (merged.routes?.length) {
+          const children = await this.buildRouteTree(merged.routes, gate, ctx, depth + 1, nodePath);
+          return { ...merged, routes: children };
+        }
+        return merged;
       }),
     );
 
     return enriched;
+  }
+
+  /**
+   * Re-fetch a node whose warm-time metadata fetch failed and splice the result
+   * into the cached tree. The miss is not held for the process lifetime — the
+   * first call that needs the node pays one request to repair it. Throws when
+   * the re-fetch fails too, rather than answering from the stub.
+   */
+  private async repairNode(path: string, ctx: Context): Promise<RawRouteNode> {
+    const stub = getNode(path);
+    if (!stub) {
+      throw notFound(`Route "${path}" not found in the EIA taxonomy.`, {
+        reason: 'route_not_found',
+        recovery: {
+          hint: 'Call eia_browse_routes without a path to see valid top-level categories.',
+        },
+      });
+    }
+
+    ctx.log.info('Re-fetching a route left incomplete by the warm', { route: path });
+    const parentPath = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+    const [repaired] = await this.buildRouteTree(
+      [stub],
+      new ConcurrencyGate(TREE_BUILD_CONCURRENCY),
+      ctx,
+      path.split('/').length - 1,
+      parentPath,
+    );
+
+    if (!repaired || repaired.incomplete) {
+      throw serviceUnavailable(`EIA did not return metadata for route "${path}".`, {
+        route: path,
+        recovery: { hint: 'Retry the call; if it persists, check api.eia.gov availability.' },
+      });
+    }
+
+    replaceNode(path, repaired);
+    return repaired;
   }
 
   private async fetchSteoSeries(ctx: Context): Promise<void> {
@@ -367,29 +589,34 @@ class EiaApiService {
    * the route that exposes it. Bounded on both sides: `listVocabularyFacets()`
    * selects a fraction of the taxonomy's facets, and each fetch is paced by
    * `FACET_INDEX_CONCURRENCY`. A facet that fails is skipped, matching how
-   * `fetchAndCacheMetadata` tolerates a single failing facet endpoint.
+   * `fetchAndCacheMetadata` tolerates a single failing facet endpoint — but it
+   * is counted and returned, because a skipped facet leaves vocabulary out of
+   * the corpus and the caller is entitled to know the pass fell short.
    */
-  private async indexVocabularyFacets(ctx: Context): Promise<void> {
+  private async indexVocabularyFacets(ctx: Context): Promise<number> {
     const targets = listVocabularyFacets();
-    if (targets.length === 0) return;
+    if (targets.length === 0) return 0;
 
+    const gate = new ConcurrencyGate(FACET_INDEX_CONCURRENCY);
     let indexed = 0;
     let failed = 0;
-    for (let i = 0; i < targets.length; i += FACET_INDEX_CONCURRENCY) {
-      const batch = targets.slice(i, i + FACET_INDEX_CONCURRENCY);
-      const counts = await Promise.all(
-        batch.map(async ({ route, facetId, description }): Promise<number> => {
+    await Promise.all(
+      targets.map(({ route, facetId, description }) =>
+        gate.run(async () => {
           try {
             const facet = await this.fetchFacet(route, { id: facetId, description }, ctx);
-            return indexFacetValues(route, [facet]);
-          } catch {
+            indexed += indexFacetValues(route, [facet]);
+          } catch (err) {
             failed++;
-            return 0;
+            ctx.log.warning('EIA facet fetch failed — vocabulary missing from the index', {
+              route,
+              facetId,
+              error: errorMessage(err),
+            });
           }
         }),
-      );
-      for (const count of counts) indexed += count;
-    }
+      ),
+    );
 
     ctx.log.info('Facet values indexed', {
       facets: targets.length,
@@ -397,11 +624,14 @@ class EiaApiService {
       values: indexed,
       indexSize: getIndexSize(),
     });
+    return failed;
   }
 
   /**
    * Browse child routes at a given path. Returns list of children with leaf
-   * classification.
+   * classification. A path the warm left incomplete is re-fetched here rather
+   * than answered from its stub, which would report no children and a leaf
+   * classification the server never established.
    */
   async browse(
     path: string | undefined,
@@ -411,13 +641,13 @@ class EiaApiService {
     children: RouteEntry[];
     isLeaf: boolean;
   }> {
-    await this.ensureCacheWarmed(ctx);
+    await this.ensureTreeWarmed(ctx);
 
     const normalizedPath = path?.trim() ?? '';
 
     // Check if the path itself is a leaf
     if (normalizedPath) {
-      const node = getNode(normalizedPath);
+      let node = getNode(normalizedPath);
       if (!node) {
         throw notFound(`Route "${normalizedPath}" not found in the EIA taxonomy.`, {
           reason: 'route_not_found',
@@ -426,6 +656,7 @@ class EiaApiService {
           },
         });
       }
+      if (node.incomplete) node = await this.repairNode(normalizedPath, ctx);
 
       const selfIsLeaf = isLeafNode(node);
       if (selfIsLeaf) {
@@ -465,7 +696,7 @@ class EiaApiService {
     const cached = _routeMetaCache.get(route);
     if (cached) return cached;
 
-    await this.ensureCacheWarmed(ctx);
+    await this.ensureTreeWarmed(ctx);
 
     const node = route ? getNode(route) : undefined;
     if (!node && route) {
@@ -483,7 +714,9 @@ class EiaApiService {
       return meta;
     }
 
-    if (node && !isLeafNode(node)) {
+    // An incomplete node was never classified, so the cached pre-flight has
+    // nothing to say about it — the live fetch below decides instead.
+    if (node && !node.incomplete && !isLeafNode(node)) {
       throw validationError(
         `Route "${route}" is a category, not a leaf — it has no data to query.`,
         {
@@ -628,9 +861,10 @@ class EiaApiService {
   ): Promise<DataResponse> {
     // Pre-flight: if the route is in the cache as a category node, fail early
     // with a typed error rather than letting the EIA API return a generic 404.
-    await this.ensureCacheWarmed(ctx);
+    // An incomplete node is skipped — it was never classified either way.
+    await this.ensureTreeWarmed(ctx);
     const cachedNode = getNode(route);
-    if (cachedNode && !isLeafNode(cachedNode)) {
+    if (cachedNode && !cachedNode.incomplete && !isLeafNode(cachedNode)) {
       throw validationError(
         `Route "${route}" is a category, not a leaf — it has no data to query.`,
         {
@@ -795,7 +1029,7 @@ class EiaApiService {
           route,
           nextOffset,
           staged: rows.length,
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessage(err),
         });
         break;
       }
@@ -815,15 +1049,22 @@ class EiaApiService {
     return { cap, capped, rows };
   }
 
-  /** Fuzzy search across the route index. */
+  /**
+   * Fuzzy search across the route index, answered once the corpus is as
+   * complete as this process can make it within `SEARCH_WARM_BUDGET_MS`.
+   * `status` travels with the results so a short or oddly-ranked answer is
+   * never mistaken for a settled one.
+   */
   async search(
     query: string,
     limit: number,
     ctx: Context,
-  ): Promise<{ results: Array<{ entry: SearchIndexEntry; score: number }>; totalIndexed: number }> {
-    await this.ensureCacheWarmed(ctx);
-    const results = searchRoutes(query, limit);
-    return { results, totalIndexed: getIndexSize() };
+  ): Promise<{
+    results: Array<{ entry: SearchIndexEntry; score: number }>;
+    status: IndexStatus;
+  }> {
+    await this.ensureIndexWarmed(ctx, SEARCH_WARM_BUDGET_MS);
+    return { results: searchRoutes(query, limit), status: getIndexStatus() };
   }
 }
 
@@ -843,5 +1084,5 @@ export function getEiaApiService(): EiaApiService {
 export function _resetEiaApiService(): void {
   _service = undefined;
   _routeMetaCache.clear();
-  _initPromise = undefined;
+  _warm = undefined;
 }

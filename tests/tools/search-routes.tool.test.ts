@@ -7,12 +7,18 @@ import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import * as eiaService from '@/services/eia/eia-service.js';
+import type { IndexStatus } from '@/services/eia/route-cache.js';
 
 vi.mock('@/services/eia/eia-service.js', () => ({
   getEiaApiService: vi.fn(),
   initEiaApiService: vi.fn(),
   _resetEiaApiService: vi.fn(),
 }));
+
+/** A fully warmed corpus of the given size — what search returns normally. */
+function settled(size: number): IndexStatus {
+  return { complete: true, incompleteRoutes: [], pendingPasses: [], size };
+}
 
 const mockSearch = vi.fn();
 
@@ -48,7 +54,7 @@ describe('searchRoutesTool', () => {
           score: 0.3,
         },
       ],
-      totalIndexed: 150,
+      status: settled(150),
     });
 
     const ctx = createMockContext();
@@ -71,7 +77,7 @@ describe('searchRoutesTool', () => {
   });
 
   it('returns empty results on no match', async () => {
-    mockSearch.mockResolvedValue({ results: [], totalIndexed: 150 });
+    mockSearch.mockResolvedValue({ results: [], status: settled(150) });
 
     const ctx = createMockContext();
     const input = searchRoutesTool.input.parse({ query: 'zzznomatch' });
@@ -100,7 +106,7 @@ describe('searchRoutesTool', () => {
       },
       score: 0.1,
     }));
-    mockSearch.mockResolvedValue({ results: entries, totalIndexed: 150 });
+    mockSearch.mockResolvedValue({ results: entries, status: settled(150) });
 
     const ctx = createMockContext();
     const input = searchRoutesTool.input.parse({ query: 'electricity', limit: 5 });
@@ -114,7 +120,7 @@ describe('searchRoutesTool', () => {
   });
 
   it('respects limit parameter', async () => {
-    mockSearch.mockResolvedValue({ results: [], totalIndexed: 0 });
+    mockSearch.mockResolvedValue({ results: [], status: settled(0) });
 
     const ctx = createMockContext();
     const input = searchRoutesTool.input.parse({ query: 'energy', limit: 5 });
@@ -124,13 +130,83 @@ describe('searchRoutesTool', () => {
   });
 
   it('uses default limit of 10', async () => {
-    mockSearch.mockResolvedValue({ results: [], totalIndexed: 0 });
+    mockSearch.mockResolvedValue({ results: [], status: settled(0) });
 
     const ctx = createMockContext();
     const input = searchRoutesTool.input.parse({ query: 'energy' });
     await searchRoutesTool.handler(input, ctx);
 
     expect(mockSearch).toHaveBeenCalledWith('energy', 10, ctx);
+  });
+
+  it('reports a corpus gap alongside the results rather than only when empty', async () => {
+    mockSearch.mockResolvedValue({
+      results: [
+        {
+          entry: {
+            route: 'coal/reserves-capacity',
+            name: 'Reserves Capacity',
+            description: 'Coal capacity data',
+            isLeaf: true,
+            category: 'coal',
+          },
+          score: 0.62,
+        },
+      ],
+      status: {
+        complete: false,
+        incompleteRoutes: ['aeo/2020'],
+        pendingPasses: ['facet_values'],
+        size: 2058,
+      },
+    });
+
+    const ctx = createMockContext();
+    const input = searchRoutesTool.input.parse({ query: 'wind' });
+    await searchRoutesTool.handler(input, ctx);
+
+    // The dangerous case is a plausible hit, not an empty set — the flag rides
+    // along with results too.
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.indexComplete).toBe(false);
+    expect(enrichment.indexGaps).toEqual(['aeo/2020', 'facet_values']);
+    expect(enrichment.totalIndexed).toBe(2058);
+  });
+
+  it('omits indexGaps and marks the corpus complete when nothing is missing', async () => {
+    mockSearch.mockResolvedValue({ results: [], status: settled(2103) });
+
+    const ctx = createMockContext();
+    const input = searchRoutesTool.input.parse({ query: 'zzznomatch' });
+    await searchRoutesTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.indexComplete).toBe(true);
+    expect(enrichment.indexGaps).toBeUndefined();
+    // A genuine no-match keeps the plain notice, with no retry suggestion.
+    expect(enrichment.notice).toMatch(/^No routes matched "zzznomatch"\. Try different/);
+  });
+
+  it('tells a caller the empty set may be an artifact when the corpus is short', async () => {
+    mockSearch.mockResolvedValue({
+      results: [],
+      status: { complete: false, incompleteRoutes: [], pendingPasses: ['steo_series'], size: 634 },
+    });
+
+    const ctx = createMockContext();
+    const input = searchRoutesTool.input.parse({ query: 'ethanol net imports' });
+    await searchRoutesTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toMatch(/part of the corpus is missing/);
+    expect(enrichment.indexGaps).toEqual(['steo_series']);
+  });
+
+  describe('enrichmentTrailer', () => {
+    it('labels indexGaps itself — a custom render owns the whole trailer line', () => {
+      const render = searchRoutesTool.enrichmentTrailer?.indexGaps?.render;
+      expect(render?.(['aeo/2020', 'facet_values'])).toBe('**indexGaps:** aeo/2020, facet_values');
+    });
   });
 
   describe('format()', () => {
