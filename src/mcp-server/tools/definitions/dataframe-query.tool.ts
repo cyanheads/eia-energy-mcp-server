@@ -14,7 +14,7 @@ import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 export const dataframeQueryTool = tool('eia_dataframe_query', {
   title: 'Query EIA Dataframes',
   description:
-    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh TTL.',
+    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh expiry. Every dataframe named in the statement has its expiry extended by the query.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -30,6 +30,34 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       when: 'SQL references a denied system catalog (information_schema, pg_catalog, sqlite_master, duckdb_*).',
       recovery: 'Query only df_<id> tables — list them with eia_dataframe_describe.',
     },
+    {
+      reason: 'missing_table',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'SQL references a df_<id> table that is not staged — mistyped, already dropped, or past its expiry.',
+      recovery:
+        'Call eia_dataframe_describe to list the staged handles, or re-run eia_query_route to stage the data again.',
+    },
+    {
+      reason: 'non_select_statement',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The statement is not a single read-only SELECT — writes, DDL, DROP, COPY, PRAGMA, and ATTACH are rejected.',
+      recovery:
+        'Rewrite the statement as one SELECT; to persist a result, pass register_as instead of writing to the canvas.',
+    },
+    {
+      reason: 'invalid_sql',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'DuckDB could not parse or bind the statement — a syntax error, or a column or alias that does not exist on the referenced dataframe.',
+      recovery:
+        'Correct the statement and retry — eia_dataframe_describe reports the exact column names of every staged dataframe, which carry {col}_units where the inline preview shows {col}-units.',
+    },
+    {
+      reason: 'register_as_clash',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'register_as names a dataframe that is already staged for this tenant.',
+      recovery:
+        'Pass a different register_as name — any unused name works; eia_dataframe_describe lists the taken ones.',
+    },
   ],
 
   input: z.object({
@@ -41,9 +69,10 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       ),
     register_as: z
       .string()
+      .min(1)
       .optional()
       .describe(
-        'When set, persist the result as a new dataframe with a fresh TTL. Use to chain analyses without re-running upstream queries. Conflicts with an existing name throw Conflict.',
+        'When set, persist the result as a new dataframe with a fresh expiry. Use to chain analyses without re-running upstream queries. The name must be unused — reusing a staged name is rejected, and the fix is a different name, not dropping the existing dataframe. eia_dataframe_describe lists the names already taken.',
       ),
     preview: z
       .number()
@@ -80,7 +109,9 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
     expires_at: z
       .string()
       .optional()
-      .describe('ISO 8601 expiry for the newly registered dataframe, when applicable.'),
+      .describe(
+        'ISO 8601 expiry for the newly registered dataframe, when applicable. Extended each time a later query references it.',
+      ),
   }),
 
   enrichment: {

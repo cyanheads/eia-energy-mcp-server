@@ -45,6 +45,9 @@ describe('dataframeDescribeTool', () => {
     const result = await dataframeDescribeTool.handler(input, ctx);
 
     expect(result.dataframes).toHaveLength(0);
+    expect(result.active_names).toEqual([]);
+    expect(result.found).toBeUndefined();
+    expect(result.requested_name).toBeUndefined();
   });
 
   it('returns dataframe metadata with all fields', async () => {
@@ -83,13 +86,14 @@ describe('dataframeDescribeTool', () => {
 
   describe('format()', () => {
     it('renders empty state message', () => {
-      const blocks = dataframeDescribeTool.format!({ dataframes: [] });
+      const blocks = dataframeDescribeTool.format!({ dataframes: [], active_names: [] });
       expect((blocks[0] as { text: string }).text).toContain('No active dataframes');
     });
 
     it('renders dataframe metadata including nullable column info', () => {
       const now = new Date().toISOString();
       const result = {
+        active_names: ['df_TEST'],
         dataframes: [
           {
             name: 'df_TEST',

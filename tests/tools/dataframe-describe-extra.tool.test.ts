@@ -29,24 +29,14 @@ describe('dataframeDescribeTool — additional coverage', () => {
   // name filter parameter forwarded to bridge
   // ------------------------------------------------------------------
 
-  it('passes name to bridge.describe when name is supplied', async () => {
+  it('always lists unscoped so a miss can be told from an empty canvas', async () => {
     mockDescribe.mockResolvedValue([]);
 
     const ctx = createMockContext({ errors: dataframeDescribeTool.errors, tenantId: 'test' });
     const input = dataframeDescribeTool.input.parse({ name: 'df_TEST' });
     await dataframeDescribeTool.handler(input, ctx);
 
-    expect(mockDescribe).toHaveBeenCalledWith(ctx, 'df_TEST');
-  });
-
-  it('passes undefined to bridge.describe when name is omitted', async () => {
-    mockDescribe.mockResolvedValue([]);
-
-    const ctx = createMockContext({ errors: dataframeDescribeTool.errors, tenantId: 'test' });
-    const input = dataframeDescribeTool.input.parse({});
-    await dataframeDescribeTool.handler(input, ctx);
-
-    expect(mockDescribe).toHaveBeenCalledWith(ctx, undefined);
+    expect(mockDescribe).toHaveBeenCalledWith(ctx);
   });
 
   // ------------------------------------------------------------------
@@ -77,6 +67,73 @@ describe('dataframeDescribeTool — additional coverage', () => {
   });
 
   // ------------------------------------------------------------------
+  // #33 — a name that does not resolve is a miss, not an empty workspace
+  // ------------------------------------------------------------------
+
+  describe('unknown name with other dataframes staged (#33)', () => {
+    const staged = (tableName: string) => ({
+      tableName,
+      sourceTool: 'eia_query_route',
+      queryParams: { route: 'steo' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      expiresAt: '2026-01-02T00:00:00.000Z',
+      rowCount: 5,
+      truncated: false,
+      maxRows: undefined,
+      columnSchema: [],
+    });
+
+    it('reports found=false and the handles that are staged', async () => {
+      mockDescribe.mockResolvedValue([staged('df_AAAAA_BBBBB'), staged('df_CCCCC_DDDDD')]);
+
+      const ctx = createMockContext({ errors: dataframeDescribeTool.errors, tenantId: 'test' });
+      const input = dataframeDescribeTool.input.parse({ name: 'df_NOPE' });
+      const result = await dataframeDescribeTool.handler(input, ctx);
+
+      expect(result.found).toBe(false);
+      expect(result.requested_name).toBe('df_NOPE');
+      expect(result.dataframes).toHaveLength(0);
+      expect(result.active_names).toEqual(['df_AAAAA_BBBBB', 'df_CCCCC_DDDDD']);
+    });
+
+    it('reports found=true and only the requested entry on a hit', async () => {
+      mockDescribe.mockResolvedValue([staged('df_AAAAA_BBBBB'), staged('df_CCCCC_DDDDD')]);
+
+      const ctx = createMockContext({ errors: dataframeDescribeTool.errors, tenantId: 'test' });
+      const input = dataframeDescribeTool.input.parse({ name: 'df_CCCCC_DDDDD' });
+      const result = await dataframeDescribeTool.handler(input, ctx);
+
+      expect(result.found).toBe(true);
+      expect(result.dataframes.map((d) => d.name)).toEqual(['df_CCCCC_DDDDD']);
+      expect(result.active_names).toHaveLength(2);
+    });
+
+    it('renders the miss with the usable handles rather than "No active dataframes"', () => {
+      const blocks = dataframeDescribeTool.format!({
+        requested_name: 'df_NOPE',
+        found: false,
+        active_names: ['df_AAAAA_BBBBB', 'df_CCCCC_DDDDD'],
+        dataframes: [],
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toBe(
+        'df_NOPE not found. 2 active dataframe(s): df_AAAAA_BBBBB, df_CCCCC_DDDDD.',
+      );
+      expect(text).not.toContain('No active dataframes');
+    });
+
+    it('renders a miss on a genuinely empty canvas without claiming siblings', () => {
+      const blocks = dataframeDescribeTool.format!({
+        requested_name: 'df_NOPE',
+        found: false,
+        active_names: [],
+        dataframes: [],
+      });
+      expect((blocks[0] as { text: string }).text).toBe('df_NOPE not found. No active dataframes.');
+    });
+  });
+
+  // ------------------------------------------------------------------
   // format() — truncated with max_rows vs without
   // ------------------------------------------------------------------
 
@@ -84,6 +141,7 @@ describe('dataframeDescribeTool — additional coverage', () => {
     it('renders truncated with max_rows value when provided', () => {
       const now = new Date().toISOString();
       const result = {
+        active_names: ['df_TRUNC'],
         dataframes: [
           {
             name: 'df_TRUNC',
@@ -106,6 +164,7 @@ describe('dataframeDescribeTool — additional coverage', () => {
     it('renders truncated without max_rows when max_rows is absent', () => {
       const now = new Date().toISOString();
       const result = {
+        active_names: ['df_TRUNC2'],
         dataframes: [
           {
             name: 'df_TRUNC2',
@@ -129,6 +188,7 @@ describe('dataframeDescribeTool — additional coverage', () => {
     it('renders multiple dataframes correctly', () => {
       const now = new Date().toISOString();
       const result = {
+        active_names: ['df_FIRST', 'df_SECOND'],
         dataframes: [
           {
             name: 'df_FIRST',

@@ -1,8 +1,10 @@
 /**
  * @fileoverview Tool definition for eia_dataframe_describe. Lists canvas
- * dataframes materialized by eia_query_route with provenance, TTL, row count,
- * and column schema. Lazy-sweeps expired tables before responding so the list
- * is always current.
+ * dataframes materialized by eia_query_route with provenance, expiry, row
+ * count, and column schema. Reconciles stored provenance against the canvas's
+ * live tables before responding so the list is always current, and reports a
+ * name that does not resolve as a miss against the staged set rather than as an
+ * empty workspace.
  * @module mcp-server/tools/definitions/dataframe-describe.tool
  */
 
@@ -13,7 +15,7 @@ import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 export const dataframeDescribeTool = tool('eia_dataframe_describe', {
   title: 'Describe EIA Dataframes',
   description:
-    'List canvas dataframes (df_<id>) materialized by eia_query_route, with provenance, TTL, row count, and column schema. Lazy-sweeps expired tables before responding so the list is always current. Pass a specific name to inspect one dataframe; omit to list all active dataframes for this tenant.',
+    'List canvas dataframes (df_<id>) materialized by eia_query_route, with provenance, expiry, row count, and column schema. Drops entries for dataframes the canvas no longer holds before responding, so the list is always current. Pass a specific name to inspect one dataframe; omit to list all active dataframes for this tenant. A name that is not staged comes back as found=false alongside the handles that are, never as an empty list. Listing is not use: only an eia_dataframe_query statement naming a dataframe extends its expiry, so a dataframe polled with this tool and never queried still lapses on schedule.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -35,6 +37,21 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
   }),
 
   output: z.object({
+    requested_name: z
+      .string()
+      .optional()
+      .describe('Echo of the name input. Absent when no name was supplied.'),
+    found: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the requested name is staged, false when it is not. Absent when no name was supplied — an unscoped list has nothing to resolve.',
+      ),
+    active_names: z
+      .array(z.string())
+      .describe(
+        'Every df_<id> handle staged for this tenant, regardless of the requested scope. On a miss these are the handles that are still usable.',
+      ),
     dataframes: z
       .array(
         z
@@ -45,7 +62,12 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
               .record(z.string(), z.unknown())
               .describe('Input parameters the source tool was called with.'),
             created_at: z.string().describe('ISO 8601 creation timestamp.'),
-            expires_at: z.string().describe('ISO 8601 expiry timestamp (sliding TTL).'),
+            expires_at: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 8601 expiry, extended each time an eia_dataframe_query statement references this dataframe. Reading it here does not extend it. Absent when the dataframe carries no expiry of its own and follows the canvas lifecycle.',
+              ),
             row_count: z.number().describe('Rows materialized in the dataframe.'),
             truncated: z
               .boolean()
@@ -68,7 +90,9 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
           })
           .describe('A canvas dataframe entry.'),
       )
-      .describe('Active dataframes for this tenant, newest first. Empty when none are registered.'),
+      .describe(
+        'Dataframes matching the requested scope, newest first. Empty when nothing is staged, or when a supplied name does not resolve — read found and active_names to tell those apart.',
+      ),
   }),
 
   async handler(input, ctx) {
@@ -79,9 +103,20 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
       });
     }
 
-    const entries = await bridge.describe(ctx, input.name);
+    // Always list unscoped, then narrow locally: the full set is what
+    // distinguishes "that handle is not staged" from "nothing is staged", and
+    // it is what a caller who mistyped a handle needs back.
+    const entries = await bridge.describe(ctx);
+    const scoped =
+      input.name === undefined ? entries : entries.filter((e) => e.tableName === input.name);
+
     return {
-      dataframes: entries.map((meta) => ({
+      ...(input.name !== undefined && {
+        requested_name: input.name,
+        found: scoped.length > 0,
+      }),
+      active_names: entries.map((meta) => meta.tableName),
+      dataframes: scoped.map((meta) => ({
         name: meta.tableName,
         source_tool: meta.sourceTool,
         query_params: meta.queryParams,
@@ -100,11 +135,25 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
   },
 
   format: (result) => {
-    if (result.dataframes.length === 0) {
-      return [{ type: 'text', text: 'No active dataframes.' }];
+    const active =
+      result.active_names.length > 0
+        ? `${result.active_names.length} active dataframe(s): ${result.active_names.join(', ')}`
+        : 'No active dataframes';
+
+    if (result.requested_name !== undefined && result.dataframes.length === 0) {
+      return [{ type: 'text', text: `${result.requested_name} not found. ${active}.` }];
     }
 
-    const lines: string[] = [`**${result.dataframes.length} active dataframe(s):**\n`];
+    const heading =
+      result.requested_name !== undefined
+        ? `**${result.requested_name}** is staged. ${active}.`
+        : `**${active}.**`;
+
+    if (result.dataframes.length === 0) {
+      return [{ type: 'text', text: heading }];
+    }
+
+    const lines: string[] = [`${heading}\n`];
     for (const df of result.dataframes) {
       const truncated = df.truncated
         ? ` (truncated${df.max_rows != null ? ` at ${df.max_rows}` : ''})`
@@ -112,7 +161,9 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
       lines.push(`### ${df.name}`);
       lines.push(`- Source: ${df.source_tool}`);
       lines.push(`- Rows: ${df.row_count}${truncated}`);
-      lines.push(`- Created: ${df.created_at} — Expires: ${df.expires_at}`);
+      lines.push(
+        `- Created: ${df.created_at}${df.expires_at ? ` — Expires: ${df.expires_at}` : ''}`,
+      );
       const paramEntries = Object.entries(df.query_params);
       if (paramEntries.length > 0) {
         const params = paramEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');

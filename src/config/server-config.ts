@@ -15,7 +15,9 @@ const ServerConfigSchema = z.object({
     .int()
     .positive()
     .default(86400)
-    .describe('Per-table TTL for canvas dataframes in seconds (default 24 h)'),
+    .describe(
+      'Sliding per-dataframe TTL in seconds, extended by every query that references the dataframe (default 24 h)',
+    ),
   canvasMaxRows: z.coerce
     .number()
     .int()

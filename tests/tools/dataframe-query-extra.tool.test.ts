@@ -111,6 +111,46 @@ describe('dataframeQueryTool — additional coverage', () => {
   });
 
   // ------------------------------------------------------------------
+  // #34 — every reason the tool can produce is declared, with a recovery
+  // the caller can act on using this server's own tools
+  // ------------------------------------------------------------------
+
+  describe('error contract coverage (#34)', () => {
+    it.each([
+      ['missing_table', JsonRpcErrorCode.NotFound],
+      ['non_select_statement', JsonRpcErrorCode.ValidationError],
+      ['invalid_sql', JsonRpcErrorCode.ValidationError],
+      ['register_as_clash', JsonRpcErrorCode.ValidationError],
+      ['system_catalog_access', JsonRpcErrorCode.ValidationError],
+      ['canvas_unavailable', JsonRpcErrorCode.ServiceUnavailable],
+    ] as const)('declares %s at the code the framework actually throws', (reason, code) => {
+      const entry = dataframeQueryTool.errors?.find((e) => e.reason === reason);
+      expect(entry).toBeDefined();
+      expect(entry?.code).toBe(code);
+      expect(entry?.recovery.length).toBeGreaterThan(0);
+    });
+
+    it('phrases every recovery in server tool names, never framework methods', () => {
+      const frameworkOnly = /registerTable\(|\bdescribe\(\)|\bclear\(\)|denySystemCatalogs/;
+      for (const entry of dataframeQueryTool.errors ?? []) {
+        expect(entry.recovery).not.toMatch(frameworkOnly);
+      }
+    });
+
+    it('points a register_as clash at a different name, not at the opt-in drop tool', () => {
+      const entry = dataframeQueryTool.errors?.find((e) => e.reason === 'register_as_clash');
+      expect(entry?.recovery).toMatch(/different register_as name/);
+      expect(entry?.recovery).not.toMatch(/eia_dataframe_drop/);
+    });
+
+    it('drops the stale Conflict claim from the register_as description', () => {
+      const shape = dataframeQueryTool.input.shape as { register_as: { description?: string } };
+      expect(shape.register_as.description).not.toMatch(/Conflict/);
+      expect(shape.register_as.description).toMatch(/must be unused/);
+    });
+  });
+
+  // ------------------------------------------------------------------
   // Security: no env secret in error output
   // ------------------------------------------------------------------
 

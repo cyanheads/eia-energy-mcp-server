@@ -12,9 +12,9 @@
 | `eia_describe_route` | Returns full metadata for a leaf route: available facets with their valid values, data column names, frequency options, units, and date range. Call before `eia_query_route` to understand filter options. | `route` (e.g. `electricity/retail-sales`) | `readOnlyHint`, `openWorldHint: false` |
 | `eia_search_routes` | Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. | `query`, `limit?` | `readOnlyHint`, `openWorldHint: false` |
 | `eia_query_route` | Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Returns a preview inline; spills large result sets to a DataCanvas table for SQL analysis by paging past the preview up to `EIA_CANVAS_MAX_ROWS`. Returns `dataset` (`df_<id>`) when spillover occurs. | `route`, `filters?` (facet key-value pairs), `start?`, `end?`, `frequency?`, `columns?`, `sort?`, `offset?`, `length?` | `readOnlyHint`, `openWorldHint: false` |
-| `eia_dataframe_describe` | List canvas dataframes materialized by `eia_query_route`, with provenance, TTL, row count, and column schema. | `name?` (single `df_<id>` or omit for all) | `readOnlyHint`, `idempotentHint`, `openWorldHint: false` |
+| `eia_dataframe_describe` | List canvas dataframes materialized by `eia_query_route`, with provenance, expiry, row count, and column schema. A `name` that is not staged returns `found: false` alongside the handles that are. Listing does not extend a dataframe's expiry. | `name?` (single `df_<id>` or omit for all) | `readOnlyHint`, `idempotentHint`, `openWorldHint: false` |
 | `eia_dataframe_query` | Run a single-statement SELECT across canvas dataframes. Supports `register_as` to persist results as new dataframes. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected by the framework SQL gate. System catalogs are denied at the bridge layer. | `sql`, `register_as?`, `preview?`, `row_limit?` | `readOnlyHint`, `idempotentHint`, `openWorldHint: false` |
-| `eia_dataframe_drop` | Drop a canvas dataframe by name. **Opt-in** via `EIA_DATAFRAME_DROP_ENABLED=true` — off by default since TTL handles cleanup. Idempotent: returns `dropped=false` when nothing matched. | `name` | `readOnlyHint: false`, `idempotentHint`, `destructiveHint: true` |
+| `eia_dataframe_drop` | Drop a canvas dataframe by name. **Opt-in** via `EIA_DATAFRAME_DROP_ENABLED=true` — off by default since the sliding expiry handles cleanup. Idempotent: returns `dropped=false` when nothing matched. | `name` | `readOnlyHint: false`, `idempotentHint`, `destructiveHint: true` |
 
 ### Resources
 
@@ -49,8 +49,8 @@ Exposes the U.S. Energy Information Administration's API v2 as a navigable, quer
 **`CanvasBridgeService`** adapts the generic `DataCanvas` primitive for EIA-specific workflows:
 - Mints `df_<id>` handles for each registered table (deterministic, collision-resistant; bridged to the canvas table name).
 - Derives an all-nullable column schema from the first 100 rows of an EIA result set. All EIA data values arrive as strings; the bridge maps them to `VARCHAR` by default and records this in provenance so SQL consumers know to `CAST` when doing arithmetic.
-- Tracks per-table provenance: source tool, original input parameters, creation/expiry timestamps, row count, and truncation flag.
-- Applies a sliding per-table TTL (default 24 h, override with `EIA_DATASET_TTL_SECONDS`) distinct from the canvas-level TTL. Expired entries are lazy-swept on `describe`.
+- Tracks per-table provenance: source tool, original input parameters, creation timestamp, row count, and truncation flag. Expiry is deliberately not among them — the canvas owns it and reports the current value.
+- Registers every table with the framework canvas primitive's sliding per-table TTL (default 24 h, override with `EIA_DATASET_TTL_SECONDS`), distinct from the canvas-level TTL. The canvas extends a dataframe's window whenever an `eia_dataframe_query` statement references it by name and its sweeper drops the table once the window lapses; the bridge keeps no expiry clock of its own. Every path that reads or writes provenance first reconciles it against the canvas's live table list, so an entry never outlives the table it describes — including for a caller that stages and queries but never lists.
 - Bridge-layer deny of DuckDB system catalogs (`information_schema`, `pg_catalog`, `sqlite_master`, `duckdb_*`) so callers cannot enumerate `df_<id>` handles they don't already hold. Callers discover handles via `eia_query_route` output or `eia_dataframe_describe`.
 
 **Resilience:**
@@ -83,7 +83,7 @@ Both paths skip facets above `MAX_INDEXED_FACET_VALUES` (200) — those are opaq
 | `EIA_API_KEY` | Yes | Free key from api.eia.gov — appended as `api_key` query param on every request |
 | `EIA_BASE_URL` | No | Defaults to `https://api.eia.gov/v2`; overridable for testing |
 | `CANVAS_PROVIDER_TYPE` | No | Set to `duckdb` to enable DataCanvas spillover and dataframe tools (Node only; Workers fail closed) |
-| `EIA_DATASET_TTL_SECONDS` | No | Per-table TTL for canvas-registered dataframes. Default `86400` (24 h), sliding — touched on every dataframe operation. Independent from the canvas-level TTL. |
+| `EIA_DATASET_TTL_SECONDS` | No | Sliding per-dataframe TTL, passed to the canvas as `ttlMs`. Default `86400` (24 h). The window is extended whenever an `eia_dataframe_query` statement names the dataframe, so a dataframe survives a long analysis and lapses only after going unused for the full interval; listing it with `eia_dataframe_describe` is not use and does not extend it. Independent from the canvas-level TTL. |
 | `EIA_DATAFRAME_DROP_ENABLED` | No | Set to `true` to expose `eia_dataframe_drop`. Default `false`; TTL handles cleanup in normal operation. |
 | `EIA_CANVAS_MAX_ROWS` | No | Cumulative row ceiling for `eia_query_route` canvas accumulation. Default `25000` — five requests at EIA's 5,000-row-per-request ceiling, ~4 MB of upstream JSON and ~8.5 s of tool latency when it binds. Lower it to keep exploratory calls snappy, raise it for wider staged analyses. |
 | `EIA_FACET_VALUE_CAP` | No | Facet values `eia_describe_route` returns per facet before truncating. Default `50` — STEO's `seriesId` alone has 1,469 values, ~130 KB of JSON in one describe call. Paged past with the tool's `facet` and `values_offset` inputs; the per-route cache is unaffected. |
@@ -96,8 +96,8 @@ Both paths skip facets above `MAX_INDEXED_FACET_VALUES` (200) — those are opaq
 4. `eia_describe_route` — thin wrapper; error contract for unknown routes
 5. `eia_search_routes` — fuzzy search against the in-memory index
 6. `eia_query_route` — filters, pagination, DataCanvas spillover (`ctx.core.canvas?`); emit `dataset` (`df_<id>`) on spillover
-7. `CanvasBridgeService` (`src/services/canvas-bridge/`) — `df_<id>` minting, provenance tracking, per-table TTL, system-catalog deny
-8. `eia_dataframe_describe` / `eia_dataframe_query` — layered on the bridge; describe lazy-sweeps expired tables
+7. `CanvasBridgeService` (`src/services/canvas-bridge/`) — `df_<id>` minting, provenance tracking, per-table sliding TTL delegated to the canvas, system-catalog deny, contract-recovery remap on query errors
+8. `eia_dataframe_describe` / `eia_dataframe_query` — layered on the bridge; describe reconciles provenance against the canvas's live tables
 9. `eia_dataframe_drop` — conditional registration in `createApp()` guarded by `EIA_DATAFRAME_DROP_ENABLED`
 
 Each step is independently testable. Tools 3–5 can be built and exercised before DataCanvas integration in step 6. The bridge (step 7) can be tested in isolation before the dataframe tools depend on it.
@@ -229,13 +229,18 @@ The three `invalid_*` reasons are split from a single EIA 400 by reading the ups
 
 ### `eia_dataframe_describe`
 
-Lists canvas dataframes materialized by `eia_query_route` — provenance, TTL, row count, and column schema. Lazy-sweeps expired tables before responding so the list is always current.
+Lists canvas dataframes materialized by `eia_query_route` — provenance, expiry, row count, and column schema. Reads the canvas's live table list first and deletes provenance for anything it no longer holds, so the response is always current. Listing is not use: only an `eia_dataframe_query` statement naming a dataframe extends its window, so polling this tool will not keep a dataframe alive.
+
+The handler always lists unscoped and narrows locally, because the full set is what separates the two ways a scoped call can come back empty: `name` names a dataframe that is not staged, versus nothing is staged at all. A miss returns `found: false` alongside `active_names`, mirroring `eia_dataframe_drop`'s `dropped: false`.
 
 **Input schema:**
 - `name?: string` — `df_<id>` handle to describe a single dataframe. Omit to list all active dataframes for this tenant.
 
 **Output:**
-- `dataframes: Array<{ name, source_tool, query_params, created_at, expires_at, row_count, truncated, max_rows?, column_schema }>` — newest first; empty when none are registered
+- `requested_name?: string` — echo of `name`; absent on an unscoped list
+- `found?: boolean` — whether `requested_name` is staged; absent on an unscoped list
+- `active_names: string[]` — every staged `df_<id>` for this tenant, whatever the requested scope. On a miss these are the handles still usable.
+- `dataframes: Array<{ name, source_tool, query_params, created_at, expires_at?, row_count, truncated, max_rows?, column_schema }>` — entries matching the requested scope, newest first. `expires_at` is the canvas's current sliding-TTL value, not a copy taken at creation.
 
 **Errors:**
 - `canvas_unavailable` (`ServiceUnavailable`) — canvas not configured; set `CANVAS_PROVIDER_TYPE=duckdb`
@@ -250,16 +255,17 @@ Single-statement SELECT across canvas dataframes. Standard DuckDB SQL — joins,
 
 **Input schema:**
 - `sql: string` — Single-statement SELECT. Data columns from EIA are `VARCHAR` — use `CAST(col AS DOUBLE)` when arithmetic or aggregation is needed.
-- `register_as?: string` — Persist the query result as a new `df_<id>` with a fresh TTL. Use to chain analyses without re-running the upstream tool calls. Conflicts with an existing name throw `Conflict`.
+- `register_as?: string` — Persist the query result as a new `df_<id>` with a fresh expiry. Use to chain analyses without re-running the upstream tool calls. The name must be unused: reusing a staged name fails as `register_as_clash` (`ValidationError`), and the fix is a different name — dropping the existing dataframe is not required and `eia_dataframe_drop` is off by default.
 - `preview?: number` — Rows to include in the immediate response (0–10 000). Defaults to `row_limit`. Set lower when chaining via `register_as` and only a sample is needed inline.
 - `row_limit?: number` — Hard cap on rows materialized in the response (default 1000, max 10 000). When `register_as` is set, the full result lives on-canvas; raise this only for inline inspection.
 
 **Output:**
 - `columns: string[]` — Column names in projection order
-- `row_count: number` — Total rows the query produced (may exceed `rows.length` when capped)
 - `rows: Array<Record<string, unknown>>` — Materialized rows, bounded by `preview`/`row_limit`
 - `registered_as?: string` — New dataframe name when `register_as` was supplied
 - `expires_at?: string` — ISO 8601 expiry for the newly registered dataframe
+
+**Enrichment:** `totalRows`, `returnedRows`, `executedSql`, and a `notice` when `row_limit` capped the result.
 
 **Read-only enforcement (four layers):**
 1. Text-level deny-list — file/HTTP-reading table functions (`read_csv*`, `read_json*`, `read_parquet*`, etc.)
@@ -271,6 +277,15 @@ Bridge-layer additionally denies system catalogs (`information_schema`, `pg_cata
 
 **Errors:**
 - `canvas_unavailable` (`ServiceUnavailable`) — canvas not configured; set `CANVAS_PROVIDER_TYPE=duckdb`
+- `system_catalog_access` (`ValidationError`) — SQL names a denied catalog; query only `df_<id>` tables
+- `missing_table` (`NotFound`) — SQL names a `df_<id>` that is not staged (mistyped, dropped, or past its expiry); list handles with `eia_dataframe_describe` or re-stage with `eia_query_route`
+- `non_select_statement` (`ValidationError`) — not a single read-only SELECT; rewrite as one SELECT, or use `register_as` to persist a result
+- `invalid_sql` (`ValidationError`) — DuckDB could not parse or bind the statement; correct it against the column names `eia_dataframe_describe` reports, which carry the sanitized `{col}_units` form the inline preview shows hyphenated
+- `register_as_clash` (`ValidationError`) — `register_as` names a staged dataframe; pass a different name
+
+Only `canvas_unavailable` is raised in the handler. The other five are thrown by the framework SQL gate and DuckDB provider below `CanvasBridge.query()`, which re-throws them carrying the contract's `recovery` hint — the framework renders a `Recovery:` line into `content[]` from `data.recovery.hint` alone, so a declared recovery reaches the caller only if it is put on the wire there. The upstream throw's code, message, and `data.reason` are preserved.
+
+Reason selection is the gate's, not the tool's, and does not always follow the surface shape of the statement: a `DROP TABLE` naming a table that does not exist fails as `missing_table` at prepare time, before the statement-type check that would have made it `non_select_statement`. Gate reasons left undeclared — `multi_statement`, `denied_function`, `identifier_shape`, `identifier_reserved` — carry the remedy in the framework's own message text.
 
 **Annotations:** `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false`
 
@@ -278,7 +293,7 @@ Bridge-layer additionally denies system catalogs (`information_schema`, `pg_cata
 
 ### `eia_dataframe_drop`
 
-Drop a canvas dataframe by name. **Opt-in** — only registered in `createApp()` when `EIA_DATAFRAME_DROP_ENABLED=true`. Idempotent: returns `dropped=false` when nothing matched. Use to free canvas resources ahead of the per-table TTL when an analysis is complete; in normal operation, TTL cleanup is sufficient and this tool is unnecessary.
+Drop a canvas dataframe by name. **Opt-in** — only registered in `createApp()` when `EIA_DATAFRAME_DROP_ENABLED=true`. Idempotent: returns `dropped=false` when nothing matched — including for a dataframe whose window already lapsed, since the canvas is authoritative on existence. Use to free canvas resources ahead of the sliding expiry when an analysis is complete; in normal operation, expiry cleanup is sufficient and this tool is unnecessary.
 
 **Input schema:**
 - `name: string` — `df_<id>` handle to drop
@@ -325,7 +340,7 @@ Addresses the prior "no bulk multi-route queries" limitation. Every dataset a te
 | 3 | Pull petroleum consumption by sector | `eia_query_route` | Returns a third `dataset` (`df_def`) |
 | 4 | GROUP BY state / sector / fuel; SUM production by period | `eia_dataframe_query` | `SELECT period, SUM(CAST(value AS DOUBLE)) ... FROM df_abc GROUP BY period ORDER BY period` |
 | 5 | JOIN two route results by period | `eia_dataframe_query` | `SELECT a.period, CAST(a.value AS DOUBLE), CAST(b.value AS DOUBLE) FROM df_abc a JOIN df_xyz b ON a.period = b.period` |
-| 6 | Persist join result for follow-up | `eia_dataframe_query` | `register_as: "df_joined_energy"` — fresh TTL; chain further aggregates without re-running source queries |
+| 6 | Persist join result for follow-up | `eia_dataframe_query` | `register_as: "df_joined_energy"` — fresh expiry; chain further aggregates without re-running source queries |
 | 7 | Inspect active dataframes | `eia_dataframe_describe` | Verify handles, row counts, expiry |
 
 **Key cast pattern:** EIA data values are `VARCHAR` in the canvas. Any arithmetic or aggregation (`SUM`, `AVG`, arithmetic operators) requires an explicit cast: `CAST(value AS DOUBLE)`. String comparisons and period filtering work on the raw `VARCHAR` columns without casting.
@@ -356,11 +371,15 @@ Addresses the prior "no bulk multi-route queries" limitation. Every dataset a te
 - **DataCanvas spillover: opt-in or always-on?** → Opt-in via `CANVAS_PROVIDER_TYPE=duckdb`. DuckDB has no V8-isolate build, so Workers deployments would break if it were always attempted. Canvas presence checked via `ctx.core.canvas?` at runtime; tool degrades gracefully to preview-only when absent.
 - **Resources?** → None. The route tree is dynamic (hundreds of entries, arbitrary depth) — stable URIs don't fit. All data access via tools; tool-only agents are fully served.
 - **Why expose dataframe tools at all?** → EIA datasets are multi-dimensional: a single route might return data across states, sectors, fuel types, and periods simultaneously. Inline preview rows (bounded to avoid context overflow) are sufficient for narrow queries but blind for analysis across facet combinations. Canvas SQL lets the agent GROUP, SUM, and JOIN on the full result set without re-fetching upstream data. The three dataframe tools are the analytical complement to `eia_query_route`, not a separate workflow.
-- **Why opt-in drop (`EIA_DATAFRAME_DROP_ENABLED`)?** → TTL (default 24 h, sliding) already handles cleanup for normal usage patterns. An always-on drop tool adds a destructive surface with no benefit in the common case. Opt-in makes the risk explicit — operators who need manual cleanup in long-running sessions enable it deliberately.
-- **Why expose `register_as` chaining in `eia_dataframe_query`?** → Derived aggregates (e.g., a JOIN of electricity prices and gas prices, grouped by region and period) are expensive to reconstruct from raw route results. Persisting them as a named dataframe with a fresh TTL lets the agent build incrementally — query once, reuse across follow-up questions in the same session — without re-running N `eia_query_route` calls.
+- **Why opt-in drop (`EIA_DATAFRAME_DROP_ENABLED`)?** → The sliding per-dataframe TTL (default 24 h, extended by every query that references the dataframe) already handles cleanup for normal usage patterns. An always-on drop tool adds a destructive surface with no benefit in the common case. Opt-in makes the risk explicit — operators who need manual cleanup in long-running sessions enable it deliberately.
+- **Why expose `register_as` chaining in `eia_dataframe_query`?** → Derived aggregates (e.g., a JOIN of electricity prices and gas prices, grouped by region and period) are expensive to reconstruct from raw route results. Persisting them as a named dataframe with a fresh expiry lets the agent build incrementally — query once, reuse across follow-up questions in the same session — without re-running N `eia_query_route` calls.
 - **How do dataframe tools address the prior "no bulk multi-route queries" limitation?** → They don't remove it at the single-call level (each `eia_query_route` still targets one leaf route), but they provide the join layer that was missing. Call `eia_query_route` N times to stage N result sets — all in the same per-tenant canvas — then use `eia_dataframe_query` to JOIN the `df_<id>` handles.
 - **Should callers thread a `canvas_id` between `eia_query_route` calls?** → No, and the parameter was removed. `CanvasBridge.acquireSharedCanvas` routes every registration to one canvas per tenant with no scoping argument, so accumulation was already automatic; the input was echoed back and otherwise ignored, and the output field carried the table name rather than a canvas ID. `dataset` is the genuine join handle and is now the only one documented. Per-call canvas isolation would be the alternative, but nothing in the workflow wants it — cross-route joins are the point.
 - **Why cap canvas accumulation at 25,000 rows?** → Registering only the previewed page made the "query canvas for the full dataset" note false, so the service now pages forward. The bound is a latency and memory trade, sized from measurement: EIA caps a request at 5,000 rows, and a 5,000-row page of `electricity/retail-sales` measures ~830 KB and ~1 s round trip. A full 25,000-row accumulation on that route is five requests, ~4 MB of upstream JSON, and ~8.5 s of end-to-end tool latency (upstream fetch plus JSON parse plus DuckDB append). Unbounded accumulation would put a six-figure-row route — retail sales monthly is ~113,000 — well past any reasonable tool latency. `EIA_CANVAS_MAX_ROWS` moves the bound either way: lower it to keep exploratory calls snappy, raise it for wider staged analyses.
+
+- **Sliding dataframe TTL: hand-rolled or the framework primitive?** → The framework's. `RegisterTableOptions.ttlMs` / `QueryOptions.ttlMs` register a per-table window that `CanvasRegistry.touchWithSqlTables` extends for every table name appearing in a query's SQL, and the registry sweeper drops the table when it lapses. The bridge previously stamped its own `expiresAt` into `ctx.state` at registration and never moved it, which made the advertised sliding behavior false: a dataframe queried steadily for hours still died 24 h after creation. Passing `ttlMs` and deleting the parallel bookkeeping (`DataframeMeta.expiresAt`, `sweepExpired()`) makes the documented behavior the real one and removes a clock the server had no reason to own. The one semantic the framework does not offer is a slide on `describe` — `CanvasInstance.describe()` touches the canvas, not the table — so listing a dataframe is documented as not extending it.
+- **Where does `describe` get `expires_at` once the canvas owns expiry?** → From `CanvasInstance.describe()`, which annotates each `TableInfo` with the table's current per-table expiry. Caching it back into `ctx.state` was declined: the value moves on every query, so a stored copy is stale by construction — the same defect the sliding-TTL fix removed. The same call doubles as the reconciliation pass that deletes provenance for tables the canvas no longer holds, which is what replaced `sweepExpired()`.
+- **Fixing the dead-letter recovery hints: upstream or server-side?** → Server-side, at `CanvasBridge.query()`. The framework's SQL gate and DuckDB provider throw with a stable `data.reason` but render a `Recovery:` line only from `data.recovery.hint`, so a tool's declared `recovery` never reaches the caller on its own. The bridge re-throws with the calling definition's hint merged in, keyed off `ctx.recoveryFor(reason)` — which returns `{}` for undeclared reasons, so the tool's `errors[]` is the only place the remapped set is written down. Waiting on the upstream wording fix was declined: it covers the gate's throw sites and two `missing_table` hints, not `register_as_clash`, so it would not close the gap even once released.
 
 - **Why cap facet values in `eia_describe_route` at 50?** → The uncapped response returned every value of every facet: `eia_describe_route("steo")` alone shipped all 1,469 `seriesId` values, ~130 KB of JSON, on every call. The cap is a response-shaping step at the tool boundary, not a cache change — the per-route metadata cache still holds the full set, which is what `values_offset` pages through and what the search index reads. 50 clears most ordinary dimensions in one call — sectors run to 15, fuel types to 45 — while bounding the pathological ones; a 62-value `stateid` costs one extra page.
 - **How do facet values get into the search index without an eager fan-out?** → An allowlisted vocabulary pass at warm time plus opportunistic indexing of every described route. Fetching all 892 facets in the taxonomy was measured and ruled out: it would more than quadruple the ~270 requests the tree warm already costs and draws `OVER_RATE_LIMIT` when burst. The allowlist covers the fuel / sector / technology / coal-rank dimensions callers actually search with and resolves to 40 fetches, 460 values, 28 KB.

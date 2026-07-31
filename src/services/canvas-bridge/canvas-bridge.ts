@@ -3,10 +3,15 @@
  * primitive. Mints df_<id> table handles, sanitizes column identifiers to the
  * canvas identifier shape (EIA's {col}-units companion columns carry a hyphen
  * the gate rejects), derives all-nullable column schemas (EIA data values are
- * all strings), tracks per-table TTL and provenance in ctx.state, and
- * lazy-sweeps expired tables on every public operation.
- * Best-effort: failed canvas operations log a warning and return undefined so
- * the caller's inline response remains useful.
+ * all strings), and tracks provenance in ctx.state. Expiry is the canvas's:
+ * every table is registered with the framework's per-table sliding TTL, which
+ * the canvas extends whenever a query references the table and whose sweeper
+ * drops it once the window lapses. Every path that reads or writes provenance
+ * first reconciles it against the canvas's live table list, so an entry never
+ * outlives the table it describes. Errors thrown below `query()` are re-thrown
+ * carrying the calling tool's declared recovery hint.
+ * Best-effort registration: a failed canvas registration logs a warning and
+ * returns undefined so the caller's inline response remains useful.
  * @module services/canvas-bridge/canvas-bridge
  */
 
@@ -18,20 +23,34 @@ import {
   inferSchemaFromRows,
   type QueryResult,
 } from '@cyanheads/mcp-ts-core/canvas';
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 
-/** Per-table provenance + TTL metadata persisted in ctx.state. */
+/**
+ * Per-table provenance persisted in ctx.state. Expiry is deliberately absent:
+ * the canvas owns the sliding per-table TTL and reports the current value on
+ * `describe`, so a stored copy would go stale the moment a query slid it.
+ */
 export interface DataframeMeta {
   columnSchema: ColumnSchema[];
   createdAt: string;
-  expiresAt: string;
   maxRows: number | undefined;
   queryParams: Record<string, unknown>;
   rowCount: number;
   sourceTool: string;
   tableName: string;
   truncated: boolean;
+}
+
+/** Stored provenance joined with the canvas's live per-table expiry. */
+export interface DataframeEntry extends DataframeMeta {
+  /**
+   * ISO 8601 expiry reported by the canvas for this table's sliding TTL.
+   * Undefined when the table carries no independent expiry and follows the
+   * canvas lifecycle instead.
+   */
+  expiresAt: string | undefined;
 }
 
 export interface RegisterDataframeResult {
@@ -118,6 +137,28 @@ export function sanitizeRowsForCanvas(rows: Record<string, unknown>[]): Record<s
   });
 }
 
+/**
+ * Re-throw a framework canvas error carrying the calling definition's declared
+ * recovery hint. The SQL gate and the DuckDB provider throw below the bridge
+ * with a stable `data.reason` but either no `data.recovery` at all
+ * (`system_catalog_access`, `non_select_statement`, `register_as_clash`) or one
+ * naming framework methods an MCP client cannot invoke (`missing_table`). The
+ * `Recovery:` line the framework renders into `content[]` is read from
+ * `data.recovery.hint` and never from the contract, so a declared `recovery`
+ * reaches the caller only if it is put on the wire here. Reasons the calling
+ * definition does not declare pass through untouched — `ctx.recoveryFor`
+ * returns `{}` for them — so the tool's `errors[]` is the single place the set
+ * of remapped reasons is written down.
+ */
+function withContractRecovery(ctx: Context, error: unknown): unknown {
+  if (!(error instanceof McpError)) return error;
+  const reason = error.data?.reason;
+  if (typeof reason !== 'string') return error;
+  const recovery = ctx.recoveryFor(reason);
+  if (!('recovery' in recovery)) return error;
+  return new McpError(error.code, error.message, { ...error.data, ...recovery }, { cause: error });
+}
+
 export class CanvasBridge {
   constructor(private readonly canvas: DataCanvas) {}
 
@@ -133,8 +174,8 @@ export class CanvasBridge {
     }
 
     try {
-      await this.sweepExpired(ctx);
       const instance = await this.acquireSharedCanvas(ctx);
+      await this.reconcile(ctx, instance);
       const tableName = this.mintTableName();
       // EIA's {col}-units companion columns carry a hyphen the canvas identifier
       // gate rejects; sanitize keys before registration. options.rows (the
@@ -142,16 +183,15 @@ export class CanvasBridge {
       const safeRows = sanitizeRowsForCanvas(options.rows);
       const schema = deriveAllNullableSchema(safeRows);
 
-      const result = await instance.registerTable(tableName, safeRows, { schema });
+      const ttlMs = getServerConfig().datasetTtlSeconds * 1000;
+      const result = await instance.registerTable(tableName, safeRows, { schema, ttlMs });
 
       const now = Date.now();
-      const ttlMs = getServerConfig().datasetTtlSeconds * 1000;
       const meta: DataframeMeta = {
         tableName: result.tableName,
         sourceTool: options.sourceTool,
         queryParams: options.queryParams,
         createdAt: new Date(now).toISOString(),
-        expiresAt: new Date(now + ttlMs).toISOString(),
         rowCount: result.rowCount,
         truncated: options.truncated ?? false,
         maxRows: options.maxRows,
@@ -168,7 +208,10 @@ export class CanvasBridge {
       return {
         tableName: result.tableName,
         rowCount: result.rowCount,
-        expiresAt: meta.expiresAt,
+        // Exact at this instant — the canvas started the sliding window on the
+        // registerTable call above. Later queries push it out; describe reports
+        // the current value.
+        expiresAt: new Date(now + ttlMs).toISOString(),
         columnSchema: schema,
       };
     } catch (error) {
@@ -180,14 +223,13 @@ export class CanvasBridge {
     }
   }
 
-  async describe(ctx: Context, tableName?: string): Promise<DataframeMeta[]> {
-    await this.sweepExpired(ctx);
-    if (tableName) {
-      const meta = await ctx.state.get<DataframeMeta>(`${META_PREFIX}${tableName}`);
-      return meta ? [meta] : [];
-    }
-    const entries: DataframeMeta[] = [];
-    for await (const { meta } of this.iterateMeta(ctx)) entries.push(meta);
+  /**
+   * Every dataframe staged for this tenant, newest first, each carrying the
+   * canvas's current expiry.
+   */
+  async describe(ctx: Context): Promise<DataframeEntry[]> {
+    const instance = await this.acquireSharedCanvas(ctx);
+    const entries = await this.reconcile(ctx, instance);
     return entries.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
@@ -195,54 +237,62 @@ export class CanvasBridge {
     ctx: Context,
     sql: string,
     options: BridgeQueryOptions = {},
-  ): Promise<{ result: QueryResult; meta?: DataframeMeta }> {
-    await this.sweepExpired(ctx);
+  ): Promise<{ result: QueryResult; meta?: DataframeEntry }> {
     const instance = await this.acquireSharedCanvas(ctx);
+    const ttlMs = getServerConfig().datasetTtlSeconds * 1000;
+    // Only the register_as branch writes provenance; a plain SELECT skips the
+    // reconciliation pass so the analytical path stays a single canvas round trip.
+    if (options.registerAs !== undefined) await this.reconcile(ctx, instance);
 
-    const result = await instance.query(sql, {
-      denySystemCatalogs: true,
-      ...(options.preview !== undefined && { preview: options.preview }),
-      ...(options.rowLimit !== undefined && { rowLimit: options.rowLimit }),
-      ...(options.registerAs !== undefined && { registerAs: options.registerAs }),
-      signal: ctx.signal,
-    });
-
-    const registerAs = options.registerAs;
-    let meta: DataframeMeta | undefined;
-    if (registerAs && result.tableName) {
-      const now = Date.now();
-      const ttlMs = getServerConfig().datasetTtlSeconds * 1000;
-      meta = {
-        tableName: result.tableName,
-        sourceTool: options.sourceTool ?? 'eia_dataframe_query',
-        queryParams: options.queryParams ?? { sql },
-        createdAt: new Date(now).toISOString(),
-        expiresAt: new Date(now + ttlMs).toISOString(),
-        rowCount: result.rowCount,
-        truncated: false,
-        maxRows: undefined,
-        columnSchema: result.columns.map((name) => ({
-          name,
-          type: 'VARCHAR',
-          nullable: true,
-        })),
-      };
-      await ctx.state.set(`${META_PREFIX}${result.tableName}`, meta);
+    let result: QueryResult;
+    try {
+      result = await instance.query(sql, {
+        denySystemCatalogs: true,
+        ...(options.preview !== undefined && { preview: options.preview }),
+        ...(options.rowLimit !== undefined && { rowLimit: options.rowLimit }),
+        ...(options.registerAs !== undefined && { registerAs: options.registerAs, ttlMs }),
+        signal: ctx.signal,
+      });
+    } catch (error) {
+      throw withContractRecovery(ctx, error);
     }
 
-    return meta ? { result, meta } : { result };
+    const registerAs = options.registerAs;
+    if (!registerAs || !result.tableName) return { result };
+
+    const now = Date.now();
+    const meta: DataframeMeta = {
+      tableName: result.tableName,
+      sourceTool: options.sourceTool ?? 'eia_dataframe_query',
+      queryParams: options.queryParams ?? { sql },
+      createdAt: new Date(now).toISOString(),
+      rowCount: result.rowCount,
+      truncated: false,
+      maxRows: undefined,
+      columnSchema: result.columns.map((name) => ({
+        name,
+        type: 'VARCHAR',
+        nullable: true,
+      })),
+    };
+    await ctx.state.set(`${META_PREFIX}${result.tableName}`, meta);
+
+    return { result, meta: { ...meta, expiresAt: new Date(now + ttlMs).toISOString() } };
   }
 
+  /**
+   * Drop a table and its provenance. The canvas is authoritative on whether
+   * anything was removed; the stored-provenance answer is the fallback only
+   * when the canvas itself is unreachable.
+   */
   async drop(ctx: Context, tableName: string): Promise<boolean> {
-    await this.sweepExpired(ctx);
     const metaKey = `${META_PREFIX}${tableName}`;
     const hadMeta = (await ctx.state.get(metaKey)) !== null;
     await ctx.state.delete(metaKey);
 
     try {
       const instance = await this.acquireSharedCanvas(ctx);
-      const dropped = await instance.drop(tableName);
-      return dropped || hadMeta;
+      return await instance.drop(tableName);
     } catch (error) {
       ctx.log.warning('Canvas drop failed', {
         tableName,
@@ -252,25 +302,32 @@ export class CanvasBridge {
     }
   }
 
-  private async sweepExpired(ctx: Context): Promise<void> {
-    const nowIso = new Date().toISOString();
-    let instance: CanvasInstance | undefined;
+  /**
+   * Delete provenance for tables the canvas no longer holds — swept at the end
+   * of a sliding window, dropped, or lost with a recycled canvas — and return
+   * the survivors joined with the canvas's current per-table expiry. Runs on
+   * every path that reads or writes provenance, not just the listing path: the
+   * canvas sweeper removes tables without telling the bridge, so a caller who
+   * only stages and queries would otherwise accumulate provenance for tables
+   * that stopped existing hours ago.
+   */
+  private async reconcile(ctx: Context, instance: CanvasInstance): Promise<DataframeEntry[]> {
+    const expiryByTable = new Map(
+      (await instance.describe()).map((table) => [table.name, table.expiresAt]),
+    );
+
+    const entries: DataframeEntry[] = [];
     for await (const { key, meta } of this.iterateMeta(ctx)) {
-      if (meta.expiresAt > nowIso) continue;
-      instance ??= await this.acquireSharedCanvas(ctx).catch(() => undefined);
-      if (instance) {
-        try {
-          await instance.drop(meta.tableName);
-        } catch (error) {
-          ctx.log.warning('TTL sweep drop failed', {
-            tableName: meta.tableName,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
+      if (!expiryByTable.has(meta.tableName)) {
+        await ctx.state.delete(key);
+        ctx.log.debug('Dropped provenance for a dataframe the canvas no longer holds', {
+          tableName: meta.tableName,
+        });
+        continue;
       }
-      await ctx.state.delete(key);
-      ctx.log.debug('Expired EIA dataframe swept', { tableName: meta.tableName });
+      entries.push({ ...meta, expiresAt: expiryByTable.get(meta.tableName) });
     }
+    return entries;
   }
 
   private async *iterateMeta(ctx: Context): AsyncGenerator<{ key: string; meta: DataframeMeta }> {

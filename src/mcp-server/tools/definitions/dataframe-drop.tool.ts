@@ -2,7 +2,8 @@
  * @fileoverview Tool definition for eia_dataframe_drop. Drops a canvas
  * dataframe by name. Opt-in — only registered in createApp() when
  * EIA_DATAFRAME_DROP_ENABLED=true. Idempotent: returns dropped=false when
- * nothing matched. TTL (default 24 h) handles cleanup in normal operation;
+ * nothing matched. The per-dataframe expiry (default 24 h, extended by every
+ * query that references the dataframe) handles cleanup in normal operation;
  * this tool is for manual cleanup in long-running sessions.
  * @module mcp-server/tools/definitions/dataframe-drop.tool
  */
@@ -14,7 +15,7 @@ import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 export const dataframeDropTool = tool('eia_dataframe_drop', {
   title: 'Drop EIA Dataframe',
   description:
-    'Drop a canvas dataframe by name. Idempotent — returns dropped=false when nothing matched. Use to free canvas resources ahead of the per-table TTL when an analysis is complete. In normal operation, TTL cleanup (default 24 h, sliding) is sufficient and this tool is unnecessary. Only available when EIA_DATAFRAME_DROP_ENABLED=true.',
+    'Drop a canvas dataframe by name. Idempotent — returns dropped=false when nothing matched. Use to free canvas resources ahead of the per-dataframe expiry when an analysis is complete. In normal operation, expiry cleanup (default 24 h, extended by every query that references the dataframe) is sufficient and this tool is unnecessary. Only available when EIA_DATAFRAME_DROP_ENABLED=true.',
   annotations: {
     readOnlyHint: false,
     idempotentHint: true,
