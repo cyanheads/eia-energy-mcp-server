@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-07-31
+
+eia_search_routes now waits for a complete index and reports indexComplete/indexGaps; buildRouteTree no longer silently drops a subtree on a failed metadata fetch
+
 ## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-07-31
 
 Dataframe TTL now genuinely slides on query access, eia_dataframe_describe distinguishes a lookup miss from an empty canvas, and eia_dataframe_query declares the error reasons callers actually hit
