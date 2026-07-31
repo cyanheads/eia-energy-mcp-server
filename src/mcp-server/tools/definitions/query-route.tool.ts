@@ -2,8 +2,9 @@
  * @fileoverview Tool definition for eia_query_route. Fetches data from a leaf
  * route with optional facet filters, date range, frequency, and column
  * selection. Data values come back as strings per the EIA API. Large result
- * sets spill to a DataCanvas table (when CANVAS_PROVIDER_TYPE=duckdb) and
- * return a canvas_id + dataset handle for SQL analysis via eia_dataframe_query.
+ * sets spill to a DataCanvas table (when CANVAS_PROVIDER_TYPE=duckdb): the
+ * service walks offset pages up to EIA_CANVAS_MAX_ROWS and registers the
+ * accumulated set, returning a dataset handle for eia_dataframe_query SQL.
  * @module mcp-server/tools/definitions/query-route.tool
  */
 
@@ -15,7 +16,7 @@ import { getEiaApiService } from '@/services/eia/eia-service.js';
 export const queryRouteTool = tool('eia_query_route', {
   title: 'Query EIA Route Data',
   description:
-    'Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Use eia_describe_route first to discover valid facet IDs, facet values, column IDs, and frequency codes. Data values are strings in the response (EIA API returns all numeric values as strings, e.g. "9.13"); cast to DOUBLE in SQL when arithmetic is needed. Returns a preview inline; large result sets (total > length) spill to a DataCanvas table when canvas is enabled — use the returned canvas_id and dataset name with eia_dataframe_query for SQL analysis. Pass the same canvas_id on subsequent eia_query_route calls to accumulate multiple route results into one canvas for cross-route joins.',
+    'Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Use eia_describe_route first to discover valid facet IDs, facet values, column IDs, and frequency codes. Data values are strings in the response (EIA API returns all numeric values as strings, e.g. "9.13"); cast to DOUBLE in SQL when arithmetic is needed. Returns a preview inline; when canvas is enabled and more rows match than the preview holds, additional pages are fetched and the accumulated set is staged as a DataCanvas table — pass the returned dataset name to eia_dataframe_query for SQL. Every dataset a tenant stages lands in the same canvas, so tables from different routes cross-join by name with nothing to thread between calls.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
@@ -61,19 +62,22 @@ export const queryRouteTool = tool('eia_query_route', {
       )
       .optional()
       .describe('Result ordering.'),
-    offset: z.number().int().min(0).default(0).describe('Pagination offset (default 0).'),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Row offset into the matching set (default 0). An offset at or beyond total returns zero rows.',
+      ),
     length: z
       .number()
       .int()
       .min(1)
       .max(5000)
       .default(100)
-      .describe('Rows to fetch per request (default 100, max 5000 per EIA limit).'),
-    canvas_id: z
-      .string()
-      .optional()
       .describe(
-        'DataCanvas ID to register results into. Omit on first call — a new canvas is minted and returned. Pass the returned canvas_id on subsequent calls to accumulate multiple route results into one canvas for cross-route SQL joins.',
+        'Rows in the inline preview (default 100, max 5000 per EIA limit). Canvas staging is not bounded by this — it pages past the preview on its own.',
       ),
   }),
 
@@ -100,25 +104,19 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Informational message when zero rows matched the filters — guidance for broadening the query.',
-      ),
-    canvas_id: z
-      .string()
-      .optional()
-      .describe(
-        'Canvas workspace ID — present when spillover occurred or canvas_id was supplied. Pass to subsequent eia_query_route calls to accumulate datasets.',
+        'Informational message when the response carries no rows — either zero rows matched the filters (broaden the query) or offset paged past the last row (reduce offset below total).',
       ),
     dataset: z
       .string()
       .optional()
       .describe(
-        'df_<id> table handle for the registered dataset — pass directly to eia_dataframe_query SQL (SELECT ... FROM df_<id>).',
+        'df_<id> table handle for the registered dataset — pass directly to eia_dataframe_query SQL (SELECT ... FROM df_<id>). Every dataset a tenant stages shares one canvas, so handles from different routes join directly.',
       ),
     canvas_preview_note: z
       .string()
       .optional()
       .describe(
-        'Human-readable note when total > returned rows, describing how to access the full dataset via canvas SQL.',
+        'Human-readable note when total exceeds the inline preview — names how many rows actually reached the canvas table and, when staging stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return), says so and gives the offset to resume from.',
       ),
     truncation_warning: z
       .string()
@@ -156,6 +154,10 @@ export const queryRouteTool = tool('eia_query_route', {
       .array(z.string())
       .optional()
       .describe('Echo of the column projection as applied, when columns were provided.'),
+    appliedOffset: z
+      .number()
+      .describe('Row offset applied to the query — the cause when a page comes back empty.'),
+    appliedLength: z.number().describe('Preview row count requested for this call.'),
   },
   enrichmentTrailer: {
     appliedFilters: {
@@ -179,26 +181,39 @@ export const queryRouteTool = tool('eia_query_route', {
     {
       reason: 'route_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Route does not exist or is not a leaf.',
+      when: 'Route does not exist in the EIA taxonomy.',
       recovery: 'Use eia_browse_routes or eia_search_routes to find a valid leaf route path.',
+    },
+    {
+      reason: 'route_not_queryable',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Route is a category node with sub-routes, not a queryable leaf.',
+      recovery:
+        'Use eia_browse_routes to drill into sub-routes, or eia_search_routes to find leaf routes.',
     },
     {
       reason: 'invalid_facet',
       code: JsonRpcErrorCode.ValidationError,
       when: 'An unknown facet key was used in filters.',
-      recovery: 'Call eia_describe_route to see valid facet IDs for this route.',
+      recovery: 'Call eia_describe_route and pick a facet key from facets[].id.',
+    },
+    {
+      reason: 'invalid_column',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'An unknown data column ID was passed in columns.',
+      recovery: 'Call eia_describe_route and pick a column from data_columns[].id.',
+    },
+    {
+      reason: 'invalid_frequency',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'An unknown frequency code was passed.',
+      recovery: 'Call eia_describe_route and pick a frequency from frequencies[].id.',
     },
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Date range is inverted (start is after end).',
       recovery: 'Swap start and end values — start must be earlier than or equal to end.',
-    },
-    {
-      reason: 'length_exceeded',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'length parameter exceeds the EIA maximum of 5000.',
-      recovery: 'Reduce length to 5000 or use offset pagination for larger result sets.',
     },
     {
       reason: 'rate_limited',
@@ -232,10 +247,15 @@ export const queryRouteTool = tool('eia_query_route', {
       );
     }
 
+    // Canvas presence decides whether the service pages past the preview, so it
+    // has to be resolved before the query, not after.
+    const bridge = getCanvasBridge();
+
     const service = getEiaApiService();
     const dataResp = await service.query(
       input.route,
       {
+        accumulate: bridge !== undefined,
         ...(input.filters !== undefined && { filters: input.filters }),
         ...(input.columns !== undefined && { columns: input.columns }),
         ...(input.frequency !== undefined && { frequency: input.frequency }),
@@ -262,6 +282,8 @@ export const queryRouteTool = tool('eia_query_route', {
       ...(input.frequency !== undefined && { appliedFrequency: input.frequency }),
       ...(input.columns !== undefined &&
         input.columns.length > 0 && { appliedColumns: input.columns }),
+      appliedOffset: input.offset,
+      appliedLength: input.length,
     });
 
     const result: {
@@ -272,7 +294,6 @@ export const queryRouteTool = tool('eia_query_route', {
       frequency: string;
       date_format: string;
       notice?: string;
-      canvas_id?: string;
       dataset?: string;
       canvas_preview_note?: string;
       truncation_warning?: string;
@@ -285,23 +306,30 @@ export const queryRouteTool = tool('eia_query_route', {
       date_format: dataResp.dateFormat,
     };
 
-    // Zero-row result is a valid success — return structured empty data with guidance.
-    if (dataResp.total === 0 && dataResp.data.length === 0) {
+    // Forward EIA's own top-level advisories. Each entry is
+    // { warning, description } — flatten to one readable line.
+    if (dataResp.warnings?.length) {
+      result.truncation_warning = dataResp.warnings
+        .map((w) => `${w.warning}: ${w.description}`)
+        .join('; ');
+    }
+
+    // A row-less response is a valid success, but the two causes need different
+    // guidance and neither can spill to canvas.
+    if (dataResp.data.length === 0) {
       result.notice =
-        'No rows matched the filters. Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.';
+        dataResp.total > 0
+          ? `Offset ${input.offset.toLocaleString()} is past the last row — total is ${dataResp.total.toLocaleString()}. Reduce offset below total to page through the matching rows.`
+          : 'No rows matched the filters. Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.';
       return result;
     }
 
-    // Forward EIA server-side truncation warnings
-    if (dataResp.warnings?.length) {
-      result.truncation_warning = dataResp.warnings.join('; ');
-    }
-
-    // DataCanvas spillover — opt-in via CANVAS_PROVIDER_TYPE=duckdb
-    const bridge = getCanvasBridge();
-    if (bridge && dataResp.data.length > 0) {
+    // DataCanvas spillover — opt-in via CANVAS_PROVIDER_TYPE=duckdb. The service
+    // has already accumulated offset pages when a bridge is present.
+    if (bridge) {
+      const canvasRows = dataResp.accumulated?.rows ?? dataResp.data;
       const registered = await bridge.registerDataframe(ctx, {
-        rows: dataResp.data,
+        rows: canvasRows,
         sourceTool: 'eia_query_route',
         queryParams: {
           route: input.route,
@@ -313,29 +341,30 @@ export const queryRouteTool = tool('eia_query_route', {
           offset: input.offset,
           length: input.length,
         },
-        truncated: dataResp.total > dataResp.data.length,
-        maxRows: input.length,
+        truncated: canvasRows.length < dataResp.total,
+        maxRows: dataResp.accumulated?.cap ?? input.length,
       });
 
       if (registered) {
         result.dataset = registered.tableName;
 
-        // Acquire or reuse canvas ID
-        if (input.canvas_id) {
-          result.canvas_id = input.canvas_id;
-        } else {
-          // The bridge manages the canvas internally; surface a stable per-tenant ID
-          // by using the bridge's shared canvas. We mint the canvas_id from the
-          // dataset name prefix for consistency.
-          result.canvas_id = registered.tableName;
-        }
-
+        const staged = registered.rowCount;
+        const accumulated = dataResp.accumulated;
         if (dataResp.total > dataResp.data.length) {
-          result.canvas_preview_note = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows — query canvas for full dataset using: SELECT * FROM ${registered.tableName}`;
+          const lastStaged = input.offset + staged;
+          const head = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows inline; ${staged.toLocaleString()} rows staged as ${registered.tableName} — SQL over the staged rows: SELECT * FROM ${registered.tableName}`;
+          const range = `the staged rows are ${(input.offset + 1).toLocaleString()}–${lastStaged.toLocaleString()} of ${dataResp.total.toLocaleString()}`;
+          if (!accumulated || lastStaged >= dataResp.total) {
+            result.canvas_preview_note = head;
+          } else if (accumulated.capped) {
+            result.canvas_preview_note = `${head}. Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (${accumulated.cap.toLocaleString()}), so ${range}. Narrow with filters, start, or end — or re-query with offset ${lastStaged.toLocaleString()} — to reach the rest.`;
+          } else {
+            result.canvas_preview_note = `${head}. Staging stopped before the end of the matching set, so ${range}. Re-query with offset ${lastStaged.toLocaleString()} to continue.`;
+          }
         }
       }
     } else if (dataResp.total > dataResp.data.length) {
-      result.canvas_preview_note = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) for full dataset access, or use offset pagination.`;
+      result.canvas_preview_note = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
     }
 
     return result;
@@ -356,8 +385,8 @@ export const queryRouteTool = tool('eia_query_route', {
       lines.push(`> ${result.canvas_preview_note}\n`);
     }
     if (result.dataset) {
-      lines.push(`**Dataset:** \`${result.dataset}\` (canvas: ${result.canvas_id})`);
-      lines.push('Use `eia_dataframe_query` with this dataset name for full SQL access.\n');
+      lines.push(`**Dataset:** \`${result.dataset}\``);
+      lines.push('Use `eia_dataframe_query` with this dataset name for SQL access.\n');
     }
     if (result.truncation_warning) {
       lines.push(`> **Warning:** ${result.truncation_warning}\n`);

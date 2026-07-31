@@ -224,39 +224,80 @@ describe('queryRouteTool — additional coverage', () => {
     expect(enrichment.appliedColumns).toBeUndefined();
   });
 
-  // ------------------------------------------------------------------
-  // Canvas: spillover with explicit canvas_id reuse
-  // ------------------------------------------------------------------
-
-  it('reuses supplied canvas_id when registering a dataset', async () => {
-    const mockRegister = vi.fn().mockResolvedValue({
-      tableName: 'df_NEW_TABLE',
-      rowCount: 2,
-      expiresAt: new Date().toISOString(),
-      columnSchema: [],
-    });
-    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-      registerDataframe: mockRegister,
-    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
-
+  it('echoes appliedOffset/appliedLength on every call', async () => {
     mockQuery.mockResolvedValue(BASE_RESPONSE);
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
     const input = queryRouteTool.input.parse({
       route: 'electricity/retail-sales',
-      canvas_id: 'df_EXISTING_CANVAS',
+      offset: 250,
+      length: 25,
     });
-    const result = await queryRouteTool.handler(input, ctx);
+    await queryRouteTool.handler(input, ctx);
 
-    // canvas_id should be the supplied one, not the newly minted table name
-    expect(result.canvas_id).toBe('df_EXISTING_CANVAS');
-    expect(result.dataset).toBe('df_NEW_TABLE');
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.appliedOffset).toBe(250);
+    expect(enrichment.appliedLength).toBe(25);
   });
 
-  it('uses dataset name as canvas_id when no canvas_id supplied', async () => {
+  it('echoes the schema defaults for offset/length when neither is supplied', async () => {
+    mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    await queryRouteTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.appliedOffset).toBe(0);
+    expect(enrichment.appliedLength).toBe(100);
+  });
+
+  // ------------------------------------------------------------------
+  // Canvas: accumulation replaces the dropped canvas_id threading
+  // ------------------------------------------------------------------
+
+  it('strips a canvas_id input — the parameter no longer exists', () => {
+    const parsed = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      canvas_id: 'df_EXISTING_CANVAS',
+    });
+    expect(parsed).not.toHaveProperty('canvas_id');
+    expect(Object.keys(queryRouteTool.input.shape)).not.toContain('canvas_id');
+  });
+
+  it('requests accumulation only when a canvas bridge is present', async () => {
+    mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    await queryRouteTool.handler(input, ctx);
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      'electricity/retail-sales',
+      expect.objectContaining({ accumulate: false }),
+      ctx,
+    );
+
+    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+      registerDataframe: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    await queryRouteTool.handler(input, createMockContext({ errors: queryRouteTool.errors }));
+
+    expect(mockQuery).toHaveBeenLastCalledWith(
+      'electricity/retail-sales',
+      expect.objectContaining({ accumulate: true }),
+      expect.anything(),
+    );
+  });
+
+  it('registers the accumulated rows, not the inline preview', async () => {
+    const accumulatedRows = Array.from({ length: 40 }, (_, i) => ({
+      period: `2024-${String(i + 1).padStart(2, '0')}`,
+      value: String(i),
+    }));
     const mockRegister = vi.fn().mockResolvedValue({
-      tableName: 'df_MINTED',
-      rowCount: 2,
+      tableName: 'df_STAGED',
+      rowCount: 40,
       expiresAt: new Date().toISOString(),
       columnSchema: [],
     });
@@ -264,14 +305,89 @@ describe('queryRouteTool — additional coverage', () => {
       registerDataframe: mockRegister,
     } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
 
-    mockQuery.mockResolvedValue(BASE_RESPONSE);
+    mockQuery.mockResolvedValue({
+      ...BASE_RESPONSE,
+      total: 40,
+      accumulated: { rows: accumulatedRows, capped: false, cap: 25000 },
+    });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
     const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
     const result = await queryRouteTool.handler(input, ctx);
 
-    expect(result.canvas_id).toBe('df_MINTED');
-    expect(result.dataset).toBe('df_MINTED');
+    expect(mockRegister.mock.calls[0]?.[1].rows).toHaveLength(40);
+    expect(mockRegister.mock.calls[0]?.[1].truncated).toBe(false);
+    // Inline preview is untouched by accumulation.
+    expect(result.data).toHaveLength(2);
+    expect(result.returned_count).toBe(2);
+    expect(result.dataset).toBe('df_STAGED');
+    // The note names the real staged count, not the preview count.
+    expect(result.canvas_preview_note).toContain('40 rows staged as df_STAGED');
+    expect(result.canvas_preview_note).not.toContain('EIA_CANVAS_MAX_ROWS');
+  });
+
+  it('names the cap in the note when accumulation was capped short of total', async () => {
+    const accumulatedRows = Array.from({ length: 25 }, (_, i) => ({
+      period: `2024-${String((i % 12) + 1).padStart(2, '0')}`,
+      value: String(i),
+    }));
+    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+      registerDataframe: vi.fn().mockResolvedValue({
+        tableName: 'df_CAPPED',
+        rowCount: 25,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      }),
+    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+
+    mockQuery.mockResolvedValue({
+      ...BASE_RESPONSE,
+      total: 113460,
+      accumulated: { rows: accumulatedRows, capped: true, cap: 25000 },
+    });
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const result = await queryRouteTool.handler(input, ctx);
+
+    expect(result.canvas_preview_note).toContain('25 rows staged as df_CAPPED');
+    expect(result.canvas_preview_note).toContain('EIA_CANVAS_MAX_ROWS');
+    expect(result.canvas_preview_note).toContain('113,460');
+    expect(result.canvas_preview_note).toContain('re-query with offset 25');
+    // Never claims the canvas holds the full dataset.
+    expect(result.canvas_preview_note).not.toContain('full dataset');
+  });
+
+  it('names the shortfall without blaming the cap when staging stopped early', async () => {
+    const accumulatedRows = Array.from({ length: 5100 }, (_, i) => ({
+      period: `2024-${String((i % 12) + 1).padStart(2, '0')}`,
+      value: String(i),
+    }));
+    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+      registerDataframe: vi.fn().mockResolvedValue({
+        tableName: 'df_PARTIAL',
+        rowCount: 5100,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      }),
+    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+
+    mockQuery.mockResolvedValue({
+      ...BASE_RESPONSE,
+      total: 20000,
+      accumulated: { rows: accumulatedRows, capped: false, cap: 25000 },
+    });
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const result = await queryRouteTool.handler(input, ctx);
+
+    expect(result.canvas_preview_note).toContain('5,100 rows staged as df_PARTIAL');
+    expect(result.canvas_preview_note).toContain('Staging stopped before the end');
+    expect(result.canvas_preview_note).toContain('1–5,100 of 20,000');
+    expect(result.canvas_preview_note).toContain('offset 5,100');
+    // The cap did not bind — the note must not claim it did.
+    expect(result.canvas_preview_note).not.toContain('EIA_CANVAS_MAX_ROWS');
   });
 
   it('canvas_preview_note omitted when canvas is available and total equals length', async () => {

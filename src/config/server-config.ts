@@ -16,6 +16,14 @@ const ServerConfigSchema = z.object({
     .positive()
     .default(86400)
     .describe('Per-table TTL for canvas dataframes in seconds (default 24 h)'),
+  canvasMaxRows: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(25000)
+    .describe(
+      'Cumulative row ceiling for eia_query_route canvas accumulation (default 25000 = 5 EIA requests)',
+    ),
   dataframeDropEnabled: z
     .stringbool()
     .default(false)
@@ -31,6 +39,7 @@ export function getServerConfig(): ServerConfig {
     apiKey: 'EIA_API_KEY',
     baseUrl: 'EIA_BASE_URL',
     datasetTtlSeconds: 'EIA_DATASET_TTL_SECONDS',
+    canvasMaxRows: 'EIA_CANVAS_MAX_ROWS',
     dataframeDropEnabled: 'EIA_DATAFRAME_DROP_ENABLED',
   });
   return _config;

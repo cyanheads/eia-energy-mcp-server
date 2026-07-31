@@ -91,13 +91,40 @@ export interface RouteMetadata {
 /** A data row from /v2/{route}/data/. All values are strings per EIA API. */
 export type DataRow = Record<string, string | null>;
 
+/**
+ * A single EIA advisory. Returned at the TOP LEVEL of the data payload (sibling
+ * to `response`), not inside it — `response.warnings` is always null.
+ */
+export interface EiaWarning {
+  description: string;
+  warning: string;
+}
+
+/**
+ * Rows accumulated across offset pages for canvas registration, kept separate
+ * from the inline preview so the response payload stays bounded by the caller's
+ * `length` while the canvas receives the wider set.
+ */
+export interface AccumulatedRows {
+  /** The cumulative row ceiling that applied (EIA_CANVAS_MAX_ROWS). */
+  cap: number;
+  /** True when `cap` stopped accumulation short of `total`. */
+  capped: boolean;
+  rows: DataRow[];
+}
+
 /** Response from /v2/{route}/data/. */
 export interface DataResponse {
+  /**
+   * Present only when accumulation was requested and more rows existed past the
+   * inline preview. `rows` starts with the preview rows and extends forward.
+   */
+  accumulated?: AccumulatedRows;
   data: DataRow[];
   dateFormat: string;
   frequency: string;
   total: number;
-  warnings: string[] | undefined;
+  warnings: EiaWarning[] | undefined;
 }
 
 /** Entry in the Fuse.js search index. */

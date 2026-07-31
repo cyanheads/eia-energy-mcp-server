@@ -10,8 +10,8 @@
 |:-----|:------------|:-----------|:------------|
 | `eia_browse_routes` | Lists child routes under a given path in the EIA dataset taxonomy. Start with no path to get top-level categories (electricity, petroleum, natural-gas, steo, aeo, ieo, seds, etc.), then drill into subcategories and leaf routes. | `path?` (route prefix, defaults to root) | `readOnlyHint`, `openWorldHint: false` |
 | `eia_describe_route` | Returns full metadata for a leaf route: available facets with their valid values, data column names, frequency options, units, and date range. Call before `eia_query_route` to understand filter options. | `route` (e.g. `electricity/retail-sales`) | `readOnlyHint`, `openWorldHint: false` |
-| `eia_search_routes` | Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "gasoline retail prices" or "solar capacity by state" to matching route paths. | `query`, `limit?` | `readOnlyHint`, `openWorldHint: false` |
-| `eia_query_route` | Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Returns a preview inline; spills large result sets to a DataCanvas table for SQL analysis. Returns `canvas_id` and `dataset` (`df_<id>`) when spillover occurs. | `route`, `filters?` (facet key-value pairs), `start?`, `end?`, `frequency?`, `columns?`, `sort?`, `limit?`, `canvas_id?` | `readOnlyHint`, `openWorldHint: false` |
+| `eia_search_routes` | Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. | `query`, `limit?` | `readOnlyHint`, `openWorldHint: false` |
+| `eia_query_route` | Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Returns a preview inline; spills large result sets to a DataCanvas table for SQL analysis by paging past the preview up to `EIA_CANVAS_MAX_ROWS`. Returns `dataset` (`df_<id>`) when spillover occurs. | `route`, `filters?` (facet key-value pairs), `start?`, `end?`, `frequency?`, `columns?`, `sort?`, `offset?`, `length?` | `readOnlyHint`, `openWorldHint: false` |
 | `eia_dataframe_describe` | List canvas dataframes materialized by `eia_query_route`, with provenance, TTL, row count, and column schema. | `name?` (single `df_<id>` or omit for all) | `readOnlyHint`, `idempotentHint`, `openWorldHint: false` |
 | `eia_dataframe_query` | Run a single-statement SELECT across canvas dataframes. Supports `register_as` to persist results as new dataframes. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected by the framework SQL gate. System catalogs are denied at the bridge layer. | `sql`, `register_as?`, `preview?`, `row_limit?` | `readOnlyHint`, `idempotentHint`, `openWorldHint: false` |
 | `eia_dataframe_drop` | Drop a canvas dataframe by name. **Opt-in** via `EIA_DATAFRAME_DROP_ENABLED=true` — off by default since TTL handles cleanup. Idempotent: returns `dropped=false` when nothing matched. | `name` | `readOnlyHint: false`, `idempotentHint`, `destructiveHint: true` |
@@ -72,6 +72,7 @@ Exposes the U.S. Energy Information Administration's API v2 as a navigable, quer
 | `CANVAS_PROVIDER_TYPE` | No | Set to `duckdb` to enable DataCanvas spillover and dataframe tools (Node only; Workers fail closed) |
 | `EIA_DATASET_TTL_SECONDS` | No | Per-table TTL for canvas-registered dataframes. Default `86400` (24 h), sliding — touched on every dataframe operation. Independent from the canvas-level TTL. |
 | `EIA_DATAFRAME_DROP_ENABLED` | No | Set to `true` to expose `eia_dataframe_drop`. Default `false`; TTL handles cleanup in normal operation. |
+| `EIA_CANVAS_MAX_ROWS` | No | Cumulative row ceiling for `eia_query_route` canvas accumulation. Default `25000` — five requests at EIA's 5,000-row-per-request ceiling, ~4 MB of upstream JSON and ~8.5 s of tool latency when it binds. Lower it to keep exploratory calls snappy, raise it for wider staged analyses. |
 
 ## Implementation Order
 
@@ -80,7 +81,7 @@ Exposes the U.S. Energy Information Administration's API v2 as a navigable, quer
 3. `eia_browse_routes` — thin wrapper over service browse method
 4. `eia_describe_route` — thin wrapper; error contract for unknown routes
 5. `eia_search_routes` — fuzzy search against the in-memory index
-6. `eia_query_route` — filters, pagination, DataCanvas spillover (`ctx.core.canvas?`); emit `canvas_id` + `dataset` (`df_<id>`) on spillover
+6. `eia_query_route` — filters, pagination, DataCanvas spillover (`ctx.core.canvas?`); emit `dataset` (`df_<id>`) on spillover
 7. `CanvasBridgeService` (`src/services/canvas-bridge/`) — `df_<id>` minting, provenance tracking, per-table TTL, system-catalog deny
 8. `eia_dataframe_describe` / `eia_dataframe_query` — layered on the bridge; describe lazy-sweeps expired tables
 9. `eia_dataframe_drop` — conditional registration in `createApp()` guarded by `EIA_DATAFRAME_DROP_ENABLED`
@@ -159,7 +160,11 @@ Fuzzy search across the in-memory route index. Useful when the caller doesn't kn
 
 Pulls data from a leaf route. Core data retrieval tool — use `eia_describe_route` first to discover valid facets and columns.
 
-**Implementation note:** Data is fetched from `/v2/{route}/data/` (note the `/data/` suffix — the metadata and data endpoints are distinct paths). Query params: `frequency`, `data[]` (columns), `facets[facetId][]`, `start`, `end`, `sort[]`, `offset`, `length` (max 5000 per page). The API returns a `warnings[]` array when results are truncated server-side. Data values are returned as **strings** (e.g. `"9.13"`, not `9.13`); units for each column appear as inline `{col}-units` fields in each row (e.g. `"price-units": "cents per kilowatt-hour"`).
+**Implementation note:** Data is fetched from `/v2/{route}/data/` (note the `/data/` suffix — the metadata and data endpoints are distinct paths). Query params: `frequency`, `data[]` (columns), `facets[facetId][]`, `start`, `end`, `sort[]`, `offset`, `length` (max 5000 per page). Data values are returned as **strings** (e.g. `"9.13"`, not `9.13`); units for each column appear as inline `{col}-units` fields in each row (e.g. `"price-units": "cents per kilowatt-hour"`).
+
+**Warnings envelope:** EIA returns `warnings` at the **top level** of the payload, a sibling of `response` — `response.warnings` is always `null`. Each entry is `{ warning, description }`, not a string (e.g. `{ "warning": "incomplete return", "description": "The API can only return 5000 rows in JSON format. …" }`). The service reads the top-level array and the tool flattens each entry to `warning: description`.
+
+**Canvas accumulation:** When a canvas bridge is present and more rows match than the preview holds, the service walks `offset` pages forward from the preview — each page bounded by EIA's 5,000-row-per-request ceiling — and returns the accumulated set separately from the inline preview. The inline `data` array always stays at the caller's `length`; accumulation only widens what reaches the canvas. `EIA_CANVAS_MAX_ROWS` (default 25,000) bounds the cumulative total; when it binds, `canvas_preview_note` names the real staged row count, the cap, and the offset to resume from. Accumulation is best-effort, matching the canvas bridge it feeds: a follow-up page that fails after retries stops staging and keeps the rows already gathered rather than discarding a preview the caller has in hand, and `canvas_preview_note` reports the shortfall and the resume offset without blaming the cap. A caller-side abort still propagates. Requesting a page size above 5,000 is not an upstream error — EIA returns the first 5,000 rows plus a `parameter out of range: length` warning — so the input schema's `.max(5000)` owns that bound and the service carries no redundant guard.
 
 **Input schema:**
 - `route: string` — Leaf route path (e.g. `"electricity/retail-sales"`)
@@ -169,9 +174,8 @@ Pulls data from a leaf route. Core data retrieval tool — use `eia_describe_rou
 - `start?: string` — Period start in the route's date format (e.g. `"2020-01"` for monthly, `"2020"` for annual). Format discoverable via `eia_describe_route`.
 - `end?: string` — Period end (same format as `start`)
 - `sort?: Array<{ column: string; direction: "asc" | "desc" }>` — Result ordering
-- `offset?: number` — Pagination offset (default 0); use with `length` to page through results
-- `length?: number` — Rows to fetch per page (default 100, max 5000)
-- `canvas_id?: string` — DataCanvas ID to register or append to; minted on omit when canvas is available
+- `offset?: number` — Row offset into the matching set (default 0); an offset at or beyond `total` returns zero rows
+- `length?: number` — Rows in the inline preview (default 100, max 5000). Canvas staging pages past this on its own.
 
 **Output:**
 - `route: string`
@@ -180,20 +184,23 @@ Pulls data from a leaf route. Core data retrieval tool — use `eia_describe_rou
 - `returned_count: number` — rows in this response (useful for chaining: when `returned_count < total`, use `offset`/canvas for the rest)
 - `frequency: string` — frequency of the returned data
 - `date_format: string` — period format for the returned data (e.g. `"YYYY-MM"`)
-- `canvas_id?: string` — present when spillover occurred. The canvas ID identifies the shared DuckDB canvas workspace (pass on subsequent calls to accumulate multiple route results into the same canvas).
-- `dataset?: string` — present when spillover occurred. The `df_<id>` handle for the registered table within the canvas — pass this directly to `eia_dataframe_query` SQL (`SELECT ... FROM df_<id>`). Distinct from `canvas_id`: one canvas can hold multiple `df_<id>` tables.
-- `canvas_preview_note?: string` — human-readable note when total > length (e.g. "Showing 100 of 4,320 rows — query canvas for full dataset")
-- `truncation_warning?: string` — forwarded from EIA's `warnings[]` when the API itself warns of incomplete results (row count approaches 5,000 per-page limit)
+- `notice?: string` — present when the response carries no rows. Distinguishes the two causes: zero rows matched the filters (broaden the query), or `offset` paged past the last row (reduce `offset` below `total`).
+- `dataset?: string` — present when a table was registered. The `df_<id>` handle — pass directly to `eia_dataframe_query` SQL (`SELECT ... FROM df_<id>`). Every dataset a tenant stages lives in one shared canvas, so handles from different routes join by name.
+- `canvas_preview_note?: string` — present when `total` exceeds the inline preview. Names how many rows actually reached the canvas table and, when staging stopped short of `total` — the `EIA_CANVAS_MAX_ROWS` cap, or an upstream page that didn't return — says so and gives the offset to resume from.
+- `truncation_warning?: string` — forwarded from EIA's top-level `warnings[]`, each entry flattened to `warning: description`
 
 **Type inference note:** DuckDB infers column types from the first ~100 rows of each registered result. Because all EIA values arrive as strings, the bridge sets the schema explicitly as `VARCHAR` for data columns. SQL consumers that need numeric results must cast: `CAST(value AS DOUBLE)`, `CAST(value AS INTEGER)`. Aggregates (`SUM`, `AVG`) also require an explicit cast since DuckDB will not coerce `VARCHAR` to numeric implicitly.
 
 **Errors:**
-- `route_not_found` (`NotFound`) — route doesn't exist or isn't a leaf
-- `invalid_facet` (`InvalidParams`) — unknown facet key; hint to call `eia_describe_route`
-- `invalid_facet_value` (`InvalidParams`) — unknown value for a known facet; includes valid values in error data
-- `no_data` (`NotFound`, non-retryable) — route exists but filters yield zero rows; suggest broadening filters or removing date constraints
-- `length_exceeded` (`InvalidParams`) — `length` > 5000 (EIA hard limit); reduce to 5000 or use pagination
+- `route_not_found` (`NotFound`) — route doesn't exist in the EIA taxonomy
+- `route_not_queryable` (`ValidationError`) — route is a category node with sub-routes, not a queryable leaf. Matches `eia_describe_route`'s reason for the same condition.
+- `invalid_facet` (`ValidationError`) — unknown facet key; recovery points at `facets[].id`. Also the fallback when an EIA 400 message doesn't match a known shape.
+- `invalid_column` (`ValidationError`) — unknown data column ID; recovery points at `data_columns[].id`
+- `invalid_frequency` (`ValidationError`) — unknown frequency code; recovery points at `frequencies[].id`
+- `no_data` (`ValidationError`) — inverted date range (`start` after `end`)
 - `rate_limited` (`ServiceUnavailable`, retryable) — EIA rate limit hit (OVER_RATE_LIMIT in API response); back off and retry
+
+The three `invalid_*` reasons are split from a single EIA 400 by reading the upstream message, which names the rejected dimension verbatim (`Invalid facet '…'`, `Invalid data '…'`, `Invalid frequency '…'`). A zero-row result is a success with a `notice`, not an error. A `length` above 5,000 is rejected by the input schema as `-32602 InvalidParams` before the handler runs, so it carries no `data.reason`. A 200 response carrying no `response` envelope is an upstream shape failure rather than a caller error, so it bubbles as a bare `ServiceUnavailable` with no `data.reason` instead of borrowing a declared reason whose code and `when` don't fit it.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: false`
 
@@ -276,7 +283,7 @@ Drop a canvas dataframe by name. **Opt-in** — only registered in `createApp()`
 | 2 | Drill to leaf | `eia_browse_routes` (category path) |
 | 3 | Inspect facets | `eia_describe_route` |
 | 4 | Pull data | `eia_query_route` (with filters from step 3) |
-| 5 | Analyze full set | SQL on `canvas_id` if spillover occurred |
+| 5 | Analyze the staged set | SQL on `dataset` if spillover occurred |
 
 ### Fuzzy Discovery → Query
 
@@ -288,13 +295,13 @@ Drop a canvas dataframe by name. **Opt-in** — only registered in `createApp()`
 
 ### Multi-Route Canvas Analysis
 
-Addresses the prior "no bulk multi-route queries" limitation. Call `eia_query_route` N times with the same `canvas_id` to accumulate multiple route result sets into one canvas workspace, then use `eia_dataframe_query` to join or compare them in a single SQL statement.
+Addresses the prior "no bulk multi-route queries" limitation. Every dataset a tenant stages lands in the same canvas, so tables from different routes are already cross-joinable by their `df_<id>` names — nothing threads between calls. Pull each route, then use `eia_dataframe_query` to join or compare the handles in a single SQL statement.
 
 | # | Action | Tool | Notes |
 |:--|:-------|:-----|:------|
-| 1 | Pull electricity retail sales | `eia_query_route` | `canvas_id` omitted → minted; returns `canvas_id` + `dataset` (`df_abc`) |
-| 2 | Pull natural gas spot prices | `eia_query_route` | Same `canvas_id` passed in → returns second `dataset` (`df_xyz`) |
-| 3 | Pull petroleum consumption by sector | `eia_query_route` | Same `canvas_id` → third `dataset` (`df_def`) |
+| 1 | Pull electricity retail sales | `eia_query_route` | Returns `dataset` (`df_abc`) |
+| 2 | Pull natural gas spot prices | `eia_query_route` | Returns a second `dataset` (`df_xyz`) in the same canvas |
+| 3 | Pull petroleum consumption by sector | `eia_query_route` | Returns a third `dataset` (`df_def`) |
 | 4 | GROUP BY state / sector / fuel; SUM production by period | `eia_dataframe_query` | `SELECT period, SUM(CAST(value AS DOUBLE)) ... FROM df_abc GROUP BY period ORDER BY period` |
 | 5 | JOIN two route results by period | `eia_dataframe_query` | `SELECT a.period, CAST(a.value AS DOUBLE), CAST(b.value AS DOUBLE) FROM df_abc a JOIN df_xyz b ON a.period = b.period` |
 | 6 | Persist join result for follow-up | `eia_dataframe_query` | `register_as: "df_joined_energy"` — fresh TTL; chain further aggregates without re-running source queries |
@@ -311,7 +318,8 @@ Addresses the prior "no bulk multi-route queries" limitation. Call `eia_query_ro
 - **Data values are strings**: All numeric data from the `/data/` endpoint arrives as strings (e.g. `"9.13"`). Consumers doing arithmetic need to parse. Surfaced in output schema.
 - **Route tree currency**: In-process cache is valid for server lifetime. EIA occasionally adds leaf routes between releases; a server restart picks them up.
 - **International data granularity**: `international/` routes have coarser facets than domestic routes (country, not state). Fully accessible but sub-national breakdowns aren't available for most countries.
-- **No bulk multi-route queries in a single call**: Each `eia_query_route` call targets one leaf route. Cross-route comparisons require multiple tool calls. However, calling `eia_query_route` N times with the same `canvas_id` accumulates multiple result sets into one canvas, and `eia_dataframe_query` can JOIN them in a single SQL statement — see "Multi-Route Canvas Analysis" workflow above.
+- **No bulk multi-route queries in a single call**: Each `eia_query_route` call targets one leaf route. Cross-route comparisons require multiple tool calls. Every call's result lands in the same per-tenant canvas, though, so `eia_dataframe_query` can JOIN the resulting `df_<id>` handles in a single SQL statement — see "Multi-Route Canvas Analysis" workflow above.
+- **Canvas staging is capped**: `eia_query_route` pages up to `EIA_CANVAS_MAX_ROWS` (default 25,000) per call. A route matching more than that stages a bounded prefix, and `canvas_preview_note` names the staged count plus the offset to resume from — narrow the query with facets, `start`, or `end` to fit an analysis inside one staged table.
 - **Dataframe tools require `CANVAS_PROVIDER_TYPE=duckdb`**: Node.js only. DuckDB has no V8-isolate build; setting `CANVAS_PROVIDER_TYPE=duckdb` on a Cloudflare Workers deployment fails closed with a `ConfigurationError` at init time. When canvas is absent, `eia_query_route` degrades to preview-only and the three dataframe tools are not available (or return `canvas_unavailable`).
 - **Deprecated routes**: `co2-emissions` is deprecated (API response carries a deprecation notice pointing to `seds`). `eia_browse_routes` should surface this notice; `eia_search_routes` may want to down-rank or annotate deprecated routes.
 
@@ -329,7 +337,9 @@ Addresses the prior "no bulk multi-route queries" limitation. Call `eia_query_ro
 - **Why expose dataframe tools at all?** → EIA datasets are multi-dimensional: a single route might return data across states, sectors, fuel types, and periods simultaneously. Inline preview rows (bounded to avoid context overflow) are sufficient for narrow queries but blind for analysis across facet combinations. Canvas SQL lets the agent GROUP, SUM, and JOIN on the full result set without re-fetching upstream data. The three dataframe tools are the analytical complement to `eia_query_route`, not a separate workflow.
 - **Why opt-in drop (`EIA_DATAFRAME_DROP_ENABLED`)?** → TTL (default 24 h, sliding) already handles cleanup for normal usage patterns. An always-on drop tool adds a destructive surface with no benefit in the common case. Opt-in makes the risk explicit — operators who need manual cleanup in long-running sessions enable it deliberately.
 - **Why expose `register_as` chaining in `eia_dataframe_query`?** → Derived aggregates (e.g., a JOIN of electricity prices and gas prices, grouped by region and period) are expensive to reconstruct from raw route results. Persisting them as a named dataframe with a fresh TTL lets the agent build incrementally — query once, reuse across follow-up questions in the same session — without re-running N `eia_query_route` calls.
-- **How do dataframe tools address the prior "no bulk multi-route queries" limitation?** → They don't remove it at the single-call level (each `eia_query_route` still targets one leaf route), but they provide the join layer that was missing. Call `eia_query_route` N times with the same `canvas_id` to stage N result sets, then use `eia_dataframe_query` to JOIN them. The limitation entry in Known Limitations has been updated to reflect this path.
+- **How do dataframe tools address the prior "no bulk multi-route queries" limitation?** → They don't remove it at the single-call level (each `eia_query_route` still targets one leaf route), but they provide the join layer that was missing. Call `eia_query_route` N times to stage N result sets — all in the same per-tenant canvas — then use `eia_dataframe_query` to JOIN the `df_<id>` handles.
+- **Should callers thread a `canvas_id` between `eia_query_route` calls?** → No, and the parameter was removed. `CanvasBridge.acquireSharedCanvas` routes every registration to one canvas per tenant with no scoping argument, so accumulation was already automatic; the input was echoed back and otherwise ignored, and the output field carried the table name rather than a canvas ID. `dataset` is the genuine join handle and is now the only one documented. Per-call canvas isolation would be the alternative, but nothing in the workflow wants it — cross-route joins are the point.
+- **Why cap canvas accumulation at 25,000 rows?** → Registering only the previewed page made the "query canvas for the full dataset" note false, so the service now pages forward. The bound is a latency and memory trade, sized from measurement: EIA caps a request at 5,000 rows, and a 5,000-row page of `electricity/retail-sales` measures ~830 KB and ~1 s round trip. A full 25,000-row accumulation on that route is five requests, ~4 MB of upstream JSON, and ~8.5 s of end-to-end tool latency (upstream fetch plus JSON parse plus DuckDB append). Unbounded accumulation would put a six-figure-row route — retail sales monthly is ~113,000 — well past any reasonable tool latency. `EIA_CANVAS_MAX_ROWS` moves the bound either way: lower it to keep exploratory calls snappy, raise it for wider staged analyses.
 
 ### Options declined
 

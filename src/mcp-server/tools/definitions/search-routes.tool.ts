@@ -9,10 +9,26 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
 
+/**
+ * Score above which a hit is labelled a weak match. Calibrated against
+ * fuse.js 7.5.0 over the live EIA taxonomy: the tool description's own example
+ * queries top out around 0.84 ("gasoline retail prices" → petroleum/pri/allmg),
+ * while a query with no real match sits at 0.95 ("solar capacity by state" →
+ * coal/reserves-capacity). Fuse's own `threshold` already drops the rest.
+ *
+ * This number is coupled to fuse.js's scoring scale, not to a semantic notion
+ * of relevance — re-measure it whenever the fuse.js version moves. Weighted
+ * scores shifted upward wholesale between 7.4.2 and 7.5.0 (the raw key weights
+ * are now normalized before they become score exponents), so a threshold left
+ * at the old scale labels perfect matches weak.
+ * `tests/services/route-cache.test.ts` guards the calibration.
+ */
+export const WEAK_MATCH_SCORE = 0.9;
+
 export const searchRoutesTool = tool('eia_search_routes', {
   title: 'Search EIA Routes',
   description:
-    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. STEO series names are indexed so queries like "ethanol net imports" or "crude oil production forecast" also resolve. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.5 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy.',
+    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. STEO series names are indexed so queries like "ethanol net imports" or "crude oil production forecast" also resolve. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.9 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
@@ -41,7 +57,9 @@ export const searchRoutesTool = tool('eia_search_routes', {
             description: z.string().describe('Route description.'),
             score: z
               .number()
-              .describe('Fuzzy match score: 0 = exact, 1 = no match. Lower is better.'),
+              .describe(
+                'Fuzzy match score: 0 = exact, 1 = no match. Lower is better; above 0.9 the match is unreliable.',
+              ),
             isLeaf: z
               .boolean()
               .describe(
@@ -119,7 +137,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
     lines.push(`**${result.results.length} result(s)**\n`);
     for (const r of result.results) {
       const tag = r.isLeaf ? '[leaf]' : '[cat]';
-      const weakMatch = r.score > 0.5 ? ' ⚠ weak match' : '';
+      const weakMatch = r.score > WEAK_MATCH_SCORE ? ' ⚠ weak match' : '';
       lines.push(`${tag} **${r.route}** (score: ${r.score.toFixed(3)}${weakMatch})`);
       lines.push(`  ${r.name}`);
       if (r.description) lines.push(`  ${r.description}`);

@@ -111,17 +111,112 @@ describe('queryRouteTool', () => {
     expect(result.notice).toContain('eia_describe_route');
   });
 
-  it('forwards truncation_warning from EIA warnings', async () => {
+  it('renders EIA warning objects as "warning: description"', async () => {
     mockQuery.mockResolvedValue({
       ...SAMPLE_DATA_RESPONSE,
-      warnings: ['Results may be truncated near the 5000 row limit'],
+      warnings: [
+        {
+          warning: 'incomplete return',
+          description: 'The API can only return 5000 rows in JSON format.',
+        },
+      ],
     });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
     const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
     const result = await queryRouteTool.handler(input, ctx);
 
-    expect(result.truncation_warning).toContain('truncated');
+    expect(result.truncation_warning).toBe(
+      'incomplete return: The API can only return 5000 rows in JSON format.',
+    );
+    expect(result.truncation_warning).not.toContain('[object Object]');
+  });
+
+  it('joins multiple EIA warnings', async () => {
+    mockQuery.mockResolvedValue({
+      ...SAMPLE_DATA_RESPONSE,
+      warnings: [
+        { warning: 'parameter out of range: length', description: 'The maximum value is 5000.' },
+        { warning: 'incomplete return', description: 'Use offset to paginate results.' },
+      ],
+    });
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const result = await queryRouteTool.handler(input, ctx);
+
+    expect(result.truncation_warning).toBe(
+      'parameter out of range: length: The maximum value is 5000.; incomplete return: Use offset to paginate results.',
+    );
+  });
+
+  it('emits an offset-past-the-end notice when total is positive but no rows came back', async () => {
+    mockQuery.mockResolvedValue({
+      total: 25,
+      dateFormat: 'YYYY',
+      frequency: 'annual',
+      data: [],
+      warnings: undefined,
+    });
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      offset: 9999,
+    });
+    const result = await queryRouteTool.handler(input, ctx);
+
+    expect(result.returned_count).toBe(0);
+    expect(result.notice).toContain('9,999');
+    expect(result.notice).toContain('25');
+    expect(result.notice).toContain('Reduce offset');
+    // The canvas-disabled advice must not fire on a past-the-end page.
+    expect(result.canvas_preview_note).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain('CANVAS_PROVIDER_TYPE');
+  });
+
+  it('does not emit "enable DataCanvas" advice when a bridge is present', async () => {
+    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+      registerDataframe: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    mockQuery.mockResolvedValue({
+      total: 25,
+      dateFormat: 'YYYY',
+      frequency: 'annual',
+      data: [],
+      warnings: undefined,
+    });
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      offset: 9999,
+    });
+    const result = await queryRouteTool.handler(input, ctx);
+
+    const rendered = (queryRouteTool.format!(result)[0] as { text: string }).text;
+    expect(rendered).not.toContain('CANVAS_PROVIDER_TYPE');
+    expect(rendered).toContain('Reduce offset');
+  });
+
+  it('omits canvas_id from the output entirely', async () => {
+    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+      registerDataframe: vi.fn().mockResolvedValue({
+        tableName: 'df_ABCDE_FGHIJ',
+        rowCount: 2,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      }),
+    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    mockQuery.mockResolvedValue(SAMPLE_DATA_RESPONSE);
+
+    const ctx = createMockContext({ errors: queryRouteTool.errors });
+    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const result = await queryRouteTool.handler(input, ctx);
+
+    expect(result.dataset).toBe('df_ABCDE_FGHIJ');
+    expect(result).not.toHaveProperty('canvas_id');
+    expect(Object.keys(queryRouteTool.output.shape)).not.toContain('canvas_id');
   });
 
   it('includes canvas_preview_note when total > returned and no canvas', async () => {
@@ -180,7 +275,6 @@ describe('queryRouteTool', () => {
         returned_count: 100,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
-        canvas_id: 'df_ABCDE_FGHIJ',
         dataset: 'df_ABCDE_FGHIJ',
         canvas_preview_note: 'Showing 100 of 5,000 rows',
       };
@@ -189,6 +283,7 @@ describe('queryRouteTool', () => {
       const text = (blocks[0] as { text: string }).text;
       expect(text).toContain('df_ABCDE_FGHIJ');
       expect(text).toContain('5,000');
+      expect(text).not.toContain('canvas:');
     });
   });
 });

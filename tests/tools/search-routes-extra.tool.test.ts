@@ -128,14 +128,14 @@ describe('searchRoutesTool — additional coverage', () => {
       expect(text).toContain('eia_query_route');
     });
 
-    it('renders weak-match warning for score > 0.5', () => {
+    it('renders weak-match warning above the weak-match threshold', () => {
       const result = {
         results: [
           {
             route: 'coal/shipments',
             name: 'Coal Shipments',
             description: 'Coal shipment data',
-            score: 0.72,
+            score: 0.95,
             isLeaf: true,
           },
         ],
@@ -145,7 +145,7 @@ describe('searchRoutesTool — additional coverage', () => {
       expect(text).toContain('weak match');
     });
 
-    it('does not render weak-match warning for score <= 0.5', () => {
+    it('does not render weak-match warning at or below the weak-match threshold', () => {
       const result = {
         results: [
           {

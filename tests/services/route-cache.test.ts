@@ -4,6 +4,7 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
+import { WEAK_MATCH_SCORE } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import {
   _resetRouteCache,
   buildNodeMap,
@@ -209,5 +210,66 @@ describe('route-cache', () => {
       ]);
       expect(getIndexSize()).toBe(7);
     });
+  });
+});
+
+/**
+ * The weak-match label in `eia_search_routes` compares Fuse's score against a
+ * fixed threshold, and Fuse's score scale is a library implementation detail —
+ * it shifted wholesale between 7.4.2 and 7.5.0. These fixtures carry the real
+ * name/description of two live EIA routes, so a fuse.js upgrade that moves the
+ * scale trips the assertions instead of silently labelling good hits weak.
+ */
+describe('weak-match calibration against the live Fuse scale', () => {
+  const LIVE_FIXTURE: RawRouteNode[] = [
+    {
+      id: 'electricity',
+      name: 'Electricity',
+      description: 'EIA electricity survey data',
+      routes: [
+        {
+          id: 'retail-sales',
+          name: 'Electricity Sales to Ultimate Customers',
+          description:
+            'Electricity sales to ultimate customer by state and sector (number of customers, average price, revenue, and megawatthours of sales). Sources: Forms EIA-826, EIA-861, EIA-861M',
+          frequency: [],
+          facets: [],
+          data: {},
+        },
+      ],
+    },
+    {
+      id: 'coal',
+      name: 'Coal',
+      description: 'EIA coal energy data',
+      routes: [
+        {
+          id: 'reserves-capacity',
+          name: 'Reserves Capacity',
+          description:
+            'Coal capacity data, including productive capacity, stocks, and recoverable reserves by state, region and mine type. Source: EIA Form 7A and MSHA Form 7000-2. Interactive browser: https://www.eia.gov/coal/data/browser/',
+          frequency: [],
+          facets: [],
+          data: {},
+        },
+      ],
+    },
+  ];
+
+  beforeEach(() => {
+    _resetRouteCache();
+    initRouteCache(LIVE_FIXTURE, []);
+  });
+
+  it('scores the description-advertised query below the weak-match threshold', () => {
+    const [top] = searchRoutes('electricity retail sales by state', 5);
+    expect(top?.entry.route).toBe('electricity/retail-sales');
+    expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
+  });
+
+  it('scores a query with no real match above the weak-match threshold', () => {
+    const [top] = searchRoutes('solar capacity by state', 5);
+    expect(top?.entry.route).toBe('coal/reserves-capacity');
+    expect(top?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
   });
 });

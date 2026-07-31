@@ -2,8 +2,10 @@
  * @fileoverview EIA API v2 service. Wraps api.eia.gov/v2 with retry/timeout,
  * route tree caching, per-route facet metadata caching, and Fuse.js fuzzy
  * search. Exposes browse, describe, query, and search methods consumed by MCP
- * tool handlers. Rate-limit detection: EIA returns `OVER_RATE_LIMIT` in the
- * response body — classified as ServiceUnavailable (retryable).
+ * tool handlers. `query()` also walks `offset` pages past the inline preview
+ * when the caller wants a canvas-bound row set, bounded by EIA_CANVAS_MAX_ROWS.
+ * Rate-limit detection: EIA returns `OVER_RATE_LIMIT` in the response body —
+ * classified as ServiceUnavailable (retryable).
  * @module services/eia/eia-service
  */
 
@@ -28,8 +30,10 @@ import {
   searchRoutes,
 } from './route-cache.js';
 import type {
+  AccumulatedRows,
   DataResponse,
   DataRow,
+  EiaWarning,
   Facet,
   RawFacetResponse,
   RawFrequency,
@@ -38,6 +42,45 @@ import type {
   RouteMetadata,
   SearchIndexEntry,
 } from './types.js';
+
+/**
+ * EIA's hard per-request row ceiling. Requesting more is not an error — the API
+ * returns the first 5,000 rows plus a `parameter out of range: length` warning.
+ */
+const EIA_MAX_ROWS_PER_REQUEST = 5000;
+
+/**
+ * EIA 400 bodies name the rejected dimension verbatim ("Invalid data 'bogus'
+ * provided.", "Invalid frequency 'hourly' provided."). Map each to the reason
+ * and recovery that points at the right part of eia_describe_route's output;
+ * anything unmatched falls back to invalid_facet.
+ */
+const INVALID_PARAM_REASONS = [
+  {
+    hint: 'Call eia_describe_route and pick a column from data_columns[].id.',
+    pattern: /invalid data\b/i,
+    reason: 'invalid_column',
+  },
+  {
+    hint: 'Call eia_describe_route and pick a frequency from frequencies[].id.',
+    pattern: /invalid frequency\b/i,
+    reason: 'invalid_frequency',
+  },
+] as const;
+
+/**
+ * One page of /v2/{route}/data/, past the `response` presence check.
+ * `warnings` is a top-level sibling of `response`, not a member of it.
+ */
+interface DataPage {
+  response: {
+    data?: DataRow[];
+    dateFormat?: string;
+    frequency?: string;
+    total?: string;
+  };
+  warnings?: EiaWarning[];
+}
 
 /** Per-route merged metadata cache (populated by describe). */
 const _routeMetaCache = new Map<string, RouteMetadata>();
@@ -482,12 +525,18 @@ class EiaApiService {
   }
 
   /**
-   * Fetch data from a leaf route. Returns rows (all string values per EIA API),
-   * total count, and any warnings.
+   * Fetch data from a leaf route. Returns the inline preview rows (all string
+   * values per EIA API), total count, and any top-level EIA warnings.
+   *
+   * With `accumulate`, additional offset pages are fetched and returned under
+   * `accumulated` for canvas registration — bounded by `EIA_CANVAS_MAX_ROWS`
+   * and by EIA's 5,000-row-per-request ceiling. The inline `data` array is never
+   * widened; it stays at the caller's requested `length`.
    */
   async query(
     route: string,
     opts: {
+      accumulate?: boolean;
       filters?: Record<string, string | string[]>;
       columns?: string[];
       frequency?: string;
@@ -499,16 +548,6 @@ class EiaApiService {
     },
     ctx: Context,
   ): Promise<DataResponse> {
-    if ((opts.length ?? 100) > 5000) {
-      throw validationError('length exceeds EIA maximum of 5000 rows per request.', {
-        reason: 'length_exceeded',
-        maxLength: 5000,
-        recovery: {
-          hint: 'Reduce length to 5000 or use offset pagination to retrieve more rows.',
-        },
-      });
-    }
-
     // Pre-flight: if the route is in the cache as a category node, fail early
     // with a typed error rather than letting the EIA API return a generic 404.
     await this.ensureCacheWarmed(ctx);
@@ -517,9 +556,9 @@ class EiaApiService {
       throw validationError(
         `Route "${route}" is a category, not a leaf — it has no data to query.`,
         {
-          reason: 'route_not_found',
+          reason: 'route_not_queryable',
           recovery: {
-            hint: 'Use eia_browse_routes or eia_search_routes to find a valid leaf route path.',
+            hint: 'Use eia_browse_routes to drill into sub-routes, or eia_search_routes to find leaf routes.',
           },
         },
       );
@@ -530,8 +569,6 @@ class EiaApiService {
     if (opts.frequency) params.frequency = opts.frequency;
     if (opts.start) params.start = opts.start;
     if (opts.end) params.end = opts.end;
-    if (opts.offset !== undefined) params.offset = String(opts.offset);
-    if (opts.length !== undefined) params.length = String(opts.length);
 
     // EIA only returns value fields when data[] params are explicitly set.
     // When the caller omits columns, auto-populate from route metadata so
@@ -564,17 +601,49 @@ class EiaApiService {
       params[`sort[${i}][direction]`] = s.direction;
     }
 
-    let resp: {
-      response: {
-        total: string;
-        dateFormat?: string;
-        frequency?: string;
-        data: DataRow[];
-        warnings?: string[];
-      };
+    const offset = opts.offset ?? 0;
+    const length = opts.length ?? 100;
+
+    const first = await this.fetchDataPage(route, params, offset, length, ctx);
+    const total = parseInt(first.response.total ?? '0', 10);
+    const data: DataRow[] = first.response.data ?? [];
+
+    const result: DataResponse = {
+      total,
+      dateFormat: first.response.dateFormat ?? '',
+      frequency: first.response.frequency ?? opts.frequency ?? '',
+      data,
+      warnings: first.warnings?.length ? first.warnings : undefined,
     };
+
+    if (opts.accumulate && data.length > 0 && offset + data.length < total) {
+      result.accumulated = await this.accumulatePages(
+        route,
+        params,
+        { offset, total, first: data },
+        ctx,
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * Fetch one page of /v2/{route}/data/, remapping EIA's 404 and 400 responses
+   * to typed reasons. The 400 remap reads the upstream message to distinguish a
+   * bad facet key from a bad column or frequency.
+   */
+  private async fetchDataPage(
+    route: string,
+    params: Record<string, string | string[]>,
+    offset: number,
+    length: number,
+    ctx: Context,
+  ): Promise<DataPage> {
+    const pageParams = { ...params, offset: String(offset), length: String(length) };
+    let resp: Partial<DataPage>;
     try {
-      resp = await this.fetchJson<typeof resp>(`${route}/data/`, params, ctx);
+      resp = await this.fetchJson<Partial<DataPage>>(`${route}/data/`, pageParams, ctx);
     } catch (err) {
       if (err instanceof McpError) {
         if (err.code === -32001 /* NotFound */) {
@@ -586,13 +655,11 @@ class EiaApiService {
           });
         }
         if (err.code === -32007 /* ValidationError */) {
-          // 400 from EIA — likely an invalid facet key. Surface the EIA message
-          // plus the contract recovery hint.
-          const eiaMsg = err.message;
-          throw validationError(eiaMsg, {
-            reason: 'invalid_facet',
+          const match = INVALID_PARAM_REASONS.find((entry) => entry.pattern.test(err.message));
+          throw validationError(err.message, {
+            reason: match?.reason ?? 'invalid_facet',
             recovery: {
-              hint: 'Call eia_describe_route to see valid facet IDs for this route.',
+              hint: match?.hint ?? 'Call eia_describe_route and pick a facet key from facets[].id.',
             },
           });
         }
@@ -600,26 +667,74 @@ class EiaApiService {
       throw err;
     }
 
-    const response = resp?.response;
-    if (!response) {
-      throw notFound(`Route "${route}" returned no data response.`, {
-        reason: 'no_data',
-        recovery: {
-          hint: 'Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.',
-        },
+    // A 200 with no `response` envelope is an upstream shape failure, not a
+    // caller error — it carries no declared reason, so it bubbles as a baseline
+    // ServiceUnavailable rather than borrowing a contract reason it doesn't fit.
+    if (!resp?.response) {
+      throw serviceUnavailable(`EIA returned no data envelope for route "${route}".`, {
+        route,
+        recovery: { hint: 'Retry the query; if it persists, check api.eia.gov availability.' },
       });
     }
 
-    const total = parseInt(response.total ?? '0', 10);
-    const data: DataRow[] = response.data ?? [];
+    return { response: resp.response, ...(resp.warnings && { warnings: resp.warnings }) };
+  }
 
-    return {
-      total,
-      dateFormat: response.dateFormat ?? '',
-      frequency: response.frequency ?? opts.frequency ?? '',
-      data,
-      warnings: response.warnings ?? undefined,
-    };
+  /**
+   * Walk offset pages forward from the preview until the result set is
+   * exhausted or the cumulative cap is reached. Each page rides the same
+   * `fetchJson` retry/rate-limit path; a short page means end of data.
+   *
+   * Accumulation only widens what reaches the canvas, so a page that fails
+   * after retries keeps the rows already gathered rather than discarding a
+   * preview the caller has in hand — the tool's note reports the real staged
+   * count and the offset to resume from. A caller-side abort still propagates.
+   */
+  private async accumulatePages(
+    route: string,
+    params: Record<string, string | string[]>,
+    seed: { offset: number; total: number; first: DataRow[] },
+    ctx: Context,
+  ): Promise<AccumulatedRows> {
+    const cap = getServerConfig().canvasMaxRows;
+    const rows = [...seed.first];
+    let nextOffset = seed.offset + seed.first.length;
+    let capped = false;
+
+    while (nextOffset < seed.total) {
+      if (rows.length >= cap) {
+        capped = true;
+        break;
+      }
+      const pageSize = Math.min(EIA_MAX_ROWS_PER_REQUEST, cap - rows.length);
+      let pageRows: DataRow[];
+      try {
+        const page = await this.fetchDataPage(route, params, nextOffset, pageSize, ctx);
+        pageRows = page.response.data ?? [];
+      } catch (err) {
+        if (ctx.signal.aborted) throw err;
+        ctx.log.warning('EIA canvas accumulation stopped early', {
+          route,
+          nextOffset,
+          staged: rows.length,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        break;
+      }
+      rows.push(...pageRows);
+      nextOffset += pageRows.length;
+      // A short page — including an empty one — means the data ran out.
+      if (pageRows.length < pageSize) break;
+    }
+
+    ctx.log.debug('EIA canvas accumulation complete', {
+      route,
+      staged: rows.length,
+      total: seed.total,
+      capped,
+    });
+
+    return { cap, capped, rows };
   }
 
   /** Fuzzy search across the route index. */
