@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-07-31
+
+Dataframe TTL now genuinely slides on query access, eia_dataframe_describe distinguishes a lookup miss from an empty canvas, and eia_dataframe_query declares the error reasons callers actually hit
+
 ## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-07-31
 
 Cap eia_describe_route facet values with offset paging, index facet values for eia_search_routes, fix a crash on non-array upstream frequency

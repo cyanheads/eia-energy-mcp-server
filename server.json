@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/eia-energy-mcp-server",
     "source": "github"
   },
-  "version": "0.3.1",
+  "version": "0.3.2",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eia-energy-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "packageArguments": [
         {
           "type": "positional",
@@ -39,7 +39,7 @@
         },
         {
           "name": "EIA_DATASET_TTL_SECONDS",
-          "description": "Per-table TTL for DataCanvas dataframes in seconds.",
+          "description": "Sliding per-dataframe TTL in seconds, extended by every query that references the dataframe.",
           "format": "string",
           "isRequired": false,
           "default": "86400"
@@ -88,7 +88,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eia-energy-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "packageArguments": [
         {
           "type": "positional",
@@ -108,7 +108,7 @@
         },
         {
           "name": "EIA_DATASET_TTL_SECONDS",
-          "description": "Per-table TTL for DataCanvas dataframes in seconds.",
+          "description": "Sliding per-dataframe TTL in seconds, extended by every query that references the dataframe.",
           "format": "string",
           "isRequired": false,
           "default": "86400"
