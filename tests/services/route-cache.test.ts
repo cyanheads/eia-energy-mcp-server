@@ -22,7 +22,7 @@ import {
   replaceNode,
   searchRoutes,
 } from '@/services/eia/route-cache.js';
-import type { Facet, RawRouteNode } from '@/services/eia/types.js';
+import type { Facet, RawRouteNode, SearchIndexEntry } from '@/services/eia/types.js';
 
 const SAMPLE_TREE: RawRouteNode[] = [
   {
@@ -521,35 +521,58 @@ describe('route-cache', () => {
 });
 
 /**
- * The weak-match label in `eia_search_routes` compares Fuse's score against a
- * fixed threshold, and Fuse's score scale is a library implementation detail —
- * it shifted wholesale between 7.4.2 and 7.5.0. These fixtures carry the real
- * name/description of two live EIA routes, so a fuse.js upgrade that moves the
- * scale trips the assertions instead of silently labelling good hits weak.
+ * `eia_search_routes` compares a hit's score against a fixed threshold, and that
+ * score comes from two places that move for different reasons: Fuse's own scale,
+ * a library implementation detail that shifted wholesale between 7.4.2 and
+ * 7.5.0, and the tokenized candidate gate, whose term weights are document
+ * frequencies over the whole corpus. Both are pinned here.
  *
- * The threshold survives the addition of facet-value entries because Fuse scores
- * each entry against the pattern independently of the corpus: appending entries
- * under an unchanged key/weight config leaves every existing score untouched.
- * Editing `FUSE_OPTIONS` is what moves the scale, and the block below pins both
- * halves — the same scores with facet values present, and the separation between
- * a real match and noise once facet values can be matched.
+ * The fixture carries the verbatim name and description of twenty live EIA
+ * routes rather than the two the phrase path alone needed. That size is load
+ * bearing: term weights are `log(N / df)`, so a handful of entries makes every
+ * term look equally rare and the gate behaves nothing like it does over the real
+ * 2,103-entry corpus. At this size it does — `electricity price residential`
+ * reproduces the reported bug under the phrase path (no candidate at all) and
+ * resolves under the tokenized one, which is the whole change in miniature.
+ *
+ * Scores are pinned exactly. A fuse.js upgrade, a `FUSE_OPTIONS` edit, or a
+ * change to the gate's constants all move them, and all three invalidate
+ * `WEAK_MATCH_SCORE` — which is measured against the live corpus by
+ * `scripts/eval-search.ts`, not against this fixture. Re-run that script when
+ * these numbers move; do not simply re-pin them.
  */
 describe('weak-match calibration against the live Fuse scale', () => {
+  /** A queryable leaf carrying one live route's real name and description. */
+  function leaf(id: string, name: string, description: string): RawRouteNode {
+    return { id, name, description, frequency: [], facets: [], data: {} };
+  }
+
   const LIVE_FIXTURE: RawRouteNode[] = [
     {
       id: 'electricity',
       name: 'Electricity',
       description: 'EIA electricity survey data',
       routes: [
-        {
-          id: 'retail-sales',
-          name: 'Electricity Sales to Ultimate Customers',
-          description:
-            'Electricity sales to ultimate customer by state and sector (number of customers, average price, revenue, and megawatthours of sales). Sources: Forms EIA-826, EIA-861, EIA-861M',
-          frequency: [],
-          facets: [],
-          data: {},
-        },
+        leaf(
+          'retail-sales',
+          'Electricity Sales to Ultimate Customers',
+          'Electricity sales to ultimate customer by state and sector (number of customers, average price, revenue, and megawatthours of sales). Sources: Forms EIA-826, EIA-861, EIA-861M',
+        ),
+        leaf(
+          'electric-power-operational-data',
+          'Electric Power Operations (Annual and Monthly)',
+          'Monthly and annual electric power operations by state, sector, and energy source. Source: Form EIA-923',
+        ),
+        leaf(
+          'operating-generator-capacity',
+          'Inventory of Operable Generators',
+          'Inventory of operable generators in the U.S. Source: Forms EIA-860, EIA-860M',
+        ),
+        leaf(
+          'facility-fuel',
+          'Electric Power Operations for Individual Power Plants (Annual and Monthly)',
+          'Annual and monthly electric power operations for individual power plants, by energy source and prime mover Source: Form EIA-923',
+        ),
       ],
     },
     {
@@ -557,17 +580,72 @@ describe('weak-match calibration against the live Fuse scale', () => {
       name: 'Coal',
       description: 'EIA coal energy data',
       routes: [
+        leaf(
+          'reserves-capacity',
+          'Reserves Capacity',
+          'Coal capacity data, including productive capacity, stocks, and recoverable reserves by state, region and mine type. Source: EIA Form 7A and MSHA Form 7000-2. Interactive browser: https://www.eia.gov/coal/data/browser/',
+        ),
+        leaf(
+          'consumption-and-quality',
+          'Consumption and Quality',
+          'Coal consumption and quality data by state and sector, including price, reciepts, heat content, sulfur content, ash content, and stocks. Source: EIA Form 7A and MSHA Form 7000-2. Interactive browser: https://www.eia.gov/coal/data/browser/',
+        ),
+        leaf(
+          'mine-production',
+          'Mine Production',
+          'Coal mine-level data, including production, region, state, county, rank, status, type, name and description. Source: EIA Form 7A and MSHA Form 7000-2. Interactive browser: https://www.eia.gov/coal/data/browser/',
+        ),
+        leaf(
+          'price-by-rank',
+          'Price by Rank',
+          'Coal prices by rank data for region and state. Source: EIA Form 7A and MSHA Form 7000-2. Interactive browser: https://www.eia.gov/coal/data/browser/',
+        ),
+      ],
+    },
+    {
+      id: 'petroleum',
+      name: 'Petroleum',
+      description: 'EIA petroleum gas survey data',
+      routes: [
         {
-          id: 'reserves-capacity',
-          name: 'Reserves Capacity',
-          description:
-            'Coal capacity data, including productive capacity, stocks, and recoverable reserves by state, region and mine type. Source: EIA Form 7A and MSHA Form 7000-2. Interactive browser: https://www.eia.gov/coal/data/browser/',
-          frequency: [],
-          facets: [],
-          data: {},
+          id: 'pri',
+          name: 'Prices',
+          description: 'Petroleum, Prices',
+          routes: [
+            leaf(
+              'gnd',
+              'Weekly Retail Gasoline and Diesel Prices',
+              'EIA petroleum gas survey data',
+            ),
+            leaf(
+              'resid',
+              'Residual Fuel Oil Prices by Sales Type',
+              'EIA petroleum gas survey data',
+            ),
+          ],
         },
       ],
     },
+    {
+      id: 'natural-gas',
+      name: 'Natural Gas',
+      description: 'EIA natural gas survey data',
+      routes: [
+        leaf('move', 'Imports and Exports/Pipelines', 'Natural Gas, Imports and Exports/Pipelines'),
+        leaf('pri', 'Prices', 'Natural Gas, Prices'),
+      ],
+    },
+    leaf(
+      'steo',
+      'Short Term Energy Outlook',
+      'Monthly short term (18 month) projections using STEO model. Report and interactive projection data browser: STEO (www.eia.gov/steo/)',
+    ),
+    leaf(
+      'total-energy',
+      'Total Energy',
+      'These data represent the most recent comprehensive energy statistics integrated across all energy sources. The data includes total energy production, consumption, stocks, and trade; energy prices; overviews of petroleum, natural gas, coal, electricity, nuclear energy, renewable energy, and carbon dioxide emissions; and data unit conversions values.',
+    ),
+    leaf('nuclear-outages', 'Nuclear Outages', 'EIA nuclear outages survey data'),
   ];
 
   beforeEach(() => {
@@ -575,20 +653,43 @@ describe('weak-match calibration against the live Fuse scale', () => {
     initRouteCache(LIVE_FIXTURE, []);
   });
 
+  it('indexes the whole fixture — the gate weights terms by corpus frequency', () => {
+    expect(getIndexSize()).toBe(20);
+  });
+
   it('scores the description-advertised query below the weak-match threshold', () => {
     const [top] = searchRoutes('electricity retail sales by state', 5);
     expect(top?.entry.route).toBe('electricity/retail-sales');
+    expect(top?.score).toBeCloseTo(0.5522, 4);
     expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
   });
 
-  it('scores a query with no real match above the weak-match threshold', () => {
+  it('scores a query this fixture cannot answer above the weak-match threshold', () => {
+    // Answerability is a property of the corpus, not of the query. Against the
+    // live taxonomy this query is on-target — electricity/operating-generator-capacity
+    // carries solar nameplate capacity by state, and `scripts/search-battery.ts`
+    // labels it so. This fixture indexes that route's name and description and
+    // none of its facet values, so nothing here holds the answer, which is what
+    // makes the query a scale probe rather than a relevance one.
     const [top] = searchRoutes('solar capacity by state', 5);
     expect(top?.entry.route).toBe('coal/reserves-capacity');
+    expect(top?.score).toBeCloseTo(0.9474, 4);
     expect(top?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
   });
 
+  it('leaves the phrase path scoring exactly where it did', () => {
+    // The tokenized gate is additive: it can only better an entry's score, so
+    // the phrase path's own numbers are the baseline every change is read
+    // against. These are the scores this tool shipped with before the gate.
+    expect(searchRoutes('electricity retail sales by state', 5, 'phrase')[0]?.score).toBeCloseTo(
+      0.7314,
+      4,
+    );
+    expect(searchRoutes('solar capacity by state', 5, 'phrase')[0]?.score).toBeCloseTo(0.9474, 4);
+  });
+
   describe('with facet values in the index', () => {
-    /** The fuel-type vocabulary `electricity/electric-power-operational-data` exposes. */
+    /** The fuel-type and sector vocabularies these two routes expose. */
     const FUEL_TYPES: Facet = {
       id: 'fueltypeid',
       description: 'Energy Source',
@@ -600,27 +701,62 @@ describe('weak-match calibration against the live Fuse scale', () => {
       ],
     };
 
+    const SECTORS: Facet = {
+      id: 'sectorid',
+      description: 'Sector',
+      values: [
+        { id: 'RES', name: 'residential' },
+        { id: 'COM', name: 'commercial' },
+        { id: 'IND', name: 'industrial' },
+        { id: 'ALL', name: 'all sectors' },
+      ],
+    };
+
     beforeEach(() => {
-      indexFacetValues('electricity/retail-sales', [FUEL_TYPES]);
+      indexFacetValues('electricity/electric-power-operational-data', [FUEL_TYPES]);
+      indexFacetValues('electricity/retail-sales', [SECTORS]);
     });
 
-    it('leaves the advertised query scoring exactly where it did', () => {
+    it('leaves the advertised query below the threshold once facet values join', () => {
       const [top] = searchRoutes('electricity retail sales by state', 5);
       expect(top?.entry.route).toBe('electricity/retail-sales');
       expect(top?.entry.filter_hint).toBeUndefined();
+      expect(top?.score).toBeCloseTo(0.598, 4);
       expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
     });
 
     it('still flags a query with no real match as weak', () => {
       const [top] = searchRoutes('solar capacity by state', 5);
       expect(top?.entry.route).toBe('coal/reserves-capacity');
+      expect(top?.score).toBeCloseTo(0.9474, 4);
       expect(top?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
     });
 
     it('resolves a fuel-type term to the owning route well under the threshold', () => {
       const [top] = searchRoutes('wind', 5);
-      expect(top?.entry.route).toBe('electricity/retail-sales');
+      expect(top?.entry.route).toBe('electricity/electric-power-operational-data');
       expect(top?.entry.filter_hint).toEqual({ fueltypeid: 'WND' });
+      expect(top?.score).toBeCloseTo(0, 5);
+    });
+
+    it('scores a single-term query exactly as the phrase path does', () => {
+      // Nothing to tokenize, so the gate never runs and #36's facet-value
+      // resolution is preserved by construction rather than by calibration.
+      for (const query of ['wind', 'anthracite coal', 'reserves']) {
+        expect(searchRoutes(query, 5)).toEqual(searchRoutes(query, 5, 'phrase'));
+      }
+    });
+
+    it('reaches the owning route for a commodity + metric + sector query', () => {
+      // The reported bug: no entry's text contains "electricity price
+      // residential" as a contiguous run, so the phrase path finds nothing at
+      // all, however well electricity/retail-sales holds the data.
+      expect(searchRoutes('electricity price residential', 5, 'phrase')).toEqual([]);
+
+      const [top] = searchRoutes('electricity price residential', 5);
+      expect(top?.entry.route).toBe('electricity/retail-sales');
+      expect(top?.entry.filter_hint).toEqual({ sectorid: 'RES' });
+      expect(top?.score).toBeCloseTo(0.3804, 4);
       expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
     });
 
@@ -631,5 +767,129 @@ describe('weak-match calibration against the live Fuse scale', () => {
       expect(routeRank).toBe(0);
       if (facetRank >= 0) expect(results[facetRank]!.score).toBeGreaterThan(results[0]!.score);
     });
+  });
+});
+
+/**
+ * The candidate gate's own rules, exercised where the corpus statistics are
+ * controlled rather than inherited from a real taxonomy. Each test names one
+ * rule and the failure it exists to prevent; the filler entries give the shared
+ * vocabulary a realistic document frequency, which is what the weighting reads.
+ */
+describe('tokenized candidate gate', () => {
+  /** `count` entries carrying the shared vocabulary, so common terms weigh little. */
+  function filler(count: number): SearchIndexEntry[] {
+    return Array.from({ length: count }, (_, i) => ({
+      route: `filler/route-${i}`,
+      name: `Sector Report ${i}`,
+      description: `Energy data by state and sector for region ${i}.`,
+      isLeaf: true,
+      category: 'filler',
+    }));
+  }
+
+  function entry(route: string, name: string, description: string): SearchIndexEntry {
+    return { route, name, description, isLeaf: true, category: route.split('/')[0] };
+  }
+
+  beforeEach(() => {
+    _resetRouteCache();
+  });
+
+  it('promotes the entry covering both terms over one covering a single term well', () => {
+    initRouteCache(
+      [],
+      [
+        entry('partial/route', 'Anthracite', 'Coal rank detail.'),
+        entry('both/route', 'Shipment Tonnage', 'Anthracite deliveries by state.'),
+        ...filler(60),
+      ],
+    );
+    // "anthracite tonnage" exists in both/route's text, split across two keys —
+    // exactly the shape Fuse's contiguous-run matching cannot reward.
+    const [top] = searchRoutes('anthracite tonnage', 5);
+    expect(top?.entry.route).toBe('both/route');
+
+    const phraseScore = searchRoutes('anthracite tonnage', 5, 'phrase').find(
+      (r) => r.entry.route === 'both/route',
+    )?.score;
+    expect(top?.score).toBeLessThan(phraseScore as number);
+  });
+
+  it('drops function words rather than letting them earn coverage', () => {
+    initRouteCache(
+      [],
+      [
+        entry('by/route', 'Sales by Region', 'Totals by region and by state.'),
+        entry('target/route', 'Anthracite Sales', 'Anthracite sales by region.'),
+        ...filler(60),
+      ],
+    );
+    // "by" is rarer in this corpus than "sales", so weighting it by frequency
+    // alone would make the preposition the heaviest term in the query.
+    const routes = searchRoutes('anthracite sales by region', 5).map((r) => r.entry.route);
+    expect(routes[0]).toBe('target/route');
+    expect(routes).not.toContain('by/route');
+  });
+
+  it("rejects an entry carrying only the query's generic terms", () => {
+    initRouteCache([], [entry('generic/route', 'Sector Report', 'Data by state.'), ...filler(60)]);
+    // "sector" and "state" are everywhere; "anthracite" is the question.
+    expect(searchRoutes('anthracite sector state', 5)).toEqual([]);
+  });
+
+  it('rejects a two-term query whose second term the corpus does not contain', () => {
+    initRouteCache(
+      [],
+      [entry('half/route', 'Anthracite Report', 'Anthracite tonnage by state.'), ...filler(60)],
+    );
+    // "turbines" matches nothing, so it carries the most weight of any term and
+    // is always unmatched — the weight bar is what rejects this one. The gate
+    // contributes nothing, leaving whatever the phrase path made of it.
+    expect(searchRoutes('anthracite turbines', 5)).toEqual(
+      searchRoutes('anthracite turbines', 5, 'phrase'),
+    );
+    expect(searchRoutes('anthracite tonnage', 5)[0]?.entry.route).toBe('half/route');
+  });
+
+  it('rejects a two-term query answered by one term, however rare that term is', () => {
+    initRouteCache(
+      [],
+      [entry('half/route', 'Anthracite Report', 'Anthracite deliveries.'), ...filler(60)],
+    );
+    // "sector" is in every filler entry and so weighs almost nothing, which
+    // leaves "anthracite" carrying over 99% of the query — enough to clear the
+    // weight bar alone. The matched-term floor is the only rule that asks for
+    // both concepts, and this is the case that isolates it.
+    expect(searchRoutes('anthracite sector', 5)).toEqual(
+      searchRoutes('anthracite sector', 5, 'phrase'),
+    );
+  });
+
+  it('requires a short term to be carried verbatim, and does not require it of a long one', () => {
+    initRouteCache(
+      [],
+      [entry('wood/route', 'Wood Tonnage', 'Wood waste tonnage by state.'), ...filler(60)],
+    );
+    // "food" is one edit from "Wood", which is enough for Fuse to match it and
+    // enough to satisfy the matched-term floor without carrying the concept.
+    expect(searchRoutes('food tonnage', 5)).toEqual(searchRoutes('food tonnage', 5, 'phrase'));
+    // A term past the length bound keeps its fuzziness — one edit still matches.
+    expect(searchRoutes('wood tonnnage', 5)[0]?.entry.route).toBe('wood/route');
+  });
+
+  it('penalizes a missing term more the rarer it is', () => {
+    initRouteCache(
+      [],
+      [
+        entry('full/route', 'Anthracite Tonnage', 'Anthracite tonnage by state and sector.'),
+        entry('partial/route', 'Anthracite Sector', 'Anthracite by state and sector.'),
+        ...filler(60),
+      ],
+    );
+    const [full, partial] = searchRoutes('anthracite tonnage sector', 5);
+    expect(full?.entry.route).toBe('full/route');
+    expect(partial?.entry.route).toBe('partial/route');
+    expect(partial?.score).toBeGreaterThan(full?.score as number);
   });
 });

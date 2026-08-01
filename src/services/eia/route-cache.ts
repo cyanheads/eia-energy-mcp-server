@@ -13,6 +13,14 @@
  * `getIndexStatus()`, and replaced in place by `replaceNode()` once it is
  * re-fetched. `getIndexStatus().complete` is what lets a caller tell a ranking
  * computed over the whole corpus from one computed over part of it.
+ *
+ * Search runs two candidate gates over that one index. Fuse matches a query as a
+ * single approximate contiguous run, which answers "does this entry read like
+ * the query" and nothing else — a question no entry can answer for
+ * "electricity price residential", because no route's text contains that run
+ * however well it holds the data. `tokenizedScores` asks the other question,
+ * scoring each query term against the corpus and combining, and an entry keeps
+ * whichever gate scored it better. `scripts/eval-search.ts` measures both.
  * @module services/eia/route-cache
  */
 
@@ -41,6 +49,8 @@ export interface IndexStatus {
 interface CacheState {
   /** Entries appended after the tree — STEO series and facet values. */
   appendedEntries: SearchIndexEntry[];
+  /** The exact array `fuseIndex` was built over — a Fuse `refIndex` indexes it. */
+  entries: SearchIndexEntry[];
   /** Fuse.js index built over routes + STEO series + facet values. */
   fuseIndex: Fuse<SearchIndexEntry>;
   /** Route paths whose warm-time metadata fetch failed — subtrees unknown. */
@@ -225,6 +235,7 @@ function collectIncompleteRoutes(nodeMap: Map<string, RawRouteNode>): Set<string
  */
 function reindex(cache: CacheState): void {
   const allEntries = [...cache.routeEntries, ...cache.appendedEntries];
+  cache.entries = allEntries;
   cache.fuseIndex = new Fuse(allEntries, FUSE_OPTIONS);
   cache.indexedKeys = new Set(allEntries.map(entryKey));
 }
@@ -239,6 +250,7 @@ export function initRouteCache(
 
   const cache: CacheState = {
     appendedEntries: [...steoSeriesEntries],
+    entries: [],
     fuseIndex: new Fuse<SearchIndexEntry>([], FUSE_OPTIONS),
     incompleteRoutes: collectIncompleteRoutes(nodeMap),
     indexedKeys: new Set(),
@@ -358,23 +370,249 @@ export function getChildren(
   return children;
 }
 
-/** Fuzzy search across the index. Returns ranked matches. */
+/**
+ * Terms below this length are dropped: `FUSE_OPTIONS.minMatchCharLength` already
+ * refuses to match them, so scoring them only adds an always-unmatched term.
+ */
+const MIN_TERM_LENGTH = 2;
+
+/** Ceiling on terms scored per query — each costs one full pass over the corpus. */
+const MAX_QUERY_TERMS = 8;
+
+/**
+ * English function words, dropped before a query is weighted. They are the one
+ * class of generic term document frequency cannot recognize: measured over this
+ * corpus, `by` matches 151 of 2,103 entries and so reads as *rarer* than
+ * `electricity` (812) — inverse document frequency would make the preposition
+ * the heaviest term in "electricity generation by fuel type". Frequency is the
+ * wrong question for a word that never carried topic in the first place.
+ *
+ * The list is grammatical, not domain vocabulary: generic *content* words
+ * (`price`, `sector`, `type`, `data`) stay in and are down-weighted by the
+ * corpus itself, which is what keeps the mechanism honest for terms nobody
+ * anticipated. Nothing here is EIA-specific, and nothing here should be — a
+ * domain word on this list would be a thumb on the scale.
+ */
+const FUNCTION_WORDS = new Set(
+  `a an and are as at be by can do does for from has have how i in into is it its
+   me my of on or per that the their them there these they this to was we were
+   what when where which who why will with would you your`.split(/\s+/),
+);
+
+/**
+ * Match quality credited to a query term no entry matched. It is the one free
+ * parameter of the combine, and it is anchored rather than tuned: an entry that
+ * matches half the query's weight perfectly and misses the other half scores
+ * `1 - 1^0.5 · q^0.5`, so fixing that case at the midpoint of the scale (0.5)
+ * fixes `q` at 0.25. Half the query answered lands at half the scale.
+ */
+const UNMATCHED_TERM_QUALITY = 0.25;
+
+/**
+ * Split a query into the terms scored independently. Repeats collapse so a word
+ * said twice cannot buy twice its weight, and function words are dropped so they
+ * can neither earn coverage nor cost it.
+ */
+function tokenizeQuery(query: string): string[] {
+  const terms = query
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((term) => term.length >= MIN_TERM_LENGTH && !FUNCTION_WORDS.has(term));
+  return [...new Set(terms)].slice(0, MAX_QUERY_TERMS);
+}
+
+/**
+ * Share of a query's term weight an entry must match to be admitted.
+ *
+ * Two anchors fix the curve. At two terms each term is half the question, so an
+ * entry carrying one and not the other has answered half — the bar sits midway
+ * between one concept and both, at 0.75. As the query lengthens the allowance
+ * relaxes toward, but never reaches, half the weight: past two terms a query
+ * accumulates phrasing and near-synonyms the corpus has no reason to contain,
+ * while an entry answering less of the query than it leaves open is not a
+ * candidate at any length.
+ *
+ * Measured against the live 2,103-entry corpus, the widest share any off-target
+ * query in `scripts/search-battery.ts` reached was 0.423 — the curve clears that
+ * at every length.
+ */
+function coverageBar(termCount: number): number {
+  return 0.5 + 0.25 / (termCount - 1);
+}
+
+/**
+ * Terms an entry must match outright, whatever their weight: half the query, and
+ * never fewer than two. A weight bar alone cannot express "both concepts are
+ * present", because one rare word routinely carries four fifths of a two-term
+ * query's weight — matching it and nothing else clears any bar below ~0.85. A
+ * multi-term query asks after a conjunction of concepts, and an entry carrying
+ * one of them has answered a different, simpler question. On a long query the
+ * weight bar is the binding constraint and this floor costs nothing.
+ */
+function minMatchedTerms(termCount: number): number {
+  return Math.max(2, Math.ceil(termCount / 2));
+}
+
+/**
+ * Length at or below which a query term must appear verbatim before the term
+ * path counts an entry as matching it. `FUSE_OPTIONS.threshold` admits a
+ * one-edit match on any pattern this short, and a token this short has a large
+ * one-edit neighbourhood: measured over the live 2,103-entry corpus, `cat`
+ * fuzzy-matches 856 entries against the 17 that carry it, and `food` reaches
+ * `Wood`. Such a match satisfies the matched-term floor while carrying none of
+ * the concept, which is how an unanswerable two-term query reaches a confident
+ * score.
+ *
+ * Longer terms keep their fuzziness, because there it earns its keep — it is
+ * what lets a plural query reach a singular description. Requiring every term
+ * verbatim scores better on the battery and is the wrong trade: it drops
+ * `electricity prices residential` from 0.10 on `electricity/retail-sales` to
+ * 0.88 on an unrelated STEO series.
+ */
+const VERBATIM_TERM_LENGTH = 4;
+
+/** True when an entry's searchable text carries the term as written. */
+function carriesTerm(entry: SearchIndexEntry, term: string): boolean {
+  return (
+    entry.name.toLowerCase().includes(term) ||
+    entry.description.toLowerCase().includes(term) ||
+    entry.route.toLowerCase().includes(term) ||
+    (entry.category?.toLowerCase().includes(term) ?? false)
+  );
+}
+
+/**
+ * Score every entry that matched at least one query term, by term rather than
+ * by phrase. Fuse matches a query as one approximate contiguous run, so a route
+ * holding the answer to a commodity + metric + sector question is never a
+ * candidate for the whole string — the run does not exist in its text. Scoring
+ * each term separately and combining is what lets "matches most of your terms"
+ * outrank "happens to contain one of your words".
+ *
+ * Four things make the combine hold its ground:
+ *
+ * - **Term weight is inverse document frequency, over function-word-free terms.**
+ *   A content word matching a large slice of the corpus (`sector`, `state`,
+ *   `prices` in an energy taxonomy) carries almost no weight; one matching a
+ *   handful carries a lot. Nothing domain-specific is hand-listed — the corpus
+ *   decides which words are generic, so the mechanism travels to vocabulary
+ *   nobody anticipated. A term matching *nothing* carries the most weight of all
+ *   and is always unmatched, which is what makes a query naming something absent
+ *   fail the bar rather than score on the words it shares with the corpus.
+ * - **Admission is on matched weight, floored by matched term count.** Matching
+ *   `sector` and `state` while missing `residential` buys almost no coverage,
+ *   and the floor stops one heavy term from carrying a short query alone.
+ * - **The combine is a weighted geometric mean.** Each missing term multiplies
+ *   the result down by its own share of the weight, so misses compound rather
+ *   than averaging out against the terms that did match.
+ * - **A short term must be carried verbatim.** Fuzzy matching on a token of
+ *   `VERBATIM_TERM_LENGTH` or fewer characters reaches a large slice of the
+ *   corpus on one edit, which clears both admission rules without carrying the
+ *   concept.
+ */
+function tokenizedScores(cache: CacheState, terms: string[]): Map<number, number> {
+  const corpusSize = cache.entries.length;
+  const perTerm = terms.map((term) => {
+    const requireVerbatim = term.length <= VERBATIM_TERM_LENGTH;
+    const hits = new Map<number, number>();
+    for (const result of cache.fuseIndex.search(term)) {
+      if (requireVerbatim && !carriesTerm(cache.entries[result.refIndex] as SearchIndexEntry, term))
+        continue;
+      hits.set(result.refIndex, result.score ?? 1);
+    }
+    return { hits, weight: Math.log((corpusSize + 1) / (hits.size + 1)) };
+  });
+
+  const totalWeight = perTerm.reduce((sum, term) => sum + term.weight, 0);
+  // Every term matched every entry — the query carries no discriminating signal.
+  if (totalWeight === 0) return new Map();
+
+  const bar = coverageBar(terms.length);
+  const minMatched = minMatchedTerms(terms.length);
+  const scores = new Map<number, number>();
+  const candidates = new Set<number>();
+  for (const { hits } of perTerm) {
+    for (const ref of hits.keys()) candidates.add(ref);
+  }
+
+  for (const ref of candidates) {
+    let matched = 0;
+    let matchedWeight = 0;
+    let quality = 1;
+    for (const { hits, weight } of perTerm) {
+      const termScore = hits.get(ref);
+      const share = weight / totalWeight;
+      if (termScore === undefined) {
+        quality *= UNMATCHED_TERM_QUALITY ** share;
+      } else {
+        matched++;
+        matchedWeight += weight;
+        quality *= (1 - termScore) ** share;
+      }
+    }
+    if (matched >= minMatched && matchedWeight / totalWeight >= bar) {
+      scores.set(ref, 1 - quality);
+    }
+  }
+  return scores;
+}
+
+/**
+ * Fuzzy search across the index. Returns ranked matches, best first.
+ *
+ * A multi-term query is scored twice — once as a phrase by Fuse, once term by
+ * term through the gate above — and each entry keeps its better score. The two
+ * paths admit different candidates and neither can cost the other anything: the
+ * phrase path answers "this entry reads like your query", the term path answers
+ * "this entry covers your query's concepts", and a query only needs one to be
+ * true. A single-term query has nothing to tokenize, so it takes the phrase path
+ * alone and scores exactly as Fuse scores it.
+ *
+ * `mode` is what `scripts/eval-search.ts` measures the gate's contribution
+ * against: `'phrase'` is the un-tokenized behavior on its own.
+ */
 export function searchRoutes(
   query: string,
   limit: number,
+  mode: 'combined' | 'phrase' = 'combined',
 ): Array<{ entry: SearchIndexEntry; score: number }> {
-  if (!_cache) return [];
-  const results = _cache.fuseIndex.search(query, { limit });
-  return results.map((r) => ({
-    entry: r.item,
-    score: r.score ?? 1,
-  }));
+  const cache = _cache;
+  if (!cache) return [];
+
+  const scores = new Map<number, number>();
+  for (const result of cache.fuseIndex.search(query)) {
+    scores.set(result.refIndex, result.score ?? 1);
+  }
+
+  if (mode === 'combined') {
+    const terms = tokenizeQuery(query);
+    if (terms.length > 1) {
+      for (const [ref, score] of tokenizedScores(cache, terms)) {
+        if (score < (scores.get(ref) ?? Number.POSITIVE_INFINITY)) scores.set(ref, score);
+      }
+    }
+  }
+
+  // Ties break on index position, which keeps route entries ahead of the STEO
+  // and facet-value entries appended after them — the order `reindex` produced.
+  return [...scores]
+    .sort(([refA, scoreA], [refB, scoreB]) => scoreA - scoreB || refA - refB)
+    .slice(0, limit)
+    .map(([ref, score]) => ({ entry: cache.entries[ref] as SearchIndexEntry, score }));
 }
 
 /** Total number of indexed entries. */
 export function getIndexSize(): number {
-  if (!_cache) return 0;
-  return _cache.routeEntries.length + _cache.appendedEntries.length;
+  return _cache?.entries.length ?? 0;
+}
+
+/**
+ * The indexed corpus itself, in `refIndex` order. `scripts/eval-search.ts`
+ * snapshots it so a scoring change can be measured twice against one corpus
+ * rather than against two warms of a taxonomy that moved in between.
+ */
+export function getIndexEntries(): readonly SearchIndexEntry[] {
+  return _cache?.entries ?? [];
 }
 
 /**

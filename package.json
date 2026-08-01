@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/eia-energy-mcp-server",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "mcpName": "io.github.cyanheads/eia-energy-mcp-server",
   "description": "Browse and query the U.S. Energy Information Administration API v2 — electricity, petroleum, natural gas, coal, forecasts, and more via MCP. STDIO or Streamable HTTP.",
   "type": "module",
@@ -33,6 +33,7 @@
     "changelog:build": "bun run scripts/build-changelog.ts",
     "changelog:check": "bun run scripts/build-changelog.ts --check",
     "list-skills": "bun run scripts/list-skills.ts",
+    "eval:search": "bun run scripts/eval-search.ts",
     "test": "vitest run",
     "start": "node dist/index.js",
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",

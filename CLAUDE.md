@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** @cyanheads/eia-energy-mcp-server
-**Version:** 0.3.3
+**Version:** 0.3.4
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.0`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 
@@ -304,6 +304,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from per-version files |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run list-skills` | List available local skills (useful for sub-agents) |
+| `bun run eval:search` | Score the `eia_search_routes` query battery against a live warmed corpus — needs `EIA_API_KEY`, ~30 s warm |
 | `bun run release:github` | Create (or repair) a GitHub Release on the current annotated tag |
 
 ---
