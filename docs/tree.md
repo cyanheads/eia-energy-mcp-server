@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-07-31 18:04:56
+Generated on: 2026-08-01 00:21:11
 
 ```text
 eia-energy-mcp-server/
@@ -41,10 +41,12 @@ eia-energy-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── eval-search.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
 │   ├── release-github.ts
+│   ├── search-battery.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
 ├── skills/

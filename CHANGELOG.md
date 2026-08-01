@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.4](changelog/0.3.x/0.3.4.md) — 2026-07-31
+
+eia_search_routes now reaches the route behind a multi-term query via a tokenized candidate gate; WEAK_MATCH_SCORE re-derived from 0.9 to 0.72
+
 ## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-07-31
 
 eia_search_routes now waits for a complete index and reports indexComplete/indexGaps; buildRouteTree no longer silently drops a subtree on a failed metadata fetch
