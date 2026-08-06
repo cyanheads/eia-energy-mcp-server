@@ -12,6 +12,22 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
+import type { EiaWarning } from '@/services/eia/types.js';
+
+/**
+ * EIA's per-page advisory: it fires whenever the requested `length` is smaller
+ * than the query's `total`, and its "5000 rows in JSON format" text is fixed
+ * boilerplate that appears at any size. It describes the inline page rather
+ * than the result set, so once the response itself states where the caller
+ * stands — the staged table reaches the last row, or a notice explains the
+ * row-less page — forwarding it contradicts the response and sends an agent
+ * back for rows it already has. Matched on the `warning` label so every other
+ * advisory EIA reports, which the response does not otherwise explain, still
+ * reaches the caller.
+ */
+function isIncompleteReturn(warning: EiaWarning): boolean {
+  return warning.warning.trim().toLowerCase() === 'incomplete return';
+}
 
 export const queryRouteTool = tool('eia_query_route', {
   title: 'Query EIA Route Data',
@@ -116,13 +132,13 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Human-readable note when total exceeds the inline preview — names how many rows actually reached the canvas table and, when staging stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return), says so and gives the offset to resume from.',
+        'Human-readable note when total exceeds the inline preview — names how many rows actually reached the canvas table, and where in the matching set those rows sit whenever the stage does not start at row 1. When staging also stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return), it says so and gives the offset to resume from.',
       ),
     truncation_warning: z
       .string()
       .optional()
       .describe(
-        "Forwarded from EIA's warnings[] when the API warns of truncated results near the 5,000 per-page limit.",
+        "Upstream advisories forwarded verbatim from EIA's warnings[], joined with '; ' when more than one applies. These describe the inline page — EIA's \"incomplete return\" entry fires whenever the requested length is under total, at any size — not a 5,000-row ceiling on this response. Absent when the response already accounts for the gap the advisory names (the staged table reaches the last row, or notice explains the empty page).",
       ),
   }),
 
@@ -154,6 +170,19 @@ export const queryRouteTool = tool('eia_query_route', {
       .array(z.string())
       .optional()
       .describe('Echo of the column projection as applied, when columns were provided.'),
+    appliedSort: z
+      .array(
+        z
+          .object({
+            column: z.string().describe('Column ID sorted by.'),
+            direction: z.enum(['asc', 'desc']).describe('Sort direction.'),
+          })
+          .describe('A sort criterion as applied.'),
+      )
+      .optional()
+      .describe(
+        'Echo of the result ordering as applied, when a sort was provided — the ordering that decided which rows a capped stage holds.',
+      ),
     appliedOffset: z
       .number()
       .describe('Row offset applied to the query — the cause when a page comes back empty.'),
@@ -173,6 +202,12 @@ export const queryRouteTool = tool('eia_query_route', {
       render: (columns) =>
         columns && columns.length > 0
           ? `**Applied Columns:** ${columns.join(', ')}`
+          : (null as unknown as string),
+    },
+    appliedSort: {
+      render: (sort) =>
+        sort && sort.length > 0
+          ? `**Applied Sort:** ${sort.map((s) => `${s.column} ${s.direction}`).join(', ')}`
           : (null as unknown as string),
     },
   },
@@ -282,6 +317,7 @@ export const queryRouteTool = tool('eia_query_route', {
       ...(input.frequency !== undefined && { appliedFrequency: input.frequency }),
       ...(input.columns !== undefined &&
         input.columns.length > 0 && { appliedColumns: input.columns }),
+      ...(input.sort !== undefined && input.sort.length > 0 && { appliedSort: input.sort }),
       appliedOffset: input.offset,
       appliedLength: input.length,
     });
@@ -306,13 +342,14 @@ export const queryRouteTool = tool('eia_query_route', {
       date_format: dataResp.dateFormat,
     };
 
-    // Forward EIA's own top-level advisories. Each entry is
-    // { warning, description } — flatten to one readable line.
-    if (dataResp.warnings?.length) {
-      result.truncation_warning = dataResp.warnings
-        .map((w) => `${w.warning}: ${w.description}`)
-        .join('; ');
-    }
+    /**
+     * Whether the response already states where the caller stands relative to
+     * `total` — a notice explaining the row-less page, or a staged table
+     * running from the caller's `offset` to the last row, leaving nothing
+     * further to page to. Decides whether EIA's per-page advisory still tells
+     * the caller anything (see `isIncompleteReturn`).
+     */
+    let gapAccountedFor = false;
 
     // A row-less response is a valid success, but the two causes need different
     // guidance and neither can spill to canvas.
@@ -321,23 +358,25 @@ export const queryRouteTool = tool('eia_query_route', {
         dataResp.total > 0
           ? `Offset ${input.offset.toLocaleString()} is past the last row — total is ${dataResp.total.toLocaleString()}. Reduce offset below total to page through the matching rows.`
           : 'No rows matched the filters. Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.';
-      return result;
-    }
-
-    // DataCanvas spillover — opt-in via CANVAS_PROVIDER_TYPE=duckdb. The service
-    // has already accumulated offset pages when a bridge is present.
-    if (bridge) {
+      gapAccountedFor = true;
+    } else if (bridge) {
+      // DataCanvas spillover — opt-in via CANVAS_PROVIDER_TYPE=duckdb. The
+      // service has already accumulated offset pages when a bridge is present.
       const canvasRows = dataResp.accumulated?.rows ?? dataResp.data;
       const registered = await bridge.registerDataframe(ctx, {
         rows: canvasRows,
         sourceTool: 'eia_query_route',
         queryParams: {
           route: input.route,
-          filters: input.filters,
-          columns: input.columns,
-          frequency: input.frequency,
-          start: input.start,
-          end: input.end,
+          ...(input.filters !== undefined && { filters: input.filters }),
+          ...(input.columns !== undefined && { columns: input.columns }),
+          ...(input.frequency !== undefined && { frequency: input.frequency }),
+          ...(input.start !== undefined && { start: input.start }),
+          ...(input.end !== undefined && { end: input.end }),
+          // Sort order decides which rows a stage that stops short of total
+          // holds, so provenance without it cannot distinguish two opposite
+          // orderings of the same query.
+          ...(input.sort !== undefined && { sort: input.sort }),
           offset: input.offset,
           length: input.length,
         },
@@ -349,22 +388,42 @@ export const queryRouteTool = tool('eia_query_route', {
         result.dataset = registered.tableName;
 
         const staged = registered.rowCount;
+        const lastStaged = input.offset + staged;
+        const coversTotal = lastStaged >= dataResp.total;
+        gapAccountedFor = coversTotal;
+
         const accumulated = dataResp.accumulated;
         if (dataResp.total > dataResp.data.length) {
-          const lastStaged = input.offset + staged;
           const head = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows inline; ${staged.toLocaleString()} rows staged as ${registered.tableName} — SQL over the staged rows: SELECT * FROM ${registered.tableName}`;
-          const range = `the staged rows are ${(input.offset + 1).toLocaleString()}–${lastStaged.toLocaleString()} of ${dataResp.total.toLocaleString()}`;
-          if (!accumulated || lastStaged >= dataResp.total) {
-            result.canvas_preview_note = head;
+          const range = `staged rows are ${(input.offset + 1).toLocaleString()}–${lastStaged.toLocaleString()} of ${dataResp.total.toLocaleString()}`;
+          if (!accumulated || coversTotal) {
+            /**
+             * An offset-bound stage holds a slice the row count alone cannot
+             * locate — without the range it reads like a prefix of the same
+             * query, which holds disjoint rows.
+             */
+            result.canvas_preview_note = input.offset > 0 ? `${head}. The ${range}.` : head;
           } else if (accumulated.capped) {
-            result.canvas_preview_note = `${head}. Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (${accumulated.cap.toLocaleString()}), so ${range}. Narrow with filters, start, or end — or re-query with offset ${lastStaged.toLocaleString()} — to reach the rest.`;
+            result.canvas_preview_note = `${head}. Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (${accumulated.cap.toLocaleString()}), so the ${range}. Narrow with filters, start, or end — or re-query with offset ${lastStaged.toLocaleString()} — to reach the rest.`;
           } else {
-            result.canvas_preview_note = `${head}. Staging stopped before the end of the matching set, so ${range}. Re-query with offset ${lastStaged.toLocaleString()} to continue.`;
+            result.canvas_preview_note = `${head}. Staging stopped before the end of the matching set, so the ${range}. Re-query with offset ${lastStaged.toLocaleString()} to continue.`;
           }
         }
       }
     } else if (dataResp.total > dataResp.data.length) {
       result.canvas_preview_note = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
+    }
+
+    // Forward EIA's own top-level advisories. Each entry is
+    // { warning, description } — flatten to one readable line, dropping only
+    // the per-page advisory the response above has already answered.
+    const advisories = (dataResp.warnings ?? []).filter(
+      (w) => !(gapAccountedFor && isIncompleteReturn(w)),
+    );
+    if (advisories.length > 0) {
+      result.truncation_warning = advisories
+        .map((w) => `${w.warning}: ${w.description}`)
+        .join('; ');
     }
 
     return result;

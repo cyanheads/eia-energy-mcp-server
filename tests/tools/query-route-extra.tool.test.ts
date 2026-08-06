@@ -412,6 +412,75 @@ describe('queryRouteTool — additional coverage', () => {
   });
 
   // ------------------------------------------------------------------
+  // #44 — sort reaches dataframe provenance and the enrichment echo, and no
+  // input the caller omitted is recorded as an undefined-valued param.
+  // ------------------------------------------------------------------
+
+  describe('sort provenance (#44)', () => {
+    const SORT = [{ column: 'period', direction: 'asc' as const }];
+
+    const stagingBridge = () => {
+      const mockRegister = vi.fn().mockResolvedValue({
+        tableName: 'df_SORTED',
+        rowCount: 2,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      });
+      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+        registerDataframe: mockRegister,
+      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+      return mockRegister;
+    };
+
+    it('carries sort into the staged dataframe provenance and the enrichment echo', async () => {
+      const mockRegister = stagingBridge();
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        columns: ['price'],
+        sort: SORT,
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      // Provenance is only honest if the ordering it records is the one the
+      // upstream request actually ran under.
+      expect(mockQuery.mock.calls[0]?.[1].sort).toEqual(SORT);
+      expect(mockRegister.mock.calls[0]?.[1].queryParams.sort).toEqual(SORT);
+      expect(getEnrichment(ctx).appliedSort).toEqual(SORT);
+    });
+
+    it('records no param the caller omitted', async () => {
+      const mockRegister = stagingBridge();
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      await queryRouteTool.handler(input, ctx);
+
+      // Undefined-valued keys would reach eia_dataframe_describe's rendered
+      // params line as `columns=undefined` while structuredContent drops them.
+      expect(Object.keys(mockRegister.mock.calls[0]?.[1].queryParams)).toEqual([
+        'route',
+        'offset',
+        'length',
+      ]);
+      expect(getEnrichment(ctx).appliedSort).toBeUndefined();
+    });
+
+    it('renders the sort echo for the clients that read content[] rather than structuredContent', () => {
+      const render = queryRouteTool.enrichmentTrailer?.appliedSort?.render;
+      expect(
+        render?.([
+          { column: 'period', direction: 'asc' },
+          { column: 'price', direction: 'desc' },
+        ]),
+      ).toBe('**Applied Sort:** period asc, price desc');
+    });
+  });
+
+  // ------------------------------------------------------------------
   // Security: tool output (data rows) must not contain env var name or value
   // ------------------------------------------------------------------
 

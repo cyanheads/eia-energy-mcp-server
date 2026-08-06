@@ -150,6 +150,165 @@ describe('queryRouteTool', () => {
     );
   });
 
+  // ------------------------------------------------------------------
+  // #41 — EIA's per-page "incomplete return" advisory fires whenever the
+  // requested length is under total. It must not ride along on a response that
+  // already states where the caller stands.
+  // ------------------------------------------------------------------
+
+  describe('incomplete-return advisory suppression (#41)', () => {
+    const INCOMPLETE_RETURN = {
+      warning: 'incomplete return',
+      description:
+        'The API can only return 5000 rows in JSON format.  Please consider constraining your request with facet, start, or end, or using offset to paginate results.',
+    };
+    const OUT_OF_RANGE = {
+      warning: 'parameter out of range: length',
+      description: 'The maximum value is 5000.',
+    };
+
+    const stagingBridge = (rowCount: number) =>
+      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+        registerDataframe: vi.fn().mockResolvedValue({
+          tableName: 'df_STAGED',
+          rowCount,
+          expiresAt: new Date().toISOString(),
+          columnSchema: [],
+        }),
+      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+
+    it('drops the advisory when the staged table covers total', async () => {
+      stagingBridge(1830);
+      mockQuery.mockResolvedValue({
+        ...SAMPLE_DATA_RESPONSE,
+        total: 1830,
+        accumulated: {
+          rows: Array.from({ length: 1830 }, (_, i) => ({ period: String(i) })),
+          capped: false,
+          cap: 25000,
+        },
+        warnings: [INCOMPLETE_RETURN],
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        length: 3,
+      });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(result.truncation_warning).toBeUndefined();
+      // The response still says where the caller stands — the advisory is
+      // redundant, not the only account of the gap.
+      expect(result.canvas_preview_note).toContain('1,830 rows staged as df_STAGED');
+      // A stage starting at row 1 needs no range — the count already locates it.
+      expect(result.canvas_preview_note).not.toContain('staged rows are');
+      expect((queryRouteTool.format!(result)[0] as { text: string }).text).not.toContain(
+        '5000 rows in JSON format',
+      );
+    });
+
+    it('drops the advisory when a notice explains the row-less page', async () => {
+      mockQuery.mockResolvedValue({
+        total: 6,
+        dateFormat: 'YYYY-MM',
+        frequency: 'monthly',
+        data: [],
+        warnings: [INCOMPLETE_RETURN],
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        offset: 99,
+        length: 5,
+      });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(result.truncation_warning).toBeUndefined();
+      expect(result.notice).toContain('Reduce offset');
+    });
+
+    it('keeps advisories the response does not explain when one is suppressed', async () => {
+      stagingBridge(1830);
+      mockQuery.mockResolvedValue({
+        ...SAMPLE_DATA_RESPONSE,
+        total: 1830,
+        accumulated: {
+          rows: Array.from({ length: 1830 }, (_, i) => ({ period: String(i) })),
+          capped: false,
+          cap: 25000,
+        },
+        warnings: [OUT_OF_RANGE, INCOMPLETE_RETURN],
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(result.truncation_warning).toBe(
+        'parameter out of range: length: The maximum value is 5000.',
+      );
+      expect(result.truncation_warning).not.toContain('incomplete return');
+    });
+
+    it('drops the advisory when an offset-bound stage reaches the last row', async () => {
+      stagingBridge(30);
+      mockQuery.mockResolvedValue({
+        ...SAMPLE_DATA_RESPONSE,
+        total: 1830,
+        accumulated: {
+          rows: Array.from({ length: 30 }, (_, i) => ({ period: String(i) })),
+          capped: false,
+          cap: 25000,
+        },
+        warnings: [INCOMPLETE_RETURN],
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        offset: 1800,
+        length: 3,
+      });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      // Staging ran from row 1,801 to the last one, so nothing past the
+      // caller's offset is left to page to. Both the suppression and the note
+      // read the same offset-relative position — a staged count mistaken for an
+      // absolute row number would forward the advisory and name offset 30 as
+      // the place to resume.
+      expect(result.truncation_warning).toBeUndefined();
+      expect(result.canvas_preview_note).toContain('30 rows staged as df_STAGED');
+      expect(result.canvas_preview_note).not.toContain('offset 30');
+      // 30 rows out of 1,830 is the same count a prefix of this query would
+      // stage, holding entirely different rows — only the range separates them.
+      expect(result.canvas_preview_note).toContain('The staged rows are 1,801–1,830 of 1,830.');
+    });
+
+    it('forwards the advisory when staging stopped short of total', async () => {
+      stagingBridge(25000);
+      mockQuery.mockResolvedValue({
+        ...SAMPLE_DATA_RESPONSE,
+        total: 113460,
+        accumulated: {
+          rows: Array.from({ length: 25000 }, (_, i) => ({ period: String(i) })),
+          capped: true,
+          cap: 25000,
+        },
+        warnings: [INCOMPLETE_RETURN],
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      // 25,000 of 113,460 staged — the rest is genuinely unreached, so EIA's
+      // pagination advice still applies.
+      expect(result.truncation_warning).toContain('incomplete return');
+    });
+  });
+
   it('emits an offset-past-the-end notice when total is positive but no rows came back', async () => {
     mockQuery.mockResolvedValue({
       total: 25,
