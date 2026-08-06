@@ -71,12 +71,88 @@ describe('dataframeQueryTool', () => {
     });
 
     const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
-    const input = dataframeQueryTool.input.parse({ sql: 'SELECT * FROM df_TEST' });
+    const input = dataframeQueryTool.input.parse({
+      sql: 'SELECT * FROM df_TEST',
+      row_limit: 10000,
+      preview: 1,
+    });
     await dataframeQueryTool.handler(input, ctx);
 
     const enrichment = getEnrichment(ctx);
     expect(enrichment.totalRows).toBe(5000);
-    expect(enrichment.notice).toMatch(/5,000/);
+    // The count is exact on this path, so the notice may state it as a total.
+    expect(enrichment.truncated).toBe(false);
+    expect(enrichment.notice).toMatch(/Showing 1 of 5,000 rows/);
+    expect(enrichment.notice).toMatch(/preview/);
+  });
+
+  it('discloses a row_limit-capped result and names both escapes (#40)', async () => {
+    // The provider caps at row_limit: rowCount === rows.length, truncated: true.
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['period', 'price'],
+        rows: Array.from({ length: 1000 }, (_, i) => ({ period: `2024-${i}`, price: '9.13' })),
+        rowCount: 1000,
+        truncated: true,
+      },
+    });
+
+    const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+    const input = dataframeQueryTool.input.parse({ sql: 'SELECT period, price FROM df_TEST' });
+    await dataframeQueryTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    // rowCount === rows.length here — the preview comparison alone cannot disclose this.
+    expect(enrichment.totalRows).toBe(enrichment.returnedRows);
+    expect(enrichment.notice).toMatch(/row_limit cap of 1,000/);
+    expect(enrichment.notice).toMatch(/register_as/);
+    // totalRows is the cap, so the notice must not present it as a total.
+    expect(enrichment.notice).not.toMatch(/of 1,000 rows/);
+  });
+
+  it('gives one non-contradictory disclosure when row_limit and preview both bind (#40)', async () => {
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['period'],
+        rows: [{ period: '2024-01' }, { period: '2024-02' }],
+        rowCount: 3,
+        truncated: true,
+      },
+    });
+
+    const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+    const input = dataframeQueryTool.input.parse({
+      sql: 'SELECT period FROM df_TEST',
+      row_limit: 3,
+      preview: 2,
+    });
+    await dataframeQueryTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.notice).toMatch(/Showing 2 rows/);
+    expect(enrichment.notice).toMatch(/row_limit cap of 3/);
+    // "Showing 2 of 3 rows" was the wrong claim — 3 is the cap, not the total.
+    expect(enrichment.notice).not.toMatch(/of 3 rows/);
+  });
+
+  it('reports truncated false and no notice on a complete result (#40)', async () => {
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['period'],
+        rows: [{ period: '2024-01' }, { period: '2024-02' }],
+        rowCount: 2,
+      },
+    });
+
+    const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+    const input = dataframeQueryTool.input.parse({ sql: 'SELECT period FROM df_TEST' });
+    await dataframeQueryTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(false);
+    expect(enrichment.notice).toBeUndefined();
   });
 
   it('returns registered_as when register_as is supplied', async () => {

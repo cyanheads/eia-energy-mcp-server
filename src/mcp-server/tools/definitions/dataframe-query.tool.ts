@@ -4,6 +4,10 @@
  * enforcement in the framework SQL gate: text deny-list, statement count,
  * statement type, EXPLAIN-plan walk, and system-catalog deny (denySystemCatalogs).
  * EIA data values are VARCHAR — cast to DOUBLE for arithmetic.
+ * Two independent caps can bind a response and each gets its own disclosure:
+ * `row_limit` drops rows the canvas never counted (`truncated`, `totalRows` is
+ * then the cap), while `preview` only narrows the inline slice of a result
+ * whose count is exact.
  * @module mcp-server/tools/definitions/dataframe-query.tool
  */
 
@@ -89,7 +93,9 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       .min(1)
       .max(10000)
       .default(1000)
-      .describe('Hard cap on rows materialized in the response (default 1000, max 10000).'),
+      .describe(
+        'Hard cap on rows materialized in the response (default 1000, max 10000). Rows past the cap are dropped without being counted — the response then carries truncated: true and a totalRows equal to the cap rather than a true total. Pass register_as to materialize the whole result instead and get an exact count.',
+      ),
   }),
 
   output: z.object({
@@ -117,15 +123,24 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
   enrichment: {
     totalRows: z
       .number()
-      .describe('Total rows the query produced (may exceed rows.length when capped by row_limit).'),
+      .describe(
+        'Rows the query materialized. Exact when truncated is false — including on the register_as path, which stages and counts the whole result past row_limit. Equal to row_limit when truncated is true: a floor on the real match count, not a total.',
+      ),
     returnedRows: z.number().describe('Rows included in this response.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when row_limit cut the result: more rows matched than the cap and the remainder was dropped without being counted. False when every matching row was materialized, including on the register_as path, which counts the new dataframe exactly.',
+      ),
     executedSql: z
       .string()
       .describe('Echo of the SQL statement that was executed — confirms the exact query that ran.'),
     notice: z
       .string()
       .optional()
-      .describe('Guidance when results are capped — shows how many rows were omitted.'),
+      .describe(
+        'Guidance when either cap bound the response — names the cap that applied and how to reach the rows it withheld.',
+      ),
   },
 
   async handler(input, ctx) {
@@ -144,20 +159,30 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       queryParams: { sql: input.sql },
     });
 
+    const truncated = result.truncated === true;
+    const shown = result.rows.length.toLocaleString();
+    const shownRows = `${shown} row${result.rows.length === 1 ? '' : 's'}`;
+
     ctx.log.info('EIA dataframe query executed', {
       rowCount: result.rowCount,
       returned: result.rows.length,
+      truncated,
       registeredAs: meta?.tableName,
     });
 
     ctx.enrich({
       totalRows: result.rowCount,
       returnedRows: result.rows.length,
+      truncated,
       executedSql: input.sql,
     });
-    if (result.rowCount > result.rows.length) {
+    if (truncated) {
       ctx.enrich.notice(
-        `Showing ${result.rows.length.toLocaleString()} of ${result.rowCount.toLocaleString()} rows — increase row_limit or use register_as to chain into a new dataframe.`,
+        `Showing ${shownRows} — more rows matched than the row_limit cap of ${input.row_limit.toLocaleString()} and the remainder was dropped uncounted, so totalRows is that cap and not a total. Raise row_limit, or re-run with register_as to stage the whole result as a new dataframe, which reports an exact row count.`,
+      );
+    } else if (result.rowCount > result.rows.length) {
+      ctx.enrich.notice(
+        `Showing ${shown} of ${result.rowCount.toLocaleString()} rows — preview capped the inline slice (it defaults to row_limit); raise it to see more${meta?.tableName ? `, or query ${meta.tableName} directly` : ''}.`,
       );
     }
 
