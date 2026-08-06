@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.8](changelog/0.3.x/0.3.8.md) — 2026-08-05
+
+eia_query_route fixes: per-column units rendering, sort/date-format error reasons, canvas-off advisory suppression
+
 ## [0.3.7](changelog/0.3.x/0.3.7.md) — 2026-08-05
 
 eia_describe_route keeps facet values EIA sends without a name and quotes a blank identifier in format()
