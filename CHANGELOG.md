@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.6](changelog/0.3.x/0.3.6.md) — 2026-08-05
+
+eia_dataframe_query surfaces row_limit truncation; eia_describe_route handles offset overshoot, unifies content[]/structuredContent facet windows, and drops restating aliases from format()
+
 ## [0.3.5](changelog/0.3.x/0.3.5.md) — 2026-08-05
 
 eia_query_route: incomplete-return advisory suppressed when already accounted for, sort now reaches dataframe provenance, canvas_preview_note reports the staged range for offset-bound stages

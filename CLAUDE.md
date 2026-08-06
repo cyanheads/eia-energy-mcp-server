@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** @cyanheads/eia-energy-mcp-server
-**Version:** 0.3.5
+**Version:** 0.3.6
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.1`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 
@@ -221,6 +221,8 @@ src/
 **In-process caches:**
 - Route tree: fetched lazily on first `eia_browse_routes` / `eia_search_routes` call; cached for server lifetime. STEO's 1,469 `seriesId` values are included in the Fuse.js index.
 - Facet metadata: per-route cache keyed by route path; populated by `eia_describe_route` via fan-out (`Promise.all` over all facets). Reused by subsequent describe and query calls.
+
+**Facet value windows:** `eia_describe_route` caps each facet at `EIA_FACET_VALUE_CAP` (default 50) — one window serving both surfaces, since `format()` renders exactly the values the output carries, so `content[]` and `structuredContent` name the same next call. `values_offset` applies to every facet in the response; one past a facet's last value empties its window, which is shaped like an exhausted enumeration, so the handler calls `ctx.enrich.notice()` naming each emptied facet and its `value_count` — the same disclosure `eia_query_route` gives a row offset past `total`. Within that window `format()` renders `id=name (alias)`, dropping the alias when it only restates the pair — EIA's generated `(id) name`, or `name` alone — and keeping it when it prefixes a class the pair does not name (`Region: (MAT) Middle Atlantic`). The `alias` output field is never filtered.
 
 **STEO:** `steo` is a flat leaf (no sub-routes) with one facet: `seriesId` covering 1,469 named series. Query it via `eia_query_route` with `seriesId` filter. Discovery via `eia_search_routes` (series names are indexed).
 
