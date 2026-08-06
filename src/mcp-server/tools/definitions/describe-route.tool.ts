@@ -8,6 +8,13 @@
  * values per facet, paged with `facet` + `values_offset`. The cap is applied to
  * the response only; the service's per-route metadata cache keeps the full
  * value set, which is what the search index and offset paging read from.
+ *
+ * One window serves both surfaces: `format()` renders the same values the
+ * output carries, so the two name the same next call. An offset past a facet's
+ * last value empties the window and returns a notice naming what to page
+ * against, since an empty window is otherwise shaped like an exhausted one.
+ * Within that window, `format()` prints a value's alias only when it says
+ * something the `id=name` pair does not; the `alias` output field is untouched.
  * @module mcp-server/tools/definitions/describe-route.tool
  */
 
@@ -17,17 +24,27 @@ import { getServerConfig } from '@/config/server-config.js';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
 
 /**
- * Facet values rendered per facet in `content[]`. Independent of the
- * structuredContent cap: this is a readability preview inside a prose block,
- * that is a payload budget. The two surfaces therefore stop at different
- * offsets, and each truncation hint names the offset its own surface reached.
+ * True when a facet value's alias only repeats the `id=name` pair the rendered
+ * line already carries. Surveyed across every facet in the taxonomy, an alias
+ * that says nothing new takes one of two forms: the `(id) name` string EIA
+ * generates for most values — `(IN) Indiana` beside `IN=Indiana` — or `name`
+ * on its own.
+ *
+ * The comparison is whole-string, and that is the load-bearing part. Every
+ * alias that does carry information carries it as a prefix on the same pair —
+ * `Region: (MAT) Middle Atlantic`, `Total: (US) United States (not including
+ * territory data)`, the balancing-authority codes `PJM:` / `SWPP:` / `ISNE:` —
+ * so a substring test would drop precisely the aliases worth printing.
  */
-const FORMAT_PREVIEW_VALUES = 5;
+const restatesPair = (alias: string, id: string, name: string): boolean => {
+  const seen = alias.trim().toLowerCase();
+  return seen === `(${id}) ${name}`.trim().toLowerCase() || seen === name.trim().toLowerCase();
+};
 
 export const describeRouteTool = tool('eia_describe_route', {
   title: 'Describe EIA Route',
   description:
-    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. Facet values are fetched from separate EIA endpoints and merged — results are cached per-route for the process lifetime to minimize API calls.',
+    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints and merged — results are cached per-route for the process lifetime to minimize API calls.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
@@ -134,6 +151,15 @@ export const describeRouteTool = tool('eia_describe_route', {
       .describe('Period format for the default frequency (e.g. "YYYY-MM").'),
   }),
 
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance when values_offset lands past the last value of one or more facets — names each emptied facet, its value_count, and its last valid offset. Absent when every facet returned values.',
+      ),
+  },
+
   errors: [
     {
       reason: 'route_not_found',
@@ -189,24 +215,46 @@ export const describeRouteTool = tool('eia_describe_route', {
     const cap = getServerConfig().facetValueCap;
     const offset = input.values_offset;
 
+    const windows = facets.map((f) => {
+      const window = f.values.slice(offset, offset + cap);
+      return {
+        id: f.id,
+        description: f.description,
+        values: window.map((v) => ({
+          id: v.id,
+          name: v.name,
+          ...(v.alias !== undefined && { alias: v.alias }),
+        })),
+        value_count: f.values.length,
+        values_truncated: offset + window.length < f.values.length,
+      };
+    });
+
+    /**
+     * An offset past a facet's last value returns the same shape as a facet
+     * enumerated to its end — empty values, nothing truncated — and the offset
+     * applies to every facet, so one large enough to page a wide facet empties
+     * every narrower one beside it. Name those facets and their counts so the
+     * two cases read apart and the caller has an offset to come back with.
+     */
+    const overshot = windows.filter((f) => f.values.length === 0 && f.value_count > 0);
+    if (overshot.length > 0) {
+      const named = overshot
+        .map(
+          (f) =>
+            `${f.id} (${f.value_count.toLocaleString()} values, last valid offset ${(f.value_count - 1).toLocaleString()})`,
+        )
+        .join(', ');
+      ctx.enrich.notice(
+        `values_offset ${offset.toLocaleString()} is past the last value of ${named}. Reduce values_offset to at most that facet's last valid offset, or pass facet to page one facet at a time so a shared offset stops emptying the narrower ones.`,
+      );
+    }
+
     return {
       route: meta.route,
       description: meta.description,
       values_offset: offset,
-      facets: facets.map((f) => {
-        const window = f.values.slice(offset, offset + cap);
-        return {
-          id: f.id,
-          description: f.description,
-          values: window.map((v) => ({
-            id: v.id,
-            name: v.name,
-            ...(v.alias !== undefined && { alias: v.alias }),
-          })),
-          value_count: f.values.length,
-          values_truncated: offset + window.length < f.values.length,
-        };
-      }),
+      facets: windows,
       data_columns: meta.dataColumns.map((c) => ({
         id: c.id,
         alias: c.alias,
@@ -258,16 +306,12 @@ export const describeRouteTool = tool('eia_describe_route', {
     if (result.facets.length) {
       lines.push('### Facets (filter dimensions)');
       for (const facet of result.facets) {
-        const preview = facet.values.slice(0, FORMAT_PREVIEW_VALUES);
-        // This surface stops at its own preview length, which is shorter than
-        // the window structuredContent carries — so the offset named here is
-        // the one this reader actually reached, not that surface's.
-        const nextOffset = result.values_offset + preview.length;
-        const remaining = facet.value_count - nextOffset;
-        const more =
-          remaining > 0
-            ? ` (+${remaining} more — eia_describe_route(route="${result.route}", facet="${facet.id}", values_offset=${nextOffset}))`
-            : '';
+        // Both surfaces render the same window, so the next call named here is
+        // the one the structured fields describe.
+        const nextOffset = result.values_offset + facet.values.length;
+        const more = facet.values_truncated
+          ? ` (+${facet.value_count - nextOffset} more — eia_describe_route(route="${result.route}", facet="${facet.id}", values_offset=${nextOffset}))`
+          : '';
         // A window is anything short of the whole set — capped at the end, or
         // started past the beginning. The last page of a paged facet is not
         // truncated but is still a window, and reporting it as the full count
@@ -276,10 +320,19 @@ export const describeRouteTool = tool('eia_describe_route', {
           facet.values_truncated || result.values_offset > 0
             ? `${facet.values.length} of ${facet.value_count} values from offset ${result.values_offset}`
             : `${facet.value_count} values`;
-        const valueList = preview
-          .map((v) => (v.alias ? `${v.id}=${v.name} (${v.alias})` : `${v.id}=${v.name}`))
-          .join(', ');
-        lines.push(`- **${facet.id}** (${scope}): ${facet.description} — ${valueList}${more}`);
+        // An emptied window has nothing to trail the em dash with. An alias
+        // that only restates the pair is dropped from the line and kept on the
+        // output field, where a reader can still read it directly.
+        const valueList = facet.values.length
+          ? ` — ${facet.values
+              .map((v) =>
+                v.alias && !restatesPair(v.alias, v.id, v.name)
+                  ? `${v.id}=${v.name} (${v.alias})`
+                  : `${v.id}=${v.name}`,
+              )
+              .join(', ')}`
+          : '';
+        lines.push(`- **${facet.id}** (${scope}): ${facet.description}${valueList}${more}`);
       }
     }
 

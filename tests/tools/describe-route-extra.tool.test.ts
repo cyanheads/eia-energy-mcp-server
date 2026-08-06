@@ -152,10 +152,10 @@ describe('describeRouteTool — additional coverage', () => {
   });
 
   // ------------------------------------------------------------------
-  // Facet values with more than 5 entries (format preview truncation)
+  // Facet value window rendering
   // ------------------------------------------------------------------
 
-  it('format shows +N more for facets with many values', () => {
+  it('format renders every value the output carries', () => {
     const values = Array.from({ length: 10 }, (_, i) => ({
       id: `ST${i}`,
       name: `State ${i}`,
@@ -182,8 +182,35 @@ describe('describeRouteTool — additional coverage', () => {
 
     const blocks = describeRouteTool.format!(result);
     const text = (blocks[0] as { text: string }).text;
-    // Under the structured cap but over the prose preview — content[] still
-    // needs a retrieval path for the tail it did not print.
+    // The window holds all 10, so nothing is stranded and nothing to page to.
+    for (const v of values) expect(text).toContain(`${v.id}=${v.name}`);
+    expect(text).not.toContain('more —');
+  });
+
+  it('format pages from the end of the rendered window', () => {
+    const result = {
+      route: 'electricity/retail-sales',
+      description: 'Retail sales',
+      values_offset: 0,
+      facets: [
+        {
+          id: 'stateid',
+          description: 'State',
+          values: Array.from({ length: 5 }, (_, i) => ({ id: `ST${i}`, name: `State ${i}` })),
+          value_count: 10,
+          values_truncated: true,
+        },
+      ],
+      data_columns: [],
+      frequencies: [],
+      date_range: { start: '2001-01', end: '2024-11' },
+      default_frequency: 'monthly',
+      default_date_format: 'YYYY-MM',
+    };
+
+    const blocks = describeRouteTool.format!(result);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('ST4=State 4');
     expect(text).toContain('+5 more');
     expect(text).toContain('values_offset=5');
   });
