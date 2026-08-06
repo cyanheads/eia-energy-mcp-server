@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-08-05 · ⚠️ Breaking
+
+eia_query_route staging now opt-in via stage: true (was automatic); canvas-only dataframe tools gated at registration when no canvas is configured; route paths normalized across all three route tools
+
 ## [0.3.8](changelog/0.3.x/0.3.8.md) — 2026-08-05
 
 eia_query_route fixes: per-column units rendering, sort/date-format error reasons, canvas-off advisory suppression

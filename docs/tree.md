@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-08-01 00:21:11
+Generated on: 2026-08-06 05:59:36
 
 ```text
 eia-energy-mcp-server/
@@ -25,6 +25,7 @@ eia-energy-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── data/
 ├── docs/
@@ -167,20 +168,21 @@ eia-energy-mcp-server/
 │   │   ├── eia-service.test.ts
 │   │   ├── normalize-description.test.ts
 │   │   └── route-cache.test.ts
-│   └── tools/
-│       ├── browse-routes-extra.tool.test.ts
-│       ├── browse-routes.tool.test.ts
-│       ├── dataframe-describe-extra.tool.test.ts
-│       ├── dataframe-describe.tool.test.ts
-│       ├── dataframe-drop.tool.test.ts
-│       ├── dataframe-query-extra.tool.test.ts
-│       ├── dataframe-query.tool.test.ts
-│       ├── describe-route-extra.tool.test.ts
-│       ├── describe-route.tool.test.ts
-│       ├── query-route-extra.tool.test.ts
-│       ├── query-route.tool.test.ts
-│       ├── search-routes-extra.tool.test.ts
-│       └── search-routes.tool.test.ts
+│   ├── tools/
+│   │   ├── browse-routes-extra.tool.test.ts
+│   │   ├── browse-routes.tool.test.ts
+│   │   ├── dataframe-describe-extra.tool.test.ts
+│   │   ├── dataframe-describe.tool.test.ts
+│   │   ├── dataframe-drop.tool.test.ts
+│   │   ├── dataframe-query-extra.tool.test.ts
+│   │   ├── dataframe-query.tool.test.ts
+│   │   ├── describe-route-extra.tool.test.ts
+│   │   ├── describe-route.tool.test.ts
+│   │   ├── query-route-extra.tool.test.ts
+│   │   ├── query-route.tool.test.ts
+│   │   ├── search-routes-extra.tool.test.ts
+│   │   └── search-routes.tool.test.ts
+│   └── index.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
