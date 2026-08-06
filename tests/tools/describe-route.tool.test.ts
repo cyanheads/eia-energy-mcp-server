@@ -502,6 +502,46 @@ describe('describeRouteTool', () => {
       expect(facetLine).not.toContain('—');
     });
 
+    it('quotes a blank identifier so the value stays visible and copyable', () => {
+      const result = {
+        route: 'electricity/facility-fuel',
+        description: 'Facility fuel',
+        values_offset: 0,
+        facets: [
+          {
+            id: 'primeMover',
+            description: 'Prime Mover',
+            values: [
+              { id: 'FW', name: 'FW' },
+              { id: ' ', name: ' ' },
+              { id: 'PV', name: 'PV' },
+            ],
+            value_count: 3,
+            values_truncated: false,
+          },
+        ],
+        data_columns: [],
+        frequencies: [],
+        date_range: { start: '', end: '' },
+        default_frequency: '',
+        default_date_format: '',
+      };
+
+      const blocks = describeRouteTool.format!(result);
+      const text = (blocks[0] as { text: string }).text;
+      const facetLine = text.split('\n').find((l) => l.startsWith('- **primeMover**'));
+
+      // Printed raw, the blank collapses into the comma joiner and the value
+      // is indistinguishable from spacing — a content[]-only reader cannot
+      // tell it exists or what to filter with.
+      expect(facetLine).toContain('" "=" "');
+      expect(facetLine).not.toContain('FW,  = , PV');
+      // Every other value is non-blank and must print unquoted.
+      expect(facetLine).toContain('FW=FW');
+      expect(facetLine).toContain('PV=PV');
+      expect(facetLine).not.toContain('"FW"');
+    });
+
     it('reports the last page as a window, not as the whole value set', () => {
       const result = {
         route: 'steo',

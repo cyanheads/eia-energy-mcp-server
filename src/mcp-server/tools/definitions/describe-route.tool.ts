@@ -30,6 +30,10 @@ import { getEiaApiService } from '@/services/eia/eia-service.js';
  * generates for most values — `(IN) Indiana` beside `IN=Indiana` — or `name`
  * on its own.
  *
+ * The second form also covers a value EIA sent without a `name`: the service
+ * labels it from its own alias, so the pair reads `id=alias` and the alias is
+ * printed once rather than twice.
+ *
  * The comparison is whole-string, and that is the load-bearing part. Every
  * alias that does carry information carries it as a prefix on the same pair —
  * `Region: (MAT) Middle Atlantic`, `Total: (US) United States (not including
@@ -40,6 +44,17 @@ const restatesPair = (alias: string, id: string, name: string): boolean => {
   const seen = alias.trim().toLowerCase();
   return seen === `(${id}) ${name}`.trim().toLowerCase() || seen === name.trim().toLowerCase();
 };
+
+/**
+ * EIA sends one facet value in the taxonomy whose identifier is a single space
+ * — `electricity/facility-fuel`'s `primeMover`, its unspecified-prime-mover
+ * bucket, which filters 14,955 rows and so cannot be dropped. Printed raw it
+ * leaves a hole in the comma-joined line (`FW=FW,  = , PV=PV`), so a reader of
+ * `content[]` alone cannot see the value is there or what to pass. Quoting
+ * makes the blank visible and its bounds copyable; every other value in the
+ * taxonomy is non-blank and prints unchanged.
+ */
+const showBlank = (s: string): string => (s.trim() === '' ? `"${s}"` : s);
 
 export const describeRouteTool = tool('eia_describe_route', {
   title: 'Describe EIA Route',
@@ -89,7 +104,11 @@ export const describeRouteTool = tool('eia_describe_route', {
                 z
                   .object({
                     id: z.string().describe('Facet value ID — use as filter value.'),
-                    name: z.string().describe('Human-readable name.'),
+                    name: z
+                      .string()
+                      .describe(
+                        'Human-readable name. Falls back to the alias, then to the id, on the values EIA sends without one.',
+                      ),
                     alias: z.string().optional().describe('Short alias, when provided by EIA.'),
                   })
                   .describe('A valid facet value.'),
@@ -325,11 +344,12 @@ export const describeRouteTool = tool('eia_describe_route', {
         // output field, where a reader can still read it directly.
         const valueList = facet.values.length
           ? ` — ${facet.values
-              .map((v) =>
-                v.alias && !restatesPair(v.alias, v.id, v.name)
-                  ? `${v.id}=${v.name} (${v.alias})`
-                  : `${v.id}=${v.name}`,
-              )
+              .map((v) => {
+                const pair = `${showBlank(v.id)}=${showBlank(v.name)}`;
+                return v.alias && !restatesPair(v.alias, v.id, v.name)
+                  ? `${pair} (${v.alias})`
+                  : pair;
+              })
               .join(', ')}`
           : '';
         lines.push(`- **${facet.id}** (${scope}): ${facet.description}${valueList}${more}`);
