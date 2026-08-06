@@ -553,27 +553,118 @@ describe('queryRouteTool — additional coverage', () => {
       expect(text).toContain('No rows returned');
     });
 
-    it('renders units in header from {col}-units fields', () => {
-      const result = {
+    // ----------------------------------------------------------------
+    // #49 — a {col}-units companion is decided from the whole preview. The
+    // header may only assert a unit every row agrees on; anything else keeps
+    // the units column in the body, and an all-null one is dropped.
+    // ----------------------------------------------------------------
+
+    describe('{col}-units rendering (#49)', () => {
+      const base = {
         route: 'electricity/retail-sales',
-        data: [
-          {
-            period: '2024-01',
-            sales: '9.13',
-            'sales-units': 'million kilowatthours',
-          },
-        ],
-        total: 1,
-        returned_count: 1,
+        total: 2,
+        returned_count: 2,
         frequency: 'monthly',
         date_format: 'YYYY-MM',
       };
-      const blocks = queryRouteTool.format!(result);
-      const text = (blocks[0] as { text: string }).text;
-      // Units should appear in header, not in every cell
-      expect(text).toContain('million kilowatthours');
-      // The actual value rows should not repeat the units column verbatim
-      expect(text).toContain('9.13');
+
+      it('annotates the header when every row carries the same unit', () => {
+        const text = (
+          queryRouteTool.format!({
+            ...base,
+            data: [
+              { period: '2024-01', sales: '9.13', 'sales-units': 'million kilowatthours' },
+              { period: '2024-02', sales: '8.45', 'sales-units': 'million kilowatthours' },
+            ],
+          })[0] as { text: string }
+        ).text;
+
+        // The width win #10 was after: one annotation, no repeated body column.
+        expect(text).toContain('| period | sales (million kilowatthours) |');
+        expect(text).not.toContain('sales-units');
+        expect(text).toContain('| 2024-01 | 9.13 |');
+      });
+
+      it('keeps the units column in the body when the unit varies row to row', () => {
+        const text = (
+          queryRouteTool.format!({
+            ...base,
+            route: 'electricity/electric-power-operational-data',
+            data: [
+              {
+                period: '2023',
+                fuelTypeDescription: 'all fuels',
+                'consumption-for-eg': '0',
+                'consumption-for-eg-units': 'thousand physical units',
+              },
+              {
+                period: '2023',
+                fuelTypeDescription: 'coal, excluding waste coal',
+                'consumption-for-eg': '50705.996',
+                'consumption-for-eg-units': 'thousand short tons',
+              },
+            ],
+          })[0] as { text: string }
+        ).text;
+
+        // The header must not stamp row 0's unit on a column the rows disagree on.
+        expect(text).not.toContain('consumption-for-eg (thousand physical units)');
+        expect(text).toContain(
+          '| period | fuelTypeDescription | consumption-for-eg | consumption-for-eg-units |',
+        );
+        expect(text).toContain('| 2023 | all fuels | 0 | thousand physical units |');
+        expect(text).toContain(
+          '| 2023 | coal, excluding waste coal | 50705.996 | thousand short tons |',
+        );
+      });
+
+      it('keeps the units column when row 0 is null and a later row carries a unit', () => {
+        const text = (
+          queryRouteTool.format!({
+            ...base,
+            route: 'electricity/facility-fuel',
+            data: [
+              {
+                period: '2023',
+                fuelTypeDescription: 'Total',
+                'total-consumption': '7945766',
+                'total-consumption-units': null,
+              },
+              {
+                period: '2023',
+                fuelTypeDescription: 'Natural Gas',
+                'total-consumption': '7945766',
+                'total-consumption-units': 'Mcf',
+              },
+            ],
+          })[0] as { text: string }
+        ).text;
+
+        // Row 0's null must not silently drop the unit the rows below carry.
+        expect(text).toContain(
+          '| period | fuelTypeDescription | total-consumption | total-consumption-units |',
+        );
+        expect(text).toContain('| 2023 | Total | 7945766 |  |');
+        expect(text).toContain('| 2023 | Natural Gas | 7945766 | Mcf |');
+      });
+
+      it('drops the units column entirely when no row carries a unit', () => {
+        const text = (
+          queryRouteTool.format!({
+            ...base,
+            data: [
+              { period: '2024-01', sales: '9.13', 'sales-units': null },
+              { period: '2024-02', sales: '8.45', 'sales-units': null },
+            ],
+          })[0] as { text: string }
+        ).text;
+
+        // An all-null companion carries nothing — rendering it would add a
+        // blank column rather than information.
+        expect(text).toContain('| period | sales |');
+        expect(text).not.toContain('sales-units');
+        expect(text).toContain('| 2024-01 | 9.13 |');
+      });
     });
 
     it('renders truncation_warning when present', () => {

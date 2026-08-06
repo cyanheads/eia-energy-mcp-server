@@ -448,6 +448,50 @@ describe('EiaApiService.query', () => {
       });
     });
 
+    it('maps an invalid sort column to invalid_sort', async () => {
+      stubError(
+        400,
+        "Invalid sort 'bogus_col' provided. The only valid sort parameters are 'revenue', 'sales', 'price', 'customers', 'period', 'stateid', and 'sectorid' in either 'asc' or 'desc' order.",
+      );
+      const ctx = createMockContext();
+
+      await expect(
+        getEiaApiService().query(
+          LEAF,
+          { columns: ['price'], sort: [{ column: 'bogus_col', direction: 'desc' }] },
+          ctx,
+        ),
+      ).rejects.toMatchObject({
+        code: -32007,
+        data: {
+          reason: 'invalid_sort',
+          recovery: { hint: expect.stringContaining('data_columns[].id') },
+        },
+      });
+    });
+
+    it('maps an invalid date format to invalid_period', async () => {
+      stubError(
+        400,
+        "Invalid date format 'not-a-date' provided. The only valid date formats for this data are 'YYYY-MM', 'YYYY-\"Q\"Q', 'YYYY'.",
+      );
+      const ctx = createMockContext();
+
+      await expect(
+        getEiaApiService().query(
+          LEAF,
+          { columns: ['price'], start: 'not-a-date', end: 'nzz' },
+          ctx,
+        ),
+      ).rejects.toMatchObject({
+        code: -32007,
+        data: {
+          reason: 'invalid_period',
+          recovery: { hint: expect.stringContaining('frequencies[].format') },
+        },
+      });
+    });
+
     it('falls back to invalid_facet on an unrecognized 400 message', async () => {
       stubError(400, 'Something else went wrong.');
       const ctx = createMockContext();

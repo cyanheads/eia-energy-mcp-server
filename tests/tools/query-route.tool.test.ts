@@ -116,8 +116,8 @@ describe('queryRouteTool', () => {
       ...SAMPLE_DATA_RESPONSE,
       warnings: [
         {
-          warning: 'incomplete return',
-          description: 'The API can only return 5000 rows in JSON format.',
+          warning: 'parameter out of range: length',
+          description: 'The maximum value is 5000.',
         },
       ],
     });
@@ -127,14 +127,31 @@ describe('queryRouteTool', () => {
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.truncation_warning).toBe(
-      'incomplete return: The API can only return 5000 rows in JSON format.',
+      'parameter out of range: length: The maximum value is 5000.',
     );
     expect(result.truncation_warning).not.toContain('[object Object]');
   });
 
   it('joins multiple EIA warnings', async () => {
+    // A stage capped short of total is the case where both advisories still
+    // apply: the gap is real, so the incomplete-return entry is not suppressed
+    // and joins the one beside it.
+    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+      registerDataframe: vi.fn().mockResolvedValue({
+        tableName: 'df_CAPPED',
+        rowCount: 25000,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      }),
+    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
     mockQuery.mockResolvedValue({
       ...SAMPLE_DATA_RESPONSE,
+      total: 113460,
+      accumulated: {
+        rows: Array.from({ length: 25000 }, (_, i) => ({ period: String(i) })),
+        capped: true,
+        cap: 25000,
+      },
       warnings: [
         { warning: 'parameter out of range: length', description: 'The maximum value is 5000.' },
         { warning: 'incomplete return', description: 'Use offset to paginate results.' },
@@ -227,6 +244,48 @@ describe('queryRouteTool', () => {
 
       expect(result.truncation_warning).toBeUndefined();
       expect(result.notice).toContain('Reduce offset');
+    });
+
+    // #54 — the canvas-absent branch writes a canvas_preview_note that accounts
+    // for the same gap, so the advisory must drop there too.
+    it('drops the advisory when canvas_preview_note accounts for the gap with no canvas', async () => {
+      mockQuery.mockResolvedValue({
+        ...SAMPLE_DATA_RESPONSE,
+        total: 113460,
+        warnings: [INCOMPLETE_RETURN],
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        length: 3,
+      });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(result.truncation_warning).toBeUndefined();
+      // The note is the account of the gap the advisory duplicated — its
+      // fixed "5000 rows" text also misdescribes a 3-row request.
+      expect(result.canvas_preview_note).toContain('113,460');
+      expect(result.canvas_preview_note).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+      expect((queryRouteTool.format!(result)[0] as { text: string }).text).not.toContain(
+        '5000 rows in JSON format',
+      );
+    });
+
+    it('keeps a non-suppressed advisory on the canvas-absent gap path', async () => {
+      mockQuery.mockResolvedValue({
+        ...SAMPLE_DATA_RESPONSE,
+        total: 113460,
+        warnings: [OUT_OF_RANGE, INCOMPLETE_RETURN],
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(result.truncation_warning).toBe(
+        'parameter out of range: length: The maximum value is 5000.',
+      );
     });
 
     it('keeps advisories the response does not explain when one is suppressed', async () => {

@@ -165,9 +165,10 @@ function incompletePaths(nodes: RawRouteNode[], parentPath = ''): string[] {
 
 /**
  * EIA 400 bodies name the rejected dimension verbatim ("Invalid data 'bogus'
- * provided.", "Invalid frequency 'hourly' provided."). Map each to the reason
- * and recovery that points at the right part of eia_describe_route's output;
- * anything unmatched falls back to invalid_facet.
+ * provided.", "Invalid frequency 'hourly' provided.", "Invalid sort 'bogus'
+ * provided.", "Invalid date format 'not-a-date' provided."). Map each to the
+ * reason and recovery that points at the right part of eia_describe_route's
+ * output; anything unmatched falls back to invalid_facet.
  */
 const INVALID_PARAM_REASONS = [
   {
@@ -179,6 +180,16 @@ const INVALID_PARAM_REASONS = [
     hint: 'Call eia_describe_route and pick a frequency from frequencies[].id.',
     pattern: /invalid frequency\b/i,
     reason: 'invalid_frequency',
+  },
+  {
+    hint: 'Call eia_describe_route and sort by a column ID from data_columns[].id or a facet ID from facets[].id.',
+    pattern: /invalid sort\b/i,
+    reason: 'invalid_sort',
+  },
+  {
+    hint: 'Call eia_describe_route and use the period format frequencies[].format gives for the chosen frequency.',
+    pattern: /invalid date format\b/i,
+    reason: 'invalid_period',
   },
 ] as const;
 
@@ -957,7 +968,8 @@ class EiaApiService {
   /**
    * Fetch one page of /v2/{route}/data/, remapping EIA's 404 and 400 responses
    * to typed reasons. The 400 remap reads the upstream message to distinguish a
-   * bad facet key from a bad column or frequency.
+   * bad facet key from a bad column, frequency, sort column, or period format
+   * (see `INVALID_PARAM_REASONS`).
    */
   private async fetchDataPage(
     route: string,

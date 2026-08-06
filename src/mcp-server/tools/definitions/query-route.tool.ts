@@ -19,11 +19,12 @@ import type { EiaWarning } from '@/services/eia/types.js';
  * than the query's `total`, and its "5000 rows in JSON format" text is fixed
  * boilerplate that appears at any size. It describes the inline page rather
  * than the result set, so once the response itself states where the caller
- * stands — the staged table reaches the last row, or a notice explains the
- * row-less page — forwarding it contradicts the response and sends an agent
- * back for rows it already has. Matched on the `warning` label so every other
- * advisory EIA reports, which the response does not otherwise explain, still
- * reaches the caller.
+ * stands — the staged table reaches the last row, a notice explains the
+ * row-less page, or `canvas_preview_note` places the inline page against
+ * `total` where no canvas is configured — forwarding it contradicts the
+ * response and sends an agent back for rows it already has. Matched on the
+ * `warning` label so every other advisory EIA reports, which the response does
+ * not otherwise explain, still reaches the caller.
  */
 function isIncompleteReturn(warning: EiaWarning): boolean {
   return warning.warning.trim().toLowerCase() === 'incomplete return';
@@ -132,13 +133,13 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Human-readable note when total exceeds the inline preview — names how many rows actually reached the canvas table, and where in the matching set those rows sit whenever the stage does not start at row 1. When staging also stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return), it says so and gives the offset to resume from.',
+        'Human-readable note when total exceeds the inline preview. With a canvas configured it names how many rows actually reached the canvas table, and where in the matching set those rows sit whenever the stage does not start at row 1; when staging also stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return), it says so and gives the offset to resume from. With no canvas configured nothing is staged, so it places the inline page against total and names offset paging and CANVAS_PROVIDER_TYPE=duckdb as the ways to reach the rest.',
       ),
     truncation_warning: z
       .string()
       .optional()
       .describe(
-        "Upstream advisories forwarded verbatim from EIA's warnings[], joined with '; ' when more than one applies. These describe the inline page — EIA's \"incomplete return\" entry fires whenever the requested length is under total, at any size — not a 5,000-row ceiling on this response. Absent when the response already accounts for the gap the advisory names (the staged table reaches the last row, or notice explains the empty page).",
+        "Upstream advisories forwarded verbatim from EIA's warnings[], joined with '; ' when more than one applies. These describe the inline page — EIA's \"incomplete return\" entry fires whenever the requested length is under total, at any size — not a 5,000-row ceiling on this response. Absent when the response already accounts for the gap the advisory names (the staged table reaches the last row, notice explains the empty page, or canvas_preview_note places the inline page against total where no canvas is configured).",
       ),
   }),
 
@@ -245,6 +246,20 @@ export const queryRouteTool = tool('eia_query_route', {
       recovery: 'Call eia_describe_route and pick a frequency from frequencies[].id.',
     },
     {
+      reason: 'invalid_sort',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A sort entry named a column the route does not sort by.',
+      recovery:
+        'Call eia_describe_route and sort by a column ID from data_columns[].id or a facet ID from facets[].id.',
+    },
+    {
+      reason: 'invalid_period',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'start or end was not in a period format the route accepts.',
+      recovery:
+        'Call eia_describe_route and use the period format frequencies[].format gives for the chosen frequency.',
+    },
+    {
       reason: 'no_data',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Date range is inverted (start is after end).',
@@ -344,10 +359,11 @@ export const queryRouteTool = tool('eia_query_route', {
 
     /**
      * Whether the response already states where the caller stands relative to
-     * `total` — a notice explaining the row-less page, or a staged table
-     * running from the caller's `offset` to the last row, leaving nothing
-     * further to page to. Decides whether EIA's per-page advisory still tells
-     * the caller anything (see `isIncompleteReturn`).
+     * `total` — a notice explaining the row-less page, a staged table running
+     * from the caller's `offset` to the last row (leaving nothing further to
+     * page to), or, with no canvas configured, a `canvas_preview_note` naming
+     * the inline page against `total`. Decides whether EIA's per-page advisory
+     * still tells the caller anything (see `isIncompleteReturn`).
      */
     let gapAccountedFor = false;
 
@@ -412,6 +428,7 @@ export const queryRouteTool = tool('eia_query_route', {
       }
     } else if (dataResp.total > dataResp.data.length) {
       result.canvas_preview_note = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
+      gapAccountedFor = true;
     }
 
     // Forward EIA's own top-level advisories. Each entry is
@@ -456,25 +473,37 @@ export const queryRouteTool = tool('eia_query_route', {
       return [{ type: 'text', text: lines.join('\n') }];
     }
 
-    // Render table — separate data columns from {col}-units columns.
-    // Units are identical on every row, so annotate the header instead of
-    // repeating them in the body.
+    /**
+     * Render table — each `{col}-units` companion is decided from the whole
+     * preview, not from row 0. The unit follows a facet value on some routes
+     * (fuel type, most obviously), so one row cannot speak for the column:
+     * annotating the header from row 0 stamps its unit on rows measured in
+     * something else, and a null on row 0 drops units later rows carry. Absent
+     * from every row, the companion is dropped — the body column would be
+     * blank. Identical on every row, it annotates the header, which is the
+     * width win and correct on most routes. Anything else stays as its own
+     * body column.
+     */
     const firstRow = result.data[0];
     if (!firstRow) return [{ type: 'text', text: lines.join('\n') }];
     const allKeys = Object.keys(firstRow);
 
-    // Build a units map from the first row: { colName: "unit string" }
     const unitsMap: Record<string, string> = {};
+    const absorbedUnitKeys = new Set<string>();
     for (const key of allKeys) {
-      if (key.endsWith('-units')) {
-        const col = key.slice(0, -6); // strip trailing '-units'
-        const unit = firstRow[key];
-        if (unit !== null && unit !== undefined) unitsMap[col] = String(unit);
+      if (!key.endsWith('-units')) continue;
+      const units = result.data.map((row) => row[key]);
+      const first = units[0];
+      if (units.every((u) => u === null || u === undefined)) {
+        absorbedUnitKeys.add(key);
+      } else if (units.every((u) => u === first)) {
+        unitsMap[key.slice(0, -6)] = String(first); // strip trailing '-units'
+        absorbedUnitKeys.add(key);
       }
     }
 
-    // Data columns are all keys that are not {col}-units entries
-    const dataCols = allKeys.filter((k) => !k.endsWith('-units'));
+    // Body columns: data columns, plus every {col}-units column the header could not absorb.
+    const dataCols = allKeys.filter((k) => !absorbedUnitKeys.has(k));
 
     // Header: "col (unit)" when a unit is known, else just "col"
     const headerCells = dataCols.map((c) => (unitsMap[c] ? `${c} (${unitsMap[c]})` : c));
