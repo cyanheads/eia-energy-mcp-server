@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.5](changelog/0.3.x/0.3.5.md) — 2026-08-05
+
+eia_query_route: incomplete-return advisory suppressed when already accounted for, sort now reaches dataframe provenance, canvas_preview_note reports the staged range for offset-bound stages
+
 ## [0.3.4](changelog/0.3.x/0.3.4.md) — 2026-07-31
 
 eia_search_routes now reaches the route behind a multi-term query via a tokenized candidate gate; WEAK_MATCH_SCORE re-derived from 0.9 to 0.72
