@@ -143,6 +143,12 @@ export interface DataResponse {
   data: DataRow[];
   dateFormat: string;
   frequency: string;
+  /**
+   * The route the query resolved to, in canonical spelling — no leading,
+   * trailing, or repeated slashes. Mirrors `RouteMetadata.route` so a tool can
+   * echo the path the caller can reuse verbatim rather than the one they typed.
+   */
+  route: string;
   total: number;
   warnings: EiaWarning[] | undefined;
 }

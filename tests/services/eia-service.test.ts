@@ -570,6 +570,133 @@ function stubApiPaths(bodies: Record<string, unknown>) {
   return { paths, fetchMock };
 }
 
+// ------------------------------------------------------------------
+// #53 — EIA's own docs write routes as `/v2/electricity/retail-sales/`, so
+// those spellings reach the tools verbatim. All three route-taking methods
+// normalize before resolving, or one route is three cache entries and browse
+// rejects a path the other two accept.
+// ------------------------------------------------------------------
+
+describe('EiaApiService — route path normalization (#53)', () => {
+  const CANONICAL = 'electricity/retail-sales';
+  const VARIANTS = [
+    `/${CANONICAL}`,
+    `${CANONICAL}/`,
+    `/${CANONICAL}/`,
+    'electricity//retail-sales',
+    ` ${CANONICAL} `,
+  ];
+
+  /** Leaf metadata for the canonical path only — a variant that leaks through 404s. */
+  const LEAF_META = {
+    [CANONICAL]: {
+      response: {
+        id: 'electricity',
+        name: 'Retail sales',
+        description: 'Retail electricity sales',
+        facets: [],
+        frequency: [{ id: 'monthly', description: 'Monthly', query: 'monthly', format: 'YYYY-MM' }],
+        data: { price: { alias: 'Price', units: 'cents per kilowatt-hour' } },
+        startPeriod: '2001-01',
+        endPeriod: '2024-11',
+        defaultFrequency: 'monthly',
+        defaultDateFormat: 'YYYY-MM',
+      },
+    },
+  };
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+    seedRouteCache();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  it('browses every spelling of a leaf path the way it browses the canonical one', async () => {
+    stubApiPaths({});
+    const ctx = createMockContext();
+
+    for (const variant of VARIANTS) {
+      const result = await getEiaApiService().browse(variant, ctx);
+      expect(result).toEqual({ path: CANONICAL, children: [], isLeaf: true });
+    }
+  });
+
+  it('browses every spelling of a category path', async () => {
+    stubApiPaths({});
+    const ctx = createMockContext();
+
+    for (const variant of ['/electricity', 'electricity/', '/electricity/']) {
+      const result = await getEiaApiService().browse(variant, ctx);
+      expect(result.path).toBe('electricity');
+      expect(result.isLeaf).toBe(false);
+      expect(result.children.map((c) => c.route)).toEqual([CANONICAL]);
+    }
+  });
+
+  it('describes every spelling from one cache entry and one facet fan-out', async () => {
+    const { paths } = stubApiPaths(LEAF_META);
+    const ctx = createMockContext();
+
+    for (const variant of [CANONICAL, ...VARIANTS]) {
+      const meta = await getEiaApiService().describe(variant, ctx);
+      // The metadata carries the canonical spelling, which is what the tool
+      // echoes back for the caller to reuse.
+      expect(meta.route).toBe(CANONICAL);
+    }
+
+    // Six spellings, one upstream fetch — the defect was three spellings
+    // costing three full facet fan-outs against EIA.
+    expect(paths).toEqual([CANONICAL]);
+  });
+
+  it('queries every spelling against the canonical upstream path', async () => {
+    const { fetchMock } = stubDataEndpoint({ total: 4 });
+    const ctx = createMockContext();
+
+    for (const variant of VARIANTS) {
+      const result = await getEiaApiService().query(
+        variant,
+        { columns: ['price'], length: 2 },
+        ctx,
+      );
+      expect(result.route).toBe(CANONICAL);
+      expect(result.data).toHaveLength(2);
+    }
+
+    for (const call of fetchMock.mock.calls) {
+      expect(new URL(String(call[0])).pathname).toBe(`/v2/${CANONICAL}/data/`);
+    }
+  });
+
+  it('fails a category spelling from the cached pre-flight rather than a live fetch', async () => {
+    const { fetchMock } = stubDataEndpoint({ total: 4 });
+    const ctx = createMockContext();
+
+    for (const variant of ['/electricity', 'electricity/', '/electricity/']) {
+      await expect(
+        getEiaApiService().query(variant, { columns: ['price'] }, ctx),
+      ).rejects.toMatchObject({ data: { reason: 'route_not_queryable' } });
+    }
+
+    // The pre-flight reads the node map, which only the canonical spelling used
+    // to hit — every variant used to cost an upstream round trip to learn the
+    // same thing.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('EiaApiService.describe — upstream shape variance', () => {
   const ROUTE = 'electricity/retail-sales';
 

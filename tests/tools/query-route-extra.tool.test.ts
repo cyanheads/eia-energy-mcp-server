@@ -27,6 +27,7 @@ vi.mock('@/services/canvas-bridge/canvas-bridge.js', () => ({
 const mockQuery = vi.fn();
 
 const BASE_RESPONSE = {
+  route: 'electricity/retail-sales',
   total: 2,
   dateFormat: 'YYYY-MM',
   frequency: 'monthly',
@@ -265,13 +266,17 @@ describe('queryRouteTool — additional coverage', () => {
     expect(Object.keys(queryRouteTool.input.shape)).not.toContain('canvas_id');
   });
 
-  it('requests accumulation only when a canvas bridge is present', async () => {
+  it('requests accumulation only when the caller stages and a canvas bridge is present', async () => {
     mockQuery.mockResolvedValue(BASE_RESPONSE);
 
+    const staged = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
     const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
-    await queryRouteTool.handler(input, ctx);
+    await queryRouteTool.handler(staged, ctx);
 
+    // stage: true with no canvas to register into still costs nothing extra.
     expect(mockQuery).toHaveBeenCalledWith(
       'electricity/retail-sales',
       expect.objectContaining({ accumulate: false }),
@@ -281,7 +286,18 @@ describe('queryRouteTool — additional coverage', () => {
     vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
       registerDataframe: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
-    await queryRouteTool.handler(input, createMockContext({ errors: queryRouteTool.errors }));
+
+    // A canvas alone is not the trigger — the caller has to ask.
+    const unstaged = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    await queryRouteTool.handler(unstaged, createMockContext({ errors: queryRouteTool.errors }));
+
+    expect(mockQuery).toHaveBeenLastCalledWith(
+      'electricity/retail-sales',
+      expect.objectContaining({ accumulate: false }),
+      expect.anything(),
+    );
+
+    await queryRouteTool.handler(staged, createMockContext({ errors: queryRouteTool.errors }));
 
     expect(mockQuery).toHaveBeenLastCalledWith(
       'electricity/retail-sales',
@@ -312,7 +328,10 @@ describe('queryRouteTool — additional coverage', () => {
     });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(mockRegister.mock.calls[0]?.[1].rows).toHaveLength(40);
@@ -347,7 +366,10 @@ describe('queryRouteTool — additional coverage', () => {
     });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.canvas_preview_note).toContain('25 rows staged as df_CAPPED');
@@ -379,7 +401,10 @@ describe('queryRouteTool — additional coverage', () => {
     });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.canvas_preview_note).toContain('5,100 rows staged as df_PARTIAL');
@@ -405,10 +430,155 @@ describe('queryRouteTool — additional coverage', () => {
     mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 2 });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.canvas_preview_note).toBeUndefined();
+  });
+
+  // ------------------------------------------------------------------
+  // #50 — staging is the caller's call. A preview must not pay for offset
+  // pages and a canvas insert nobody asked for, and the response has to name
+  // the lever, or the capability is invisible.
+  // ------------------------------------------------------------------
+
+  describe('opt-in staging (#50)', () => {
+    const bridgeWithRegister = () => {
+      const mockRegister = vi.fn().mockResolvedValue({
+        tableName: 'df_STAGED',
+        rowCount: 25000,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      });
+      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+        registerDataframe: mockRegister,
+      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+      return mockRegister;
+    };
+
+    it('stages nothing and asks for no accumulation when stage is omitted', async () => {
+      const mockRegister = bridgeWithRegister();
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 113460 });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales', length: 2 });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[1].accumulate).toBe(false);
+      // Not even the previewed page — registering that alone would stage a
+      // 2-row prefix of a 113,460-row match under a handle that reads whole.
+      expect(mockRegister).not.toHaveBeenCalled();
+      expect(result.dataset).toBeUndefined();
+    });
+
+    it('names stage: true when a canvas is configured but staging was not asked for', async () => {
+      bridgeWithRegister();
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 113460 });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales', length: 2 });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(result.canvas_preview_note).toContain('Showing 2 of 113,460 rows');
+      expect(result.canvas_preview_note).toContain('stage: true');
+      // The canvas is already on — sending the caller after a server env var
+      // would name a change that fixes nothing.
+      expect(result.canvas_preview_note).not.toContain('CANVAS_PROVIDER_TYPE');
+      expect((queryRouteTool.format!(result)[0] as { text: string }).text).toContain('stage: true');
+    });
+
+    it('keeps the deployment-level advice where there is no canvas to stage into', async () => {
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 113460 });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        length: 2,
+        stage: true,
+      });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      // stage: true is not the lever here — it is already set and there is
+      // still nothing to register into.
+      expect(result.canvas_preview_note).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+      expect(result.canvas_preview_note).not.toContain('stage: true');
+      expect(result.dataset).toBeUndefined();
+    });
+
+    it('stages the whole match up to the cap, never just the previewed page', async () => {
+      const mockRegister = bridgeWithRegister();
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        total: 113460,
+        accumulated: {
+          rows: Array.from({ length: 25000 }, (_, i) => ({ period: String(i) })),
+          capped: true,
+          cap: 25000,
+        },
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        length: 2,
+        stage: true,
+      });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[1].accumulate).toBe(true);
+      const registered = mockRegister.mock.calls[0]?.[1];
+      expect(registered.rows).toHaveLength(25000);
+      expect(registered.truncated).toBe(true);
+      // The cap that bound is what the dataframe records as its ceiling — the
+      // preview length would understate it by four orders of magnitude.
+      expect(registered.maxRows).toBe(25000);
+      expect(result.data).toHaveLength(2);
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // #53 — the route the response names is the one the service resolved to,
+  // so it is reusable verbatim and provenance reads as one source.
+  // ------------------------------------------------------------------
+
+  describe('normalized route echo (#53)', () => {
+    it('echoes the service-resolved route rather than the caller spelling', async () => {
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({ route: '/electricity/retail-sales/' });
+      const result = await queryRouteTool.handler(input, ctx);
+
+      expect(result.route).toBe('electricity/retail-sales');
+      expect(getEnrichment(ctx).effectiveRoute).toBe('electricity/retail-sales');
+    });
+
+    it('records the normalized route in staged dataframe provenance', async () => {
+      const mockRegister = vi.fn().mockResolvedValue({
+        tableName: 'df_STAGED',
+        rowCount: 2,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      });
+      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+        registerDataframe: mockRegister,
+      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity//retail-sales',
+        stage: true,
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      // Two spellings of one route must not read as two sources in
+      // eia_dataframe_describe's provenance.
+      expect(mockRegister.mock.calls[0]?.[1].queryParams.route).toBe('electricity/retail-sales');
+    });
   });
 
   // ------------------------------------------------------------------
@@ -441,6 +611,7 @@ describe('queryRouteTool — additional coverage', () => {
         route: 'electricity/retail-sales',
         columns: ['price'],
         sort: SORT,
+        stage: true,
       });
       await queryRouteTool.handler(input, ctx);
 
@@ -456,7 +627,10 @@ describe('queryRouteTool — additional coverage', () => {
       mockQuery.mockResolvedValue(BASE_RESPONSE);
 
       const ctx = createMockContext({ errors: queryRouteTool.errors });
-      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        stage: true,
+      });
       await queryRouteTool.handler(input, ctx);
 
       // Undefined-valued keys would reach eia_dataframe_describe's rendered

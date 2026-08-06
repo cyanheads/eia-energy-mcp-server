@@ -1,10 +1,14 @@
 /**
  * @fileoverview Tool definition for eia_query_route. Fetches data from a leaf
  * route with optional facet filters, date range, frequency, and column
- * selection. Data values come back as strings per the EIA API. Large result
- * sets spill to a DataCanvas table (when CANVAS_PROVIDER_TYPE=duckdb): the
- * service walks offset pages up to EIA_CANVAS_MAX_ROWS and registers the
- * accumulated set, returning a dataset handle for eia_dataframe_query SQL.
+ * selection. Data values come back as strings per the EIA API. Staging is
+ * opt-in: with `stage: true` and a canvas configured
+ * (CANVAS_PROVIDER_TYPE=duckdb) the service walks offset pages up to
+ * EIA_CANVAS_MAX_ROWS and registers the accumulated set, returning a dataset
+ * handle for eia_dataframe_query SQL. Left off, the call costs one upstream
+ * request and nothing is registered. The route echoed back is the canonical
+ * spelling the service resolved to, which is also what dataframe provenance
+ * records.
  * @module mcp-server/tools/definitions/query-route.tool
  */
 
@@ -21,7 +25,7 @@ import type { EiaWarning } from '@/services/eia/types.js';
  * than the result set, so once the response itself states where the caller
  * stands — the staged table reaches the last row, a notice explains the
  * row-less page, or `canvas_preview_note` places the inline page against
- * `total` where no canvas is configured — forwarding it contradicts the
+ * `total` because nothing was staged — forwarding it contradicts the
  * response and sends an agent back for rows it already has. Matched on the
  * `warning` label so every other advisory EIA reports, which the response does
  * not otherwise explain, still reaches the caller.
@@ -33,7 +37,7 @@ function isIncompleteReturn(warning: EiaWarning): boolean {
 export const queryRouteTool = tool('eia_query_route', {
   title: 'Query EIA Route Data',
   description:
-    'Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Use eia_describe_route first to discover valid facet IDs, facet values, column IDs, and frequency codes. Data values are strings in the response (EIA API returns all numeric values as strings, e.g. "9.13"); cast to DOUBLE in SQL when arithmetic is needed. Returns a preview inline; when canvas is enabled and more rows match than the preview holds, additional pages are fetched and the accumulated set is staged as a DataCanvas table — pass the returned dataset name to eia_dataframe_query for SQL. Every dataset a tenant stages lands in the same canvas, so tables from different routes cross-join by name with nothing to thread between calls.',
+    'Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Use eia_describe_route first to discover valid facet IDs, facet values, column IDs, and frequency codes. Data values are strings in the response (EIA API returns all numeric values as strings, e.g. "9.13"); cast to DOUBLE in SQL when arithmetic is needed. Returns a preview inline and stages nothing by default — one upstream request, whatever total says. Pass stage: true to also page past the preview and stage the accumulated set as a DataCanvas table, then pass the returned dataset name to eia_dataframe_query for SQL. Every dataset a tenant stages lands in the same canvas, so tables from different routes cross-join by name with nothing to thread between calls.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
@@ -41,7 +45,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .min(1)
       .describe(
-        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes.',
+        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling like "/electricity/retail-sales/" resolves to the same route.',
       ),
     filters: z
       .record(z.string(), z.union([z.string(), z.array(z.string())]))
@@ -94,12 +98,22 @@ export const queryRouteTool = tool('eia_query_route', {
       .max(5000)
       .default(100)
       .describe(
-        'Rows in the inline preview (default 100, max 5000 per EIA limit). Canvas staging is not bounded by this — it pages past the preview on its own.',
+        'Rows in the inline preview (default 100, max 5000 per EIA limit). With stage: true, staging is not bounded by this — it pages past the preview on its own.',
+      ),
+    stage: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Stage the matching rows as a DataCanvas table for SQL (default false). Off, the call makes one upstream request and returns the preview alone. On, the service pages past the preview up to EIA_CANVAS_MAX_ROWS and registers the accumulated rows, returning the handle in dataset — several extra upstream requests and seconds of latency on a large route, so turn it on when moving to analysis, not while exploring. Requires a canvas (CANVAS_PROVIDER_TYPE=duckdb); without one nothing is staged whatever this is set to.',
       ),
   }),
 
   output: z.object({
-    route: z.string().describe('The route path queried.'),
+    route: z
+      .string()
+      .describe(
+        'The route path queried, in canonical spelling — any leading, trailing, or doubled slashes the input carried are stripped. Reusable verbatim in a follow-up call.',
+      ),
     data: z
       .array(z.object({}).passthrough().describe('A single data row with dynamic column keys.'))
       .describe(
@@ -127,19 +141,19 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'df_<id> table handle for the registered dataset — pass directly to eia_dataframe_query SQL (SELECT ... FROM df_<id>). Every dataset a tenant stages shares one canvas, so handles from different routes join directly.',
+        'df_<id> table handle for the registered dataset — pass directly to eia_dataframe_query SQL (SELECT ... FROM df_<id>). Present only on a stage: true call against a deployment with a canvas configured; absent otherwise, since nothing was staged. Every dataset a tenant stages shares one canvas, so handles from different routes join directly.',
       ),
     canvas_preview_note: z
       .string()
       .optional()
       .describe(
-        'Human-readable note when total exceeds the inline preview. With a canvas configured it names how many rows actually reached the canvas table, and where in the matching set those rows sit whenever the stage does not start at row 1; when staging also stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return), it says so and gives the offset to resume from. With no canvas configured nothing is staged, so it places the inline page against total and names offset paging and CANVAS_PROVIDER_TYPE=duckdb as the ways to reach the rest.',
+        'Human-readable note when total exceeds the inline preview. On a stage: true call it names how many rows actually reached the canvas table, and where in the matching set those rows sit whenever the stage does not start at row 1; when staging also stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return), it says so and gives the offset to resume from. Where staging was not requested it places the inline page against total and names stage: true as the way to get SQL access to the rest; where no canvas is configured at all, staging is unavailable, so it names offset paging and CANVAS_PROVIDER_TYPE=duckdb instead.',
       ),
     truncation_warning: z
       .string()
       .optional()
       .describe(
-        "Upstream advisories forwarded verbatim from EIA's warnings[], joined with '; ' when more than one applies. These describe the inline page — EIA's \"incomplete return\" entry fires whenever the requested length is under total, at any size — not a 5,000-row ceiling on this response. Absent when the response already accounts for the gap the advisory names (the staged table reaches the last row, notice explains the empty page, or canvas_preview_note places the inline page against total where no canvas is configured).",
+        "Upstream advisories forwarded verbatim from EIA's warnings[], joined with '; ' when more than one applies. These describe the inline page — EIA's \"incomplete return\" entry fires whenever the requested length is under total, at any size — not a 5,000-row ceiling on this response. Absent when the response already accounts for the gap the advisory names (the staged table reaches the last row, notice explains the empty page, or canvas_preview_note places the inline page against total because nothing was staged).",
       ),
   }),
 
@@ -279,6 +293,7 @@ export const queryRouteTool = tool('eia_query_route', {
       route: input.route,
       offset: input.offset,
       length: input.length,
+      stage: input.stage,
     });
 
     // Pre-flight: detect inverted date range before hitting the EIA API.
@@ -297,15 +312,20 @@ export const queryRouteTool = tool('eia_query_route', {
       );
     }
 
-    // Canvas presence decides whether the service pages past the preview, so it
-    // has to be resolved before the query, not after.
+    /**
+     * Staging is what makes the service page past the preview, and it needs
+     * both the caller's opt-in and a canvas to register into — so both are
+     * resolved before the query, not after. Without the opt-in the call costs
+     * one upstream request whatever `total` says.
+     */
     const bridge = getCanvasBridge();
+    const stagingBridge = input.stage ? bridge : undefined;
 
     const service = getEiaApiService();
     const dataResp = await service.query(
       input.route,
       {
-        accumulate: bridge !== undefined,
+        accumulate: stagingBridge !== undefined,
         ...(input.filters !== undefined && { filters: input.filters }),
         ...(input.columns !== undefined && { columns: input.columns }),
         ...(input.frequency !== undefined && { frequency: input.frequency }),
@@ -320,7 +340,7 @@ export const queryRouteTool = tool('eia_query_route', {
 
     // Populate enrichment — reaches both structuredContent and content[] trailer.
     ctx.enrich({
-      effectiveRoute: input.route,
+      effectiveRoute: dataResp.route,
       totalCount: dataResp.total,
       returnedCount: dataResp.data.length,
       ...(input.filters &&
@@ -349,7 +369,7 @@ export const queryRouteTool = tool('eia_query_route', {
       canvas_preview_note?: string;
       truncation_warning?: string;
     } = {
-      route: input.route,
+      route: dataResp.route,
       data: dataResp.data,
       total: dataResp.total,
       returned_count: dataResp.data.length,
@@ -375,15 +395,17 @@ export const queryRouteTool = tool('eia_query_route', {
           ? `Offset ${input.offset.toLocaleString()} is past the last row — total is ${dataResp.total.toLocaleString()}. Reduce offset below total to page through the matching rows.`
           : 'No rows matched the filters. Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.';
       gapAccountedFor = true;
-    } else if (bridge) {
-      // DataCanvas spillover — opt-in via CANVAS_PROVIDER_TYPE=duckdb. The
-      // service has already accumulated offset pages when a bridge is present.
+    } else if (stagingBridge) {
+      // DataCanvas spillover — the caller asked for it and a canvas is
+      // configured, so the service has already accumulated offset pages.
       const canvasRows = dataResp.accumulated?.rows ?? dataResp.data;
-      const registered = await bridge.registerDataframe(ctx, {
+      const registered = await stagingBridge.registerDataframe(ctx, {
         rows: canvasRows,
         sourceTool: 'eia_query_route',
         queryParams: {
-          route: input.route,
+          // The canonical route, not the caller's spelling — two spellings of
+          // one route must not read as two different sources in provenance.
+          route: dataResp.route,
           ...(input.filters !== undefined && { filters: input.filters }),
           ...(input.columns !== undefined && { columns: input.columns }),
           ...(input.frequency !== undefined && { frequency: input.frequency }),
@@ -427,7 +449,18 @@ export const queryRouteTool = tool('eia_query_route', {
         }
       }
     } else if (dataResp.total > dataResp.data.length) {
-      result.canvas_preview_note = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
+      /**
+       * Nothing was staged, and the two reasons need different advice. A canvas
+       * is configured and the caller simply did not ask to stage — naming
+       * `stage: true` is the only way they learn the capability is there, and
+       * the canvas-off wording would send them after a deployment change they
+       * do not need. With no canvas the lever does not exist, so offset paging
+       * is what is left.
+       */
+      const head = `Showing ${dataResp.data.length.toLocaleString()} of ${dataResp.total.toLocaleString()} rows`;
+      result.canvas_preview_note = bridge
+        ? `${head} — nothing was staged. Re-run with stage: true to page past the preview and stage the matching rows as a DataCanvas table for SQL, or page through with offset.`
+        : `${head} — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
       gapAccountedFor = true;
     }
 

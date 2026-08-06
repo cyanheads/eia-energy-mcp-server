@@ -1,6 +1,7 @@
 /**
  * @fileoverview Tool definition for eia_dataframe_query. Runs a single-statement
- * SELECT against canvas dataframes registered by eia_query_route. Read-only
+ * SELECT against canvas dataframes registered by eia_query_route's opt-in
+ * staging path. Read-only
  * enforcement in the framework SQL gate: text deny-list, statement count,
  * statement type, EXPLAIN-plan walk, and system-catalog deny (denySystemCatalogs).
  * EIA data values are VARCHAR — cast to DOUBLE for arithmetic.
@@ -18,7 +19,7 @@ import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 export const dataframeQueryTool = tool('eia_dataframe_query', {
   title: 'Query EIA Dataframes',
   description:
-    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh expiry. Every dataframe named in the statement has its expiry extended by the query.',
+    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route calls that passed stage: true — a query that staged nothing leaves no table to select from. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh expiry. Every dataframe named in the statement has its expiry extended by the query.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -39,7 +40,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       code: JsonRpcErrorCode.NotFound,
       when: 'SQL references a df_<id> table that is not staged — mistyped, already dropped, or past its expiry.',
       recovery:
-        'Call eia_dataframe_describe to list the staged handles, or re-run eia_query_route to stage the data again.',
+        'Call eia_dataframe_describe to list the staged handles, or re-run eia_query_route with stage: true to stage the data again.',
     },
     {
       reason: 'non_select_statement',

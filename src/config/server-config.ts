@@ -54,6 +54,21 @@ export function getServerConfig(): ServerConfig {
   return _config;
 }
 
+/**
+ * Whether this deployment has a DataCanvas, read at tool-registration time.
+ *
+ * Deliberately outside `ServerConfigSchema` and read straight from the
+ * environment: `CANVAS_PROVIDER_TYPE` belongs to the framework's core config,
+ * which never merges with a server's own, and `createApp()` builds its `tools[]`
+ * before `setup(core)` runs, so `core.canvas` is not in hand when the canvas-only
+ * tools have to be gated. `duckdb` is the only enabling value — the framework
+ * parses the variable as `z.enum(['none', 'duckdb'])`, so a malformed value
+ * fails its own validation at startup rather than needing handling here.
+ */
+export function isCanvasEnabled(): boolean {
+  return process.env.CANVAS_PROVIDER_TYPE === 'duckdb';
+}
+
 /** Reset for tests that need to change config. */
 export function _resetServerConfig(): void {
   _config = undefined;

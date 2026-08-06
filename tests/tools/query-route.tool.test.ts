@@ -25,6 +25,7 @@ vi.mock('@/services/canvas-bridge/canvas-bridge.js', () => ({
 const mockQuery = vi.fn();
 
 const SAMPLE_DATA_RESPONSE = {
+  route: 'electricity/retail-sales',
   total: 240,
   dateFormat: 'YYYY-MM',
   frequency: 'monthly',
@@ -89,6 +90,7 @@ describe('queryRouteTool', () => {
 
   it('returns structured empty data when zero rows matched', async () => {
     mockQuery.mockResolvedValue({
+      route: 'electricity/retail-sales',
       total: 0,
       dateFormat: 'YYYY-MM',
       frequency: 'monthly',
@@ -159,7 +161,10 @@ describe('queryRouteTool', () => {
     });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.truncation_warning).toBe(
@@ -211,6 +216,7 @@ describe('queryRouteTool', () => {
       const input = queryRouteTool.input.parse({
         route: 'electricity/retail-sales',
         length: 3,
+        stage: true,
       });
       const result = await queryRouteTool.handler(input, ctx);
 
@@ -227,6 +233,7 @@ describe('queryRouteTool', () => {
 
     it('drops the advisory when a notice explains the row-less page', async () => {
       mockQuery.mockResolvedValue({
+        route: 'electricity/retail-sales',
         total: 6,
         dateFormat: 'YYYY-MM',
         frequency: 'monthly',
@@ -302,7 +309,10 @@ describe('queryRouteTool', () => {
       });
 
       const ctx = createMockContext({ errors: queryRouteTool.errors });
-      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        stage: true,
+      });
       const result = await queryRouteTool.handler(input, ctx);
 
       expect(result.truncation_warning).toBe(
@@ -329,6 +339,7 @@ describe('queryRouteTool', () => {
         route: 'electricity/retail-sales',
         offset: 1800,
         length: 3,
+        stage: true,
       });
       const result = await queryRouteTool.handler(input, ctx);
 
@@ -359,7 +370,10 @@ describe('queryRouteTool', () => {
       });
 
       const ctx = createMockContext({ errors: queryRouteTool.errors });
-      const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        stage: true,
+      });
       const result = await queryRouteTool.handler(input, ctx);
 
       // 25,000 of 113,460 staged — the rest is genuinely unreached, so EIA's
@@ -370,6 +384,7 @@ describe('queryRouteTool', () => {
 
   it('emits an offset-past-the-end notice when total is positive but no rows came back', async () => {
     mockQuery.mockResolvedValue({
+      route: 'electricity/retail-sales',
       total: 25,
       dateFormat: 'YYYY',
       frequency: 'annual',
@@ -394,27 +409,38 @@ describe('queryRouteTool', () => {
   });
 
   it('does not emit "enable DataCanvas" advice when a bridge is present', async () => {
+    // The gap has to be real and the rows have to reach the canvas, or the
+    // branch under test is never taken: a row-less page is answered by the
+    // notice above regardless of whether a bridge exists, so asserting the
+    // absence of the advice there holds however the branch is wired.
     vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-      registerDataframe: vi.fn().mockResolvedValue(undefined),
+      registerDataframe: vi.fn().mockResolvedValue({
+        tableName: 'df_STAGED',
+        rowCount: 240,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+      }),
     } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
     mockQuery.mockResolvedValue({
-      total: 25,
-      dateFormat: 'YYYY',
-      frequency: 'annual',
-      data: [],
-      warnings: undefined,
+      ...SAMPLE_DATA_RESPONSE,
+      accumulated: {
+        rows: Array.from({ length: 240 }, (_, i) => ({ period: String(i) })),
+        capped: false,
+        cap: 25000,
+      },
     });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
     const input = queryRouteTool.input.parse({
       route: 'electricity/retail-sales',
-      offset: 9999,
+      length: 2,
+      stage: true,
     });
     const result = await queryRouteTool.handler(input, ctx);
 
     const rendered = (queryRouteTool.format!(result)[0] as { text: string }).text;
     expect(rendered).not.toContain('CANVAS_PROVIDER_TYPE');
-    expect(rendered).toContain('Reduce offset');
+    expect(rendered).toContain('240 rows staged as df_STAGED');
   });
 
   it('omits canvas_id from the output entirely', async () => {
@@ -429,7 +455,10 @@ describe('queryRouteTool', () => {
     mockQuery.mockResolvedValue(SAMPLE_DATA_RESPONSE);
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
+    const input = queryRouteTool.input.parse({
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.dataset).toBe('df_ABCDE_FGHIJ');

@@ -1,7 +1,7 @@
 /**
  * @fileoverview Tool definition for eia_dataframe_describe. Lists canvas
- * dataframes materialized by eia_query_route with provenance, expiry, row
- * count, and column schema. Reconciles stored provenance against the canvas's
+ * dataframes materialized by eia_query_route's opt-in staging path with
+ * provenance, expiry, row count, and column schema. Reconciles stored provenance against the canvas's
  * live tables before responding so the list is always current, and reports a
  * name that does not resolve as a miss against the staged set rather than as an
  * empty workspace.
@@ -15,7 +15,7 @@ import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 export const dataframeDescribeTool = tool('eia_dataframe_describe', {
   title: 'Describe EIA Dataframes',
   description:
-    'List canvas dataframes (df_<id>) materialized by eia_query_route, with provenance, expiry, row count, and column schema. Drops entries for dataframes the canvas no longer holds before responding, so the list is always current. Pass a specific name to inspect one dataframe; omit to list all active dataframes for this tenant. A name that is not staged comes back as found=false alongside the handles that are, never as an empty list. Listing is not use: only an eia_dataframe_query statement naming a dataframe extends its expiry, so a dataframe polled with this tool and never queried still lapses on schedule.',
+    'List canvas dataframes (df_<id>) materialized by eia_query_route calls that passed stage: true, with provenance, expiry, row count, and column schema. Nothing is staged until such a call runs, so an empty list on a fresh session means no query has staged yet, not that staging failed. Drops entries for dataframes the canvas no longer holds before responding, so the list is always current. Pass a specific name to inspect one dataframe; omit to list all active dataframes for this tenant. A name that is not staged comes back as found=false alongside the handles that are, never as an empty list. Listing is not use: only an eia_dataframe_query statement naming a dataframe extends its expiry, so a dataframe polled with this tool and never queried still lapses on schedule.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [

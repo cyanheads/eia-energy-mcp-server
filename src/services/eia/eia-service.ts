@@ -2,8 +2,11 @@
  * @fileoverview EIA API v2 service. Wraps api.eia.gov/v2 with retry/timeout,
  * route tree caching, per-route facet metadata caching, and Fuse.js fuzzy
  * search. Exposes browse, describe, query, and search methods consumed by MCP
- * tool handlers. `query()` also walks `offset` pages past the inline preview
- * when the caller wants a canvas-bound row set, bounded by EIA_CANVAS_MAX_ROWS.
+ * tool handlers. All three route-taking methods normalize the path first, so
+ * one route resolves the same way however it is spelled and the node map and
+ * per-route metadata cache hold a single entry for it. `query()` also walks
+ * `offset` pages past the inline preview when the caller asks for a
+ * canvas-bound row set, bounded by EIA_CANVAS_MAX_ROWS.
  * Facet values reach the search index from two directions: a bounded pass over
  * the vocabulary facets named in the route tree, and every route the caller
  * describes. Both feed the per-route metadata cache, which always holds the
@@ -145,6 +148,22 @@ class ConcurrencyGate {
       this.waiting.shift()?.();
     }
   }
+}
+
+/**
+ * Canonical spelling of a route path: no leading or trailing slash, no repeated
+ * internal ones. EIA's own docs and data browser write routes as
+ * `/v2/electricity/retail-sales/`, so those spellings reach the tools verbatim,
+ * while the node map and the per-route metadata cache are keyed on the bare
+ * form. Normalizing at the service boundary is what makes every spelling resolve
+ * against the cached tree — and what keeps one route from occupying three cache
+ * entries and costing three facet fan-outs.
+ */
+function normalizeRoutePath(path: string): string {
+  return path
+    .trim()
+    .replace(/\/{2,}/g, '/')
+    .replace(/^\/+|\/+$/g, '');
 }
 
 /** Message text for a caught value of unknown type. */
@@ -654,9 +673,11 @@ class EiaApiService {
 
   /**
    * Browse child routes at a given path. Returns list of children with leaf
-   * classification. A path the warm left incomplete is re-fetched here rather
-   * than answered from its stub, which would report no children and a leaf
-   * classification the server never established.
+   * classification. The path is normalized first, so a leading, trailing, or
+   * doubled slash resolves against the node map instead of missing it. A path
+   * the warm left incomplete is re-fetched here rather than answered from its
+   * stub, which would report no children and a leaf classification the server
+   * never established.
    */
   async browse(
     path: string | undefined,
@@ -668,7 +689,7 @@ class EiaApiService {
   }> {
     await this.ensureTreeWarmed(ctx);
 
-    const normalizedPath = path?.trim() ?? '';
+    const normalizedPath = normalizeRoutePath(path ?? '');
 
     // Check if the path itself is a leaf
     if (normalizedPath) {
@@ -715,21 +736,25 @@ class EiaApiService {
 
   /**
    * Describe a leaf route — returns full metadata including facets with values.
-   * Results are cached per-route to avoid repeat fan-out.
+   * The route is normalized first, so every spelling of one path shares a
+   * single metadata cache entry and a single facet fan-out; `meta.route` is
+   * therefore the canonical form, which is what the tool echoes back.
    */
   async describe(route: string, ctx: Context): Promise<RouteMetadata> {
-    const cached = _routeMetaCache.get(route);
+    const normalizedRoute = normalizeRoutePath(route);
+
+    const cached = _routeMetaCache.get(normalizedRoute);
     if (cached) return cached;
 
     await this.ensureTreeWarmed(ctx);
 
-    const node = route ? getNode(route) : undefined;
-    if (!node && route) {
+    const node = normalizedRoute ? getNode(normalizedRoute) : undefined;
+    if (!node && normalizedRoute) {
       // Try fetching directly from EIA in case route tree walk missed it
-      await this.fetchAndCacheMetadata(route, ctx);
-      const meta = _routeMetaCache.get(route);
+      await this.fetchAndCacheMetadata(normalizedRoute, ctx);
+      const meta = _routeMetaCache.get(normalizedRoute);
       if (!meta) {
-        throw notFound(`Route "${route}" not found in the EIA taxonomy.`, {
+        throw notFound(`Route "${normalizedRoute}" not found in the EIA taxonomy.`, {
           reason: 'route_not_found',
           recovery: {
             hint: 'Use eia_browse_routes or eia_search_routes to discover valid route paths.',
@@ -743,7 +768,7 @@ class EiaApiService {
     // nothing to say about it — the live fetch below decides instead.
     if (node && !node.incomplete && !isLeafNode(node)) {
       throw validationError(
-        `Route "${route}" is a category, not a leaf — it has no data to query.`,
+        `Route "${normalizedRoute}" is a category, not a leaf — it has no data to query.`,
         {
           reason: 'route_not_queryable',
           recovery: {
@@ -753,10 +778,10 @@ class EiaApiService {
       );
     }
 
-    await this.fetchAndCacheMetadata(route, ctx);
-    const meta = _routeMetaCache.get(route);
+    await this.fetchAndCacheMetadata(normalizedRoute, ctx);
+    const meta = _routeMetaCache.get(normalizedRoute);
     if (!meta) {
-      throw notFound(`Could not retrieve metadata for route "${route}".`, {
+      throw notFound(`Could not retrieve metadata for route "${normalizedRoute}".`, {
         reason: 'route_not_found',
       });
     }
@@ -862,7 +887,10 @@ class EiaApiService {
 
   /**
    * Fetch data from a leaf route. Returns the inline preview rows (all string
-   * values per EIA API), total count, and any top-level EIA warnings.
+   * values per EIA API), total count, the canonical `route` the query resolved
+   * to, and any top-level EIA warnings. The route is normalized first, so the
+   * cached leaf/category pre-flight and the metadata cache apply to every
+   * spelling rather than only the bare one.
    *
    * With `accumulate`, additional offset pages are fetched and returned under
    * `accumulated` for canvas registration — bounded by `EIA_CANVAS_MAX_ROWS`
@@ -884,14 +912,16 @@ class EiaApiService {
     },
     ctx: Context,
   ): Promise<DataResponse> {
+    const normalizedRoute = normalizeRoutePath(route);
+
     // Pre-flight: if the route is in the cache as a category node, fail early
     // with a typed error rather than letting the EIA API return a generic 404.
     // An incomplete node is skipped — it was never classified either way.
     await this.ensureTreeWarmed(ctx);
-    const cachedNode = getNode(route);
+    const cachedNode = getNode(normalizedRoute);
     if (cachedNode && !cachedNode.incomplete && !isLeafNode(cachedNode)) {
       throw validationError(
-        `Route "${route}" is a category, not a leaf — it has no data to query.`,
+        `Route "${normalizedRoute}" is a category, not a leaf — it has no data to query.`,
         {
           reason: 'route_not_queryable',
           recovery: {
@@ -913,10 +943,10 @@ class EiaApiService {
     // on-demand when the cache is cold (no prior eia_describe_route call).
     let columnsToRequest = opts.columns;
     if (!columnsToRequest?.length) {
-      let cached = _routeMetaCache.get(route);
+      let cached = _routeMetaCache.get(normalizedRoute);
       if (!cached) {
-        await this.fetchAndCacheMetadata(route, ctx);
-        cached = _routeMetaCache.get(route);
+        await this.fetchAndCacheMetadata(normalizedRoute, ctx);
+        cached = _routeMetaCache.get(normalizedRoute);
       }
       if (cached?.dataColumns.length) {
         columnsToRequest = cached.dataColumns.map((c) => c.id);
@@ -941,11 +971,12 @@ class EiaApiService {
     const offset = opts.offset ?? 0;
     const length = opts.length ?? 100;
 
-    const first = await this.fetchDataPage(route, params, offset, length, ctx);
+    const first = await this.fetchDataPage(normalizedRoute, params, offset, length, ctx);
     const total = parseInt(first.response.total ?? '0', 10);
     const data: DataRow[] = first.response.data ?? [];
 
     const result: DataResponse = {
+      route: normalizedRoute,
       total,
       dateFormat: first.response.dateFormat ?? '',
       frequency: first.response.frequency ?? opts.frequency ?? '',
@@ -955,7 +986,7 @@ class EiaApiService {
 
     if (opts.accumulate && data.length > 0 && offset + data.length < total) {
       result.accumulated = await this.accumulatePages(
-        route,
+        normalizedRoute,
         params,
         { offset, total, first: data },
         ctx,

@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/eia-energy-mcp-server",
     "source": "github"
   },
-  "version": "0.3.8",
+  "version": "0.4.0",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eia-energy-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.8",
+      "version": "0.4.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -46,14 +46,14 @@
         },
         {
           "name": "EIA_DATAFRAME_DROP_ENABLED",
-          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup.",
+          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup. Also requires CANVAS_PROVIDER_TYPE=duckdb.",
           "format": "string",
           "isRequired": false,
           "default": "false"
         },
         {
           "name": "EIA_CANVAS_MAX_ROWS",
-          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging. Five requests at EIA's 5000-row-per-request ceiling.",
+          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging on a stage: true call. Five requests at EIA's 5000-row-per-request ceiling.",
           "format": "string",
           "isRequired": false,
           "default": "25000"
@@ -67,7 +67,7 @@
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable DataCanvas spillover for large query result sets (Node.js only).",
+          "description": "Set to 'duckdb' to enable DataCanvas (Node.js only). Registers the three eia_dataframe_* tools and lets eia_query_route stage rows when called with stage: true.",
           "format": "string",
           "isRequired": false
         },
@@ -88,7 +88,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eia-energy-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.8",
+      "version": "0.4.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -115,14 +115,14 @@
         },
         {
           "name": "EIA_DATAFRAME_DROP_ENABLED",
-          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup.",
+          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup. Also requires CANVAS_PROVIDER_TYPE=duckdb.",
           "format": "string",
           "isRequired": false,
           "default": "false"
         },
         {
           "name": "EIA_CANVAS_MAX_ROWS",
-          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging. Five requests at EIA's 5000-row-per-request ceiling.",
+          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging on a stage: true call. Five requests at EIA's 5000-row-per-request ceiling.",
           "format": "string",
           "isRequired": false,
           "default": "25000"
@@ -136,7 +136,7 @@
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable DataCanvas spillover for large query result sets (Node.js only).",
+          "description": "Set to 'duckdb' to enable DataCanvas (Node.js only). Registers the three eia_dataframe_* tools and lets eia_query_route stage rows when called with stage: true.",
           "format": "string",
           "isRequired": false
         },

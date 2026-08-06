@@ -20,7 +20,9 @@ export const browseRoutesTool = tool('eia_browse_routes', {
     path: z
       .string()
       .optional()
-      .describe('Route path to browse (e.g. "electricity", "petroleum/pri"). Omit for root.'),
+      .describe(
+        'Route path to browse (e.g. "electricity", "petroleum/pri"). Omit for root. Leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling like "/electricity/retail-sales/" resolves to the same route.',
+      ),
   }),
 
   output: z.object({

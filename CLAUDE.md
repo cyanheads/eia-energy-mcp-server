@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** @cyanheads/eia-energy-mcp-server
-**Version:** 0.3.8
+**Version:** 0.4.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.1`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 
@@ -216,6 +216,8 @@ src/
 
 ## EIA-Specific Conventions
 
+**Route paths are normalized at the service boundary.** `browse()`, `describe()`, and `query()` all strip leading/trailing slashes and collapse internal runs before resolving, so EIA's own `/v2/electricity/retail-sales/` spelling resolves like the bare form, one metadata-cache entry serves every spelling, and the cached leaf/category pre-flight applies to all of them. The canonical value travels back on `RouteMetadata.route` and `DataResponse.route` — tools echo that, never `input.route`.
+
 **Two-phase workflow:** Discovery (`eia_browse_routes` / `eia_search_routes` → `eia_describe_route`) must precede data retrieval (`eia_query_route`). Facet IDs and valid values are not embedded in route metadata — they require separate `GET /v2/{route}/facet/{facetId}` calls. Always describe the route before querying it.
 
 **In-process caches:**
@@ -232,7 +234,7 @@ src/
 
 **Retry / rate limits:** Wrap fetch + parse in `withRetry`. DEMO_KEY hits limits quickly; production keys have higher caps. Detect EIA's `OVER_RATE_LIMIT` response and classify as `ServiceUnavailable` (retryable).
 
-**DataCanvas:** Opt-in via `CANVAS_PROVIDER_TYPE=duckdb`. Check `ctx.core.canvas?` at runtime; degrade gracefully to preview-only when absent. When total > length, `EiaApiService.query()` walks `offset` pages past the inline preview — each capped at EIA's 5,000-row-per-request ceiling, the cumulative set capped at `EIA_CANVAS_MAX_ROWS` (default 25,000) — and the accumulated rows register as a `df_<id>` table returned in `dataset`. The inline preview stays at the caller's `length`. There is no `canvas_id`: `acquireSharedCanvas` routes every registration to one canvas per tenant, so tables cross-join by name with nothing to thread. Column names are sanitized to the canvas identifier shape before registration — EIA's hyphenated `{col}-units` companions become `{col}_units` in the staged table (the inline preview keeps the hyphenated names); query the sanitized names, which `eia_dataframe_describe` reports.
+**DataCanvas:** Opt-in via `CANVAS_PROVIDER_TYPE=duckdb`. The three `eia_dataframe_*` tools are wrapped in `disabledTool()` in `createApp()` when it is unset — `createApp` builds `tools[]` before `setup(core)` runs, so the gate reads `process.env.CANVAS_PROVIDER_TYPE` via `isCanvasEnabled()` rather than `core.canvas` or `ServerConfigSchema` (core config never merges with server config). Staging is also per-call: `eia_query_route` takes `stage: boolean` (default `false`) and registers nothing without it, so a preview costs one upstream request. When `stage: true`, a canvas is present, and total > length, `EiaApiService.query()` walks `offset` pages past the inline preview — each capped at EIA's 5,000-row-per-request ceiling, the cumulative set capped at `EIA_CANVAS_MAX_ROWS` (default 25,000) — and the accumulated rows register as a `df_<id>` table returned in `dataset`. The inline preview stays at the caller's `length`. There is no `canvas_id`: `acquireSharedCanvas` routes every registration to one canvas per tenant, so tables cross-join by name with nothing to thread. Column names are sanitized to the canvas identifier shape before registration — EIA's hyphenated `{col}-units` companions become `{col}_units` in the staged table (the inline preview keeps the hyphenated names); query the sanitized names, which `eia_dataframe_describe` reports.
 
 **EIA warnings:** returned at the TOP level of the data payload, a sibling of `response` — `response.warnings` is always null. Each entry is `{ warning, description }`, not a string.
 

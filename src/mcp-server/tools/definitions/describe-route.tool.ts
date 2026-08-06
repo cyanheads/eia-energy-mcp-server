@@ -67,7 +67,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .min(1)
       .describe(
-        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes.',
+        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling like "/electricity/retail-sales/" resolves to the same route.',
       ),
     facet: z
       .string()
