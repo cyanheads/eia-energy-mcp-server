@@ -11,6 +11,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
+import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
 import {
   _resetEiaApiService,
   getEiaApiService,
@@ -802,6 +803,199 @@ describe('EiaApiService — facet values in the search index', () => {
     expect(meta.facets[0]?.values).toHaveLength(400);
     // But an opaque-identifier facet that size stays out of the index.
     expect(getIndexSize()).toBe(before);
+  });
+});
+
+/**
+ * EIA's two null shapes in `/facet/{id}` mean different things: a null `id` is
+ * not a filter value, a missing `name` is only a missing label. These run the
+ * real service under `eia_describe_route` — the caller-visible surface — so the
+ * assertions cover the returned window, the output contract, and the rendered
+ * line rather than the service helper alone.
+ */
+describe('EiaApiService.describe — facet values EIA sends without a name', () => {
+  const METERS = 'electricity/state-electricity-profiles/meters';
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+    seedRouteCache();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  /** Leaf metadata carrying one facet, whose values the caller supplies. */
+  function facetFixture(route: string, facetId: string, values: unknown[]) {
+    return {
+      [route]: {
+        response: {
+          id: 'electricity',
+          name: 'Meters',
+          description: 'Advanced metering counts',
+          facets: [{ id: facetId, description: 'Meter Technology' }],
+          frequency: [],
+          data: { meters: { alias: 'Meter Count', units: 'number of meters' } },
+        },
+      },
+      [`${route}/facet/${facetId}`]: {
+        response: { totalFacets: values.length, facets: values },
+      },
+    };
+  }
+
+  /** Drive the real service through the tool the way a client reaches it. */
+  async function describeThroughTool(route: string, facetId?: string) {
+    const ctx = createMockContext({ errors: describeRouteTool.errors });
+    const input = describeRouteTool.input.parse({ route, ...(facetId && { facet: facetId }) });
+    const result = await describeRouteTool.handler(input, ctx);
+    return {
+      result,
+      // The schema declares id/name as non-null strings — #12's failure mode.
+      parsed: describeRouteTool.output.parse(result),
+      text: (describeRouteTool.format!(result)[0] as { text: string }).text,
+    };
+  }
+
+  /** `technology` on the meters route: every value omits `name`, all carry an alias. */
+  const TECHNOLOGY_VALUES = [
+    { id: 'Automatic Meter Reading', alias: 'Automated Meter Reading (AMR)' },
+    { id: 'Standard meters', alias: 'Standard (non-AMR/AMI) Meters' },
+    { id: 'Advanced Meter Infrastructure', alias: 'Advanced Metering Infrastructure (AMI)' },
+    { id: 'All meters', alias: 'All meters' },
+  ];
+
+  it('keeps a facet whose values all omit name, labelling each from its alias', async () => {
+    stubApiPaths(facetFixture(METERS, 'technology', TECHNOLOGY_VALUES));
+
+    const { result, text } = await describeThroughTool(METERS);
+
+    const technology = result.facets[0];
+    expect(technology?.id).toBe('technology');
+    expect(technology?.value_count).toBe(4);
+    expect(technology?.values).toEqual([
+      {
+        id: 'Automatic Meter Reading',
+        name: 'Automated Meter Reading (AMR)',
+        alias: 'Automated Meter Reading (AMR)',
+      },
+      {
+        id: 'Standard meters',
+        name: 'Standard (non-AMR/AMI) Meters',
+        alias: 'Standard (non-AMR/AMI) Meters',
+      },
+      {
+        id: 'Advanced Meter Infrastructure',
+        name: 'Advanced Metering Infrastructure (AMI)',
+        alias: 'Advanced Metering Infrastructure (AMI)',
+      },
+      { id: 'All meters', name: 'All meters', alias: 'All meters' },
+    ]);
+
+    // The rendered line names the filter vocabulary rather than "(0 values)",
+    // and the alias-suppression rule keeps the label from printing twice.
+    expect(text).toContain('**technology** (4 values)');
+    expect(text).toContain('Advanced Meter Infrastructure=Advanced Metering Infrastructure (AMI),');
+    expect(text).not.toContain('(AMI) (Advanced Metering Infrastructure (AMI))');
+  });
+
+  it('labels a value from its own name when EIA supplies both a name and an alias', async () => {
+    // Most of the taxonomy carries both, and the alias restates the pair rather
+    // than replacing the name. Taking the alias first still renders a plausible
+    // line, so the order is only pinned by a value whose two labels differ.
+    stubApiPaths(
+      facetFixture(METERS, 'technology', [
+        { id: 'IN', name: 'Indiana', alias: '(IN) Indiana' },
+        { id: 'MAT', name: 'Middle Atlantic', alias: 'Region: (MAT) Middle Atlantic' },
+      ]),
+    );
+
+    const { result, text } = await describeThroughTool(METERS);
+
+    expect(result.facets[0]?.values).toEqual([
+      { id: 'IN', name: 'Indiana', alias: '(IN) Indiana' },
+      { id: 'MAT', name: 'Middle Atlantic', alias: 'Region: (MAT) Middle Atlantic' },
+    ]);
+    expect(text).toContain('IN=Indiana, MAT=Middle Atlantic (Region: (MAT) Middle Atlantic)');
+  });
+
+  it('drops a value with no id, keeping the ones that can filter', async () => {
+    // The balancing-authority shape: a null id with a name is still unusable.
+    stubApiPaths(
+      facetFixture(METERS, 'technology', [
+        { id: null, name: 'Hawaiian Electric Co Inc', alias: '() Hawaiian Electric Co Inc' },
+        { id: 'PJM', name: 'PJM Interconnection, LLC', alias: 'PJM: PJM Interconnection, LLC' },
+      ]),
+    );
+
+    const { result } = await describeThroughTool(METERS);
+
+    expect(result.facets[0]?.value_count).toBe(1);
+    expect(result.facets[0]?.values.map((v) => v.id)).toEqual(['PJM']);
+  });
+
+  it('drops a value whose id and name are both null', async () => {
+    stubApiPaths(
+      facetFixture(METERS, 'technology', [
+        { id: 'MBBL', name: 'millions barrels' },
+        { id: null, name: null },
+      ]),
+    );
+
+    const { result } = await describeThroughTool(METERS);
+
+    expect(result.facets[0]?.values).toEqual([{ id: 'MBBL', name: 'millions barrels' }]);
+  });
+
+  it('falls back to the id when EIA supplies neither a name nor an alias', async () => {
+    stubApiPaths(facetFixture(METERS, 'technology', [{ id: 'AMI' }, { id: 'AMR', name: null }]));
+
+    const { result, text } = await describeThroughTool(METERS);
+
+    expect(result.facets[0]?.values).toEqual([
+      { id: 'AMI', name: 'AMI' },
+      { id: 'AMR', name: 'AMR' },
+    ]);
+    expect(text).toContain('AMI=AMI, AMR=AMR');
+  });
+
+  it('describes an international-shaped facet without a schema failure (#12)', async () => {
+    const ROUTE = 'international';
+    stubApiPaths(
+      facetFixture(ROUTE, 'dataFlagId', [
+        { id: '1', name: 'Data are unavailable (permanently)' },
+        { id: '11', name: 'Data row has been initialized' },
+        { id: null, name: null },
+      ]),
+    );
+
+    const { result, parsed } = await describeThroughTool(ROUTE);
+
+    // The null pair that used to throw `expected string, received null` is gone,
+    // and everything that reaches the schema is a string.
+    expect(parsed.facets[0]?.value_count).toBe(2);
+    expect(result.facets[0]?.values.map((v) => v.id)).toEqual(['1', '11']);
+  });
+
+  it('indexes an alias-labelled value under the id that filters', async () => {
+    stubApiPaths(facetFixture(METERS, 'technology', TECHNOLOGY_VALUES));
+    const before = getIndexSize();
+
+    await describeThroughTool(METERS);
+
+    expect(getIndexSize()).toBe(before + 4);
+    const [hit] = searchRoutes('advanced metering infrastructure', 5);
+    expect(hit?.entry.route).toBe(METERS);
+    expect(hit?.entry.filter_hint).toEqual({ technology: 'Advanced Meter Infrastructure' });
   });
 });
 

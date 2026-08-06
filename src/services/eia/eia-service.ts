@@ -56,6 +56,7 @@ import type {
   Facet,
   RawFacetMeta,
   RawFacetResponse,
+  RawFacetValue,
   RawFrequency,
   RawRouteNode,
   RouteEntry,
@@ -563,10 +564,19 @@ class EiaApiService {
   }
 
   /**
-   * Fetch one `/facet/{id}` endpoint and normalize it to a `Facet`. EIA returns
-   * null `id`/`name` for some values (e.g. the international route); those carry
-   * no usable filter value and are dropped. Throws on transport failure — each
-   * caller decides what a single failing facet endpoint means for it.
+   * Fetch one `/facet/{id}` endpoint and normalize it to a `Facet`. Throws on
+   * transport failure — each caller decides what a single failing facet
+   * endpoint means for it.
+   *
+   * EIA answers with a null `id` on some values and a null-or-absent `name` on
+   * others, and the two mean different things. The `id` is the filter value, so
+   * a value without one is unusable and is dropped. A missing `name` costs
+   * nothing that way — the `id` still filters — and EIA carries the label in
+   * `alias` on exactly those values, so `name` falls back to the alias and then
+   * to the `id`. Dropping on either field instead hid whole facets: every value
+   * of `electricity/state-electricity-profiles/meters`'s `technology` facet
+   * omits `name`, so the facet read as having none. The fallback is also what
+   * keeps the non-null `id`/`name` contract the describe output schema declares.
    */
   private async fetchFacet(route: string, meta: RawFacetMeta, ctx: Context): Promise<Facet> {
     const resp = await this.fetchJson<{ response: RawFacetResponse }>(
@@ -578,8 +588,12 @@ class EiaApiService {
       id: meta.id,
       description: meta.description,
       values: (resp?.response?.facets ?? [])
-        .filter((v) => v.id != null && v.name != null)
-        .map((v) => ({ id: v.id, name: v.name, ...(v.alias !== undefined && { alias: v.alias }) })),
+        .filter((v): v is RawFacetValue & { id: string } => v.id != null)
+        .map((v) => ({
+          id: v.id,
+          name: v.name ?? v.alias ?? v.id,
+          ...(v.alias !== undefined && { alias: v.alias }),
+        })),
     };
   }
 

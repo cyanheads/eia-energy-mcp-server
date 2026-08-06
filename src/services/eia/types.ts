@@ -61,11 +61,19 @@ export interface RawFacetMeta {
   id: string;
 }
 
-/** Individual facet value from /v2/{route}/facet/{facetId}. */
+/**
+ * Individual facet value from /v2/{route}/facet/{facetId}, modelled as EIA
+ * actually answers rather than as the normalized `Facet` value it becomes.
+ * `id` arrives null on some values (`international`'s `dataFlagId`,
+ * `electricity/operating-generator-capacity`'s `balancing_authority_code`), and
+ * `name` is either null or absent on others — every value of
+ * `electricity/state-electricity-profiles/meters`'s `technology` facet omits it
+ * and carries the label in `alias` instead.
+ */
 export interface RawFacetValue {
   alias?: string;
-  id: string;
-  name: string;
+  id: string | null;
+  name?: string | null;
 }
 
 /** Response from /v2/{route}/facet/{facetId}. */
