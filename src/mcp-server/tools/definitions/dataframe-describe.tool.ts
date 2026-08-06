@@ -164,7 +164,13 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
       lines.push(
         `- Created: ${df.created_at}${df.expires_at ? ` — Expires: ${df.expires_at}` : ''}`,
       );
-      const paramEntries = Object.entries(df.query_params);
+      /**
+       * `structuredContent` drops undefined-valued keys on serialization, so
+       * rendering them here would put parameters in `content[]` that the
+       * structured surface never reported — and `JSON.stringify(undefined)`
+       * renders them as the literal `undefined` rather than as a value.
+       */
+      const paramEntries = Object.entries(df.query_params).filter(([, v]) => v !== undefined);
       if (paramEntries.length > 0) {
         const params = paramEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
         lines.push(`- Params: ${params}`);

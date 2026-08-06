@@ -113,5 +113,60 @@ describe('dataframeDescribeTool', () => {
       expect(text).toContain('nullable=true');
       expect(text).toContain('PATCPUS');
     });
+
+    // #44 — the rendered params line must report the same keys
+    // structuredContent does, and structuredContent drops undefined on
+    // serialization.
+    it('renders only the params that carry a value', () => {
+      const now = new Date().toISOString();
+      const blocks = dataframeDescribeTool.format!({
+        active_names: ['df_SPARSE'],
+        dataframes: [
+          {
+            name: 'df_SPARSE',
+            source_tool: 'eia_query_route',
+            query_params: {
+              route: 'electricity/retail-sales',
+              filters: { stateid: 'WA' },
+              columns: undefined,
+              start: undefined,
+              end: undefined,
+              offset: 0,
+              length: 3,
+            },
+            created_at: now,
+            expires_at: now,
+            row_count: 3,
+            truncated: false,
+            column_schema: [],
+          },
+        ],
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain(
+        '- Params: route="electricity/retail-sales", filters={"stateid":"WA"}, offset=0, length=3',
+      );
+      expect(text).not.toContain('undefined');
+    });
+
+    it('omits the params line when every param is undefined', () => {
+      const now = new Date().toISOString();
+      const blocks = dataframeDescribeTool.format!({
+        active_names: ['df_EMPTY_PARAMS'],
+        dataframes: [
+          {
+            name: 'df_EMPTY_PARAMS',
+            source_tool: 'eia_query_route',
+            query_params: { columns: undefined },
+            created_at: now,
+            expires_at: now,
+            row_count: 1,
+            truncated: false,
+            column_schema: [],
+          },
+        ],
+      });
+      expect((blocks[0] as { text: string }).text).not.toContain('- Params:');
+    });
   });
 });
