@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-08-25 · ⚠️ Breaking
+
+@cyanheads/mcp-ts-core ^0.12.3: tool inputs are now strict — an undeclared top-level argument is rejected by name instead of silently dropped; Bun pinned to 1.4.0; Dockerfile gains a HEALTHCHECK and an image version label
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-08-05 · ⚠️ Breaking
 
 eia_query_route staging now opt-in via stage: true (was automatic); canvas-only dataframe tools gated at registration when no canvas is configured; route paths normalized across all three route tools

@@ -1,11 +1,9 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-08-06 05:59:36
+Generated on: 2026-08-25 07:07:23
 
 ```text
 eia-energy-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ eia-energy-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
@@ -27,7 +27,6 @@ eia-energy-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   └── template.md
-├── data/
 ├── docs/
 │   ├── design.md
 │   └── idea.md
@@ -181,7 +180,8 @@ eia-energy-mcp-server/
 │   │   ├── query-route-extra.tool.test.ts
 │   │   ├── query-route.tool.test.ts
 │   │   ├── search-routes-extra.tool.test.ts
-│   │   └── search-routes.tool.test.ts
+│   │   ├── search-routes.tool.test.ts
+│   │   └── strict-inputs.tool.test.ts
 │   └── index.test.ts
 ├── .dockerignore
 ├── .env.example
