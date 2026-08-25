@@ -338,6 +338,7 @@ class EiaApiService {
       {
         operation: 'EiaApiService.fetchJson',
         baseDelayMs: 1000,
+        context: ctx,
         signal: ctx.signal,
       },
     );

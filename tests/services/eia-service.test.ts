@@ -8,6 +8,7 @@
  * @module tests/services/eia-service.test
  */
 
+import type { MockContextLogger } from '@cyanheads/mcp-ts-core/testing';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
@@ -105,6 +106,21 @@ function stubDataEndpoint(options: {
   });
   vi.stubGlobal('fetch', fetchMock);
   return { calls, fetchMock };
+}
+
+/** The key `beforeEach` stubs into `EIA_API_KEY`, asserted against by the log tests. */
+const API_KEY = 'test-key';
+
+/** Every `ctx.log` call the mock logger recorded, in order. */
+function logCalls(ctx: { log: unknown }): Array<{ level: string; msg: string; data?: unknown }> {
+  return (ctx.log as MockContextLogger).calls;
+}
+
+/** Every recorded log call flattened to one string — message and metadata alike. */
+function loggedText(ctx: { log: unknown }): string {
+  return logCalls(ctx)
+    .map((call) => `${call.msg} ${JSON.stringify(call.data ?? {})}`)
+    .join('\n');
 }
 
 /** Seed the route tree so query()'s pre-flight resolves without network calls. */
@@ -285,6 +301,52 @@ describe('EiaApiService.query', () => {
       expect(result.accumulated?.rows).toHaveLength(5100);
       // Not the cap — the note must not blame EIA_CANVAS_MAX_ROWS for this.
       expect(result.accumulated?.capped).toBe(false);
+    });
+
+    /**
+     * `ctx.log` is dual-sink as of mcp-ts-core 0.12.0 — every level also emits
+     * `notifications/message` to the client. The API key rides in every request
+     * URL as `api_key=`, so a log line that carried a URL would hand it to the
+     * caller. These pin that no service log line does.
+     */
+    it('keeps the API key out of every log line on the happy path', async () => {
+      vi.stubEnv('EIA_CANVAS_MAX_ROWS', '25000');
+      _resetServerConfig();
+      stubDataEndpoint({ total: 300 });
+      const ctx = createMockContext();
+
+      await getEiaApiService().query(
+        LEAF,
+        { accumulate: true, columns: ['price'], length: 100, offset: 0 },
+        ctx,
+      );
+
+      const emitted = loggedText(ctx);
+      expect(emitted).not.toBe('');
+      expect(emitted).not.toContain(API_KEY);
+      expect(emitted).not.toContain('api_key');
+    });
+
+    it('keeps the API key out of the log line an upstream failure produces', async () => {
+      vi.stubEnv('EIA_CANVAS_MAX_ROWS', '25000');
+      _resetServerConfig();
+      stubDataEndpoint({ total: 20000, failFromCall: 3 });
+      const ctx = createMockContext();
+
+      await getEiaApiService().query(
+        LEAF,
+        { accumulate: true, columns: ['price'], length: 100, offset: 0 },
+        ctx,
+      );
+
+      const stoppedEarly = logCalls(ctx).filter(
+        (call) => call.msg === 'EIA canvas accumulation stopped early',
+      );
+      expect(stoppedEarly).toHaveLength(1);
+
+      const emitted = loggedText(ctx);
+      expect(emitted).not.toContain(API_KEY);
+      expect(emitted).not.toContain('api_key');
     });
 
     it('propagates the failure when the caller aborted mid-accumulation', async () => {
