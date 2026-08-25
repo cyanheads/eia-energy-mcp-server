@@ -257,13 +257,18 @@ describe('queryRouteTool — additional coverage', () => {
   // Canvas: accumulation replaces the dropped canvas_id threading
   // ------------------------------------------------------------------
 
-  it('strips a canvas_id input — the parameter no longer exists', () => {
-    const parsed = queryRouteTool.input.parse({
+  it('rejects a canvas_id input by name — the parameter no longer exists', () => {
+    expect(Object.keys(queryRouteTool.input.shape)).not.toContain('canvas_id');
+
+    const result = queryRouteTool.input.safeParse({
       route: 'electricity/retail-sales',
       canvas_id: 'df_EXISTING_CANVAS',
     });
-    expect(parsed).not.toHaveProperty('canvas_id');
-    expect(Object.keys(queryRouteTool.input.shape)).not.toContain('canvas_id');
+
+    expect(result.success).toBe(false);
+    const issue = result.error?.issues[0];
+    expect(issue?.code).toBe('unrecognized_keys');
+    expect((issue as { keys?: readonly string[] } | undefined)?.keys).toEqual(['canvas_id']);
   });
 
   it('requests accumulation only when the caller stages and a canvas bridge is present', async () => {
