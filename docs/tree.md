@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-08-25 07:07:23
+Generated on: 2026-09-19 18:43:30
 
 ```text
 eia-energy-mcp-server/
@@ -14,6 +14,8 @@ eia-energy-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── workflows/
+│   │   └── codeql.yml
 │   ├── CODE_OF_CONDUCT.md
 │   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
@@ -30,26 +32,7 @@ eia-energy-mcp-server/
 ├── docs/
 │   ├── design.md
 │   └── idea.md
-├── scripts/
-│   ├── build-changelog.ts
-│   ├── build.ts
-│   ├── check-dependency-specifiers.ts
-│   ├── check-docs-sync.ts
-│   ├── check-framework-antipatterns.ts
-│   ├── check-skill-versions.ts
-│   ├── check-skills-sync.ts
-│   ├── clean-mcpb.ts
-│   ├── clean.ts
-│   ├── devcheck.ts
-│   ├── eval-search.ts
-│   ├── lint-mcp.ts
-│   ├── lint-packaging.ts
-│   ├── list-skills.ts
-│   ├── release-github.ts
-│   ├── search-battery.ts
-│   ├── split-changelog.ts
-│   └── tree.ts
-├── skills/
+├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
 │   ├── add-prompt/
@@ -120,6 +103,8 @@ eia-energy-mcp-server/
 │   │   └── SKILL.md
 │   ├── release-and-publish/
 │   │   └── SKILL.md
+│   ├── release-pr-review/
+│   │   └── SKILL.md
 │   ├── report-issue-framework/
 │   │   └── SKILL.md
 │   ├── report-issue-local/
@@ -134,6 +119,25 @@ eia-energy-mcp-server/
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
+├── scripts/
+│   ├── build-changelog.ts
+│   ├── build.ts
+│   ├── check-dependency-specifiers.ts
+│   ├── check-docs-sync.ts
+│   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
+│   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
+│   ├── clean.ts
+│   ├── devcheck.ts
+│   ├── eval-search.ts
+│   ├── lint-mcp.ts
+│   ├── lint-packaging.ts
+│   ├── list-skills.ts
+│   ├── release-github.ts
+│   ├── search-battery.ts
+│   ├── split-changelog.ts
+│   └── tree.ts
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -143,14 +147,15 @@ eia-energy-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── browse-routes.tool.ts
-│   │           ├── dataframe-describe.tool.ts
-│   │           ├── dataframe-drop.tool.ts
-│   │           ├── dataframe-query.tool.ts
-│   │           ├── describe-route.tool.ts
-│   │           ├── query-route.tool.ts
-│   │           └── search-routes.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── browse-routes.tool.ts
+│   │       │   ├── dataframe-describe.tool.ts
+│   │       │   ├── dataframe-drop.tool.ts
+│   │       │   ├── dataframe-query.tool.ts
+│   │       │   ├── describe-route.tool.ts
+│   │       │   ├── query-route.tool.ts
+│   │       │   └── search-routes.tool.ts
+│   │       └── literal-table-cell.ts
 │   ├── services/
 │   │   ├── canvas-bridge/
 │   │   │   └── canvas-bridge.ts
@@ -165,11 +170,13 @@ eia-energy-mcp-server/
 │   ├── services/
 │   │   ├── canvas-bridge.test.ts
 │   │   ├── eia-service.test.ts
+│   │   ├── http-classification.test.ts
 │   │   ├── normalize-description.test.ts
 │   │   └── route-cache.test.ts
 │   ├── tools/
 │   │   ├── browse-routes-extra.tool.test.ts
 │   │   ├── browse-routes.tool.test.ts
+│   │   ├── canvas-execution.tool.test.ts
 │   │   ├── dataframe-describe-extra.tool.test.ts
 │   │   ├── dataframe-describe.tool.test.ts
 │   │   ├── dataframe-drop.tool.test.ts
@@ -177,8 +184,10 @@ eia-energy-mcp-server/
 │   │   ├── dataframe-query.tool.test.ts
 │   │   ├── describe-route-extra.tool.test.ts
 │   │   ├── describe-route.tool.test.ts
+│   │   ├── literal-tables.tool.test.ts
 │   │   ├── query-route-extra.tool.test.ts
 │   │   ├── query-route.tool.test.ts
+│   │   ├── route-aliases.tool.test.ts
 │   │   ├── search-routes-extra.tool.test.ts
 │   │   ├── search-routes.tool.test.ts
 │   │   └── strict-inputs.tool.test.ts
@@ -188,6 +197,7 @@ eia-energy-mcp-server/
 ├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
+├── AGENTS.md
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml

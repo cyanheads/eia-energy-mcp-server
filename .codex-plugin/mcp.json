@@ -3,8 +3,8 @@
     "command": "npx",
     "args": ["-y", "@cyanheads/eia-energy-mcp-server"],
     "env": {
-      "MCP_TRANSPORT_TYPE": "stdio",
-      "EIA_API_KEY": ""
-    }
+      "MCP_TRANSPORT_TYPE": "stdio"
+    },
+    "env_vars": ["EIA_API_KEY"]
   }
 }
