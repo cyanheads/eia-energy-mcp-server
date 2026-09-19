@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-09-19 · ⚠️ Breaking · 🛡️ Security
 
-Route aliases accept both EIA path spellings without changing advertised schemas, literal table values retain their text safely, and @cyanheads/mcp-ts-core 0.13.6 adds current validation and recovery behavior.
+Route aliases accept both EIA path spellings without changing advertised schemas, literal table values retain their text safely, and the server adopts framework validation and recovery updates.
 
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-08-25 · ⚠️ Breaking
 
