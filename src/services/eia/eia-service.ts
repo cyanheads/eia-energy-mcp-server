@@ -27,12 +27,18 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import {
+  JsonRpcErrorCode,
   McpError,
   notFound,
   serviceUnavailable,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import { withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  createPacer,
+  httpErrorFromResponse,
+  type Pacer,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import {
   addEntriesToIndex,
@@ -117,37 +123,6 @@ function raceDeadline(promise: Promise<void>, deadline: number): Promise<boolean
     const timer = setTimeout(() => resolve(false), remaining);
     promise.then(() => resolve(true), reject).finally(() => clearTimeout(timer));
   });
-}
-
-/**
- * Caps how many fetches run at once across a whole recursive tree build. A
- * shared gate rather than a per-level `Promise.all` bound, because a node's
- * children are fetched from inside its own task — the recursion would otherwise
- * multiply each level's width.
- *
- * That same shape is why a slot must cover the fetch and nothing more. Hold one
- * across the recursion and the build wedges as soon as every slot belongs to a
- * parent waiting on a child that can never acquire one; `tests/services/
- * eia-service.test.ts` builds a tree wide enough to prove it does not.
- */
-class ConcurrencyGate {
-  private active = 0;
-  private readonly waiting: Array<() => void> = [];
-
-  constructor(private readonly limit: number) {}
-
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.active >= this.limit) {
-      await new Promise<void>((resolve) => this.waiting.push(resolve));
-    }
-    this.active++;
-    try {
-      return await fn();
-    } finally {
-      this.active--;
-      this.waiting.shift()?.();
-    }
-  }
 }
 
 /**
@@ -300,18 +275,14 @@ class EiaApiService {
             ? `EIA API error: ${upstreamMessage}`
             : `EIA API returned HTTP ${response.status}.`;
 
-          if (response.status === 404) {
-            // 404s are definitive — NotFound code is not transient, withRetry won't retry
-            throw notFound(detail, { status: response.status });
-          }
-
-          if (response.status === 400) {
-            // 400s are definitive — ValidationError code is not transient, withRetry won't retry
-            throw validationError(detail, { status: response.status });
-          }
-
-          // 5xx and other status codes — transient, eligible for retry
-          throw serviceUnavailable(detail, { status: response.status });
+          const error = await httpErrorFromResponse(response, {
+            service: 'EIA',
+            captureBody: false,
+            codeOverride: (status) =>
+              status === 400 ? JsonRpcErrorCode.ValidationError : undefined,
+          });
+          error.message = detail;
+          throw error;
         }
 
         let parsed: unknown;
@@ -423,11 +394,8 @@ class EiaApiService {
       throw serviceUnavailable('EIA root endpoint returned no routes.');
     }
 
-    let tree = await this.buildRouteTree(
-      topLevelNodes,
-      new ConcurrencyGate(TREE_BUILD_CONCURRENCY),
-      ctx,
-    );
+    using gate = createPacer({ name: 'eia-tree', maxConcurrent: TREE_BUILD_CONCURRENCY });
+    let tree = await this.buildRouteTree(topLevelNodes, gate, ctx);
 
     // What the pass above misses is EIA rate-limiting the burst it is itself
     // making, so retrying inside it only adds to the pressure. Sweep once the
@@ -436,7 +404,8 @@ class EiaApiService {
     const missed = incompletePaths(tree);
     if (missed.length > 0) {
       ctx.log.info('Re-fetching route metadata the tree build could not reach', { routes: missed });
-      tree = await this.buildRouteTree(tree, new ConcurrencyGate(1), ctx);
+      using repairGate = createPacer({ name: 'eia-tree-repair', maxConcurrent: 1 });
+      tree = await this.buildRouteTree(tree, repairGate, ctx);
     }
 
     initRouteCache(tree, []);
@@ -473,7 +442,7 @@ class EiaApiService {
 
   private async buildRouteTree(
     nodes: RawRouteNode[],
-    gate: ConcurrencyGate,
+    gate: Pacer,
     ctx: Context,
     depth = 0,
     parentPath = '',
@@ -501,8 +470,9 @@ class EiaApiService {
         // both the real children and the fact that anything went wrong.
         let fetched: RawRouteNode | undefined;
         try {
-          const resp = await gate.run(() =>
-            this.fetchJson<{ response: RawRouteNode }>(nodePath, {}, ctx),
+          const resp = await gate.run(
+            () => this.fetchJson<{ response: RawRouteNode }>(nodePath, {}, ctx),
+            { signal: ctx.signal },
           );
           fetched = resp?.response;
         } catch (err) {
@@ -552,9 +522,10 @@ class EiaApiService {
 
     ctx.log.info('Re-fetching a route left incomplete by the warm', { route: path });
     const parentPath = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+    using gate = createPacer({ name: 'eia-node-repair', maxConcurrent: TREE_BUILD_CONCURRENCY });
     const [repaired] = await this.buildRouteTree(
       [stub],
-      new ConcurrencyGate(TREE_BUILD_CONCURRENCY),
+      gate,
       ctx,
       path.split('/').length - 1,
       parentPath,
@@ -642,24 +613,27 @@ class EiaApiService {
     const targets = listVocabularyFacets();
     if (targets.length === 0) return 0;
 
-    const gate = new ConcurrencyGate(FACET_INDEX_CONCURRENCY);
+    using gate = createPacer({ name: 'eia-facet-index', maxConcurrent: FACET_INDEX_CONCURRENCY });
     let indexed = 0;
     let failed = 0;
     await Promise.all(
       targets.map(({ route, facetId, description }) =>
-        gate.run(async () => {
-          try {
-            const facet = await this.fetchFacet(route, { id: facetId, description }, ctx);
-            indexed += indexFacetValues(route, [facet]);
-          } catch (err) {
-            failed++;
-            ctx.log.warning('EIA facet fetch failed — vocabulary missing from the index', {
-              route,
-              facetId,
-              error: errorMessage(err),
-            });
-          }
-        }),
+        gate.run(
+          async () => {
+            try {
+              const facet = await this.fetchFacet(route, { id: facetId, description }, ctx);
+              indexed += indexFacetValues(route, [facet]);
+            } catch (err) {
+              failed++;
+              ctx.log.warning('EIA facet fetch failed — vocabulary missing from the index', {
+                route,
+                facetId,
+                error: errorMessage(err),
+              });
+            }
+          },
+          { signal: ctx.signal },
+        ),
       ),
     );
 

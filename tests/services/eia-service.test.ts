@@ -54,15 +54,13 @@ interface PageFixture {
   status?: number;
 }
 
-/** Minimal stand-in for the subset of Response the service reads. */
+/** Real Response keeps the HTTP error mapper's headers and status semantics. */
 function httpResponse(fixture: PageFixture) {
   const status = fixture.status ?? 200;
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    text: async () =>
-      typeof fixture.body === 'string' ? fixture.body : JSON.stringify(fixture.body),
-  } as unknown as Response;
+  return new Response(
+    typeof fixture.body === 'string' ? fixture.body : JSON.stringify(fixture.body),
+    { status },
+  );
 }
 
 /**

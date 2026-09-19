@@ -61,6 +61,7 @@ export const describeRouteTool = tool('eia_describe_route', {
   description:
     'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints and merged — results are cached per-route for the process lifetime to minimize API calls.',
   annotations: { readOnlyHint: true, openWorldHint: false },
+  inputAliases: { path: 'route' },
 
   input: z.object({
     route: z
@@ -182,12 +183,14 @@ export const describeRouteTool = tool('eia_describe_route', {
   errors: [
     {
       reason: 'route_not_found',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
       when: 'Route does not exist in the EIA taxonomy.',
       recovery: 'Use eia_browse_routes or eia_search_routes to discover valid leaf route paths.',
     },
     {
       reason: 'route_not_queryable',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Route is a category node with sub-routes, not a queryable leaf.',
       recovery:
@@ -202,6 +205,7 @@ export const describeRouteTool = tool('eia_describe_route', {
     },
     {
       reason: 'rate_limited',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
       retryable: true,
       when: 'EIA rate limit hit during facet fan-out.',

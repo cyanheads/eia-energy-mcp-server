@@ -21,7 +21,7 @@ const serverConfig = getServerConfig();
 /**
  * The three dataframe tools are canvas-only — every one of their handlers fails
  * on the first line without a canvas — so a deployment with none advertises
- * four working tools rather than six of which two fail on call.
+ * four working tools rather than seven of which three fail on call.
  * `canvas_unavailable` stays on each contract as the backstop for a canvas that
  * fails at runtime.
  * The drop tool answers to two gates, and the landing card names whichever one
@@ -54,6 +54,7 @@ const dropTool = !canvasEnabled
 await createApp({
   name: 'eia-energy-mcp-server',
   title: 'eia-energy-mcp-server',
+  sessionMode: 'stateless',
   instructions:
     'Use the `eia_*` tools for U.S. Energy Information Administration (EIA) API v2 energy data. Requires an `EIA_API_KEY`. Routes use path identifiers (e.g. `electricity`, `petroleum/pri`); leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling resolves the same way. Workflow: `eia_search_routes` or `eia_browse_routes` to find a leaf route → `eia_describe_route` for its facets and columns → `eia_query_route` with facet-ID filters. Facet values come only from describe, not route metadata, so describe before querying. Values arrive as strings. `eia_query_route` returns a preview and stages nothing by default; pass `stage: true` to also stage the matching rows as a DataCanvas table named by the `dataset` field, queried via SQL with `eia_dataframe_query`. Every dataset a tenant stages shares one canvas, so tables from different routes cross-join by name. The dataframe tools are listed only where a canvas is configured.',
   tools: [

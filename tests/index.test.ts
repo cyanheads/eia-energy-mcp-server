@@ -29,11 +29,11 @@ function disabledMeta(def: unknown): DisabledMetadata | undefined {
  * was handed, keyed by tool name.
  */
 async function registeredTools(): Promise<Map<string, unknown>> {
-  const captured: Array<{ tools: Array<{ name: string }> }> = [];
+  const captured: Array<{ tools: Array<{ name: string }>; sessionMode?: string }> = [];
 
   vi.doMock('@cyanheads/mcp-ts-core', async (importOriginal) => ({
     ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core')>()),
-    createApp: vi.fn((options: { tools: Array<{ name: string }> }) => {
+    createApp: vi.fn((options: { tools: Array<{ name: string }>; sessionMode?: string }) => {
       captured.push(options);
       return Promise.resolve(undefined);
     }),
@@ -43,6 +43,7 @@ async function registeredTools(): Promise<Map<string, unknown>> {
 
   const options = captured[0];
   if (!options) throw new Error('createApp was not called');
+  expect(options.sessionMode).toBe('stateless');
   return new Map(options.tools.map((t) => [t.name, t]));
 }
 

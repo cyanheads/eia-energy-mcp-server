@@ -15,6 +15,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
+import { literalTableCell } from '../literal-table-cell.js';
 
 export const dataframeQueryTool = tool('eia_dataframe_query', {
   title: 'Query EIA Dataframes',
@@ -31,12 +32,14 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
     },
     {
       reason: 'system_catalog_access',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'SQL references a denied system catalog (information_schema, pg_catalog, sqlite_master, duckdb_*).',
       recovery: 'Query only df_<id> tables — list them with eia_dataframe_describe.',
     },
     {
       reason: 'missing_table',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
       when: 'SQL references a df_<id> table that is not staged — mistyped, already dropped, or past its expiry.',
       recovery:
@@ -44,6 +47,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
     },
     {
       reason: 'non_select_statement',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The statement is not a single read-only SELECT — writes, DDL, DROP, COPY, PRAGMA, and ATTACH are rejected.',
       recovery:
@@ -51,6 +55,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
     },
     {
       reason: 'invalid_sql',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'DuckDB could not parse or bind the statement — a syntax error, or a column or alias that does not exist on the referenced dataframe.',
       recovery:
@@ -58,6 +63,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
     },
     {
       reason: 'register_as_clash',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'register_as names a dataframe that is already staged for this tenant.',
       recovery:
@@ -209,18 +215,12 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       return [{ type: 'text', text: lines.join('\n') }];
     }
 
-    const header = `| ${result.columns.join(' | ')} |`;
+    const header = `| ${result.columns.map(literalTableCell).join(' | ')} |`;
     const sep = `| ${result.columns.map(() => '---').join(' | ')} |`;
     lines.push(header, sep);
 
     for (const row of result.rows) {
-      const cells = result.columns.map((c) => {
-        const v = row[c];
-        if (v === null || v === undefined) return '';
-        if (typeof v === 'string') return v.replace(/\|/g, '\\|');
-        if (typeof v === 'object') return JSON.stringify(v).replace(/\|/g, '\\|');
-        return String(v);
-      });
+      const cells = result.columns.map((c) => literalTableCell(row[c]));
       lines.push(`| ${cells.join(' | ')} |`);
     }
 

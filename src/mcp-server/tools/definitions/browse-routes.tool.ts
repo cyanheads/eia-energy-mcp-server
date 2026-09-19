@@ -15,6 +15,7 @@ export const browseRoutesTool = tool('eia_browse_routes', {
   description:
     'Lists child routes under a given path in the EIA dataset taxonomy. Start with no path to get the 14 top-level categories (electricity, petroleum, natural-gas, steo, aeo, ieo, seds, etc.), then drill into subcategories. Each result includes an isLeaf flag — leaf routes are queryable endpoints; non-leaf routes have children to browse. When isLeaf is true on the browsed path itself, switch to eia_describe_route.',
   annotations: { readOnlyHint: true, openWorldHint: false },
+  inputAliases: { route: 'path' },
 
   input: z.object({
     path: z
@@ -54,6 +55,7 @@ export const browseRoutesTool = tool('eia_browse_routes', {
   errors: [
     {
       reason: 'route_not_found',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
       when: 'Path does not exist in the EIA taxonomy.',
       recovery: 'Call eia_browse_routes without a path to see valid top-level categories.',

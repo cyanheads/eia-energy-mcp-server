@@ -17,6 +17,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
 import type { EiaWarning } from '@/services/eia/types.js';
+import { literalTableCell } from '../literal-table-cell.js';
 
 /**
  * EIA's per-page advisory: it fires whenever the requested `length` is smaller
@@ -35,6 +36,7 @@ function isIncompleteReturn(warning: EiaWarning): boolean {
 }
 
 export const queryRouteTool = tool('eia_query_route', {
+  inputAliases: { path: 'route' },
   title: 'Query EIA Route Data',
   description:
     'Fetches data from a leaf route with optional facet filters, date range, frequency, and column selection. Use eia_describe_route first to discover valid facet IDs, facet values, column IDs, and frequency codes. Data values are strings in the response (EIA API returns all numeric values as strings, e.g. "9.13"); cast to DOUBLE in SQL when arithmetic is needed. Returns a preview inline and stages nothing by default — one upstream request, whatever total says. Pass stage: true to also page past the preview and stage the accumulated set as a DataCanvas table, then pass the returned dataset name to eia_dataframe_query for SQL. Every dataset a tenant stages lands in the same canvas, so tables from different routes cross-join by name with nothing to thread between calls.',
@@ -230,12 +232,14 @@ export const queryRouteTool = tool('eia_query_route', {
   errors: [
     {
       reason: 'route_not_found',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
       when: 'Route does not exist in the EIA taxonomy.',
       recovery: 'Use eia_browse_routes or eia_search_routes to find a valid leaf route path.',
     },
     {
       reason: 'route_not_queryable',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Route is a category node with sub-routes, not a queryable leaf.',
       recovery:
@@ -243,24 +247,28 @@ export const queryRouteTool = tool('eia_query_route', {
     },
     {
       reason: 'invalid_facet',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'An unknown facet key was used in filters.',
       recovery: 'Call eia_describe_route and pick a facet key from facets[].id.',
     },
     {
       reason: 'invalid_column',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'An unknown data column ID was passed in columns.',
       recovery: 'Call eia_describe_route and pick a column from data_columns[].id.',
     },
     {
       reason: 'invalid_frequency',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'An unknown frequency code was passed.',
       recovery: 'Call eia_describe_route and pick a frequency from frequencies[].id.',
     },
     {
       reason: 'invalid_sort',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A sort entry named a column the route does not sort by.',
       recovery:
@@ -268,6 +276,7 @@ export const queryRouteTool = tool('eia_query_route', {
     },
     {
       reason: 'invalid_period',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'start or end was not in a period format the route accepts.',
       recovery:
@@ -281,6 +290,7 @@ export const queryRouteTool = tool('eia_query_route', {
     },
     {
       reason: 'rate_limited',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
       retryable: true,
       when: 'EIA rate limit hit (OVER_RATE_LIMIT).',
@@ -539,17 +549,17 @@ export const queryRouteTool = tool('eia_query_route', {
     const dataCols = allKeys.filter((k) => !absorbedUnitKeys.has(k));
 
     // Header: "col (unit)" when a unit is known, else just "col"
-    const headerCells = dataCols.map((c) => (unitsMap[c] ? `${c} (${unitsMap[c]})` : c));
+    const headerCells = dataCols.map((c) =>
+      unitsMap[c]
+        ? `${literalTableCell(c)} (${literalTableCell(unitsMap[c])})`
+        : literalTableCell(c),
+    );
     const header = `| ${headerCells.join(' | ')} |`;
     const sep = `| ${dataCols.map(() => '---').join(' | ')} |`;
     lines.push(header, sep);
 
     for (const row of result.data) {
-      const cells = dataCols.map((c) => {
-        const v = row[c];
-        if (v === null || v === undefined) return '';
-        return String(v).replace(/\|/g, '\\|');
-      });
+      const cells = dataCols.map((c) => literalTableCell(row[c]));
       lines.push(`| ${cells.join(' | ')} |`);
     }
 
