@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-09-19 · ⚠️ Breaking · 🛡️ Security
+
+Route aliases accept both EIA path spellings without changing advertised schemas, literal table values retain their text safely, and @cyanheads/mcp-ts-core 0.13.6 adds current validation and recovery behavior.
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-08-25 · ⚠️ Breaking
 
 @cyanheads/mcp-ts-core ^0.12.3: tool inputs are now strict — an undeclared top-level argument is rejected by name instead of silently dropped; Bun pinned to 1.4.0; Dockerfile gains a HEALTHCHECK and an image version label
