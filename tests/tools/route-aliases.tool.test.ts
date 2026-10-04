@@ -81,7 +81,7 @@ describe('route aliases', () => {
       expect(fetch).not.toHaveBeenCalled();
     });
     it(`${definition.name} rejects a malformed alias with a recovery hint`, async () => {
-      const result = await runToolContract(definition, { [alias]: 42 });
+      const result = await runToolContract(definition, { [alias]: true });
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({
         error: { code: -32602, data: { recovery: { hint: expect.any(String) } } },
