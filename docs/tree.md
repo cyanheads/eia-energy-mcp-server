@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-09-19 18:43:30
+Generated on: 2026-10-04 05:42:32
 
 ```text
 eia-energy-mcp-server/
@@ -131,9 +131,11 @@ eia-energy-mcp-server/
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── eval-search.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   ├── search-battery.ts
 │   ├── split-changelog.ts
@@ -182,6 +184,7 @@ eia-energy-mcp-server/
 │   │   ├── dataframe-drop.tool.test.ts
 │   │   ├── dataframe-query-extra.tool.test.ts
 │   │   ├── dataframe-query.tool.test.ts
+│   │   ├── declared-recovery.tool.test.ts
 │   │   ├── describe-route-extra.tool.test.ts
 │   │   ├── describe-route.tool.test.ts
 │   │   ├── literal-tables.tool.test.ts
