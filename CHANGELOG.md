@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-10-03
+
+Updates framework error handling and input repair, and refreshes Docker and registry packaging.
+
 ## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-09-19 · ⚠️ Breaking · 🛡️ Security
 
 Route aliases accept both EIA path spellings without changing advertised schemas, literal table values retain their text safely, and the server adopts framework validation and recovery updates.
