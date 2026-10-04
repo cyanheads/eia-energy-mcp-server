@@ -139,16 +139,11 @@ export function sanitizeRowsForCanvas(rows: Record<string, unknown>[]): Record<s
 
 /**
  * Re-throw a framework canvas error carrying the calling definition's declared
- * recovery hint. The SQL gate and the DuckDB provider throw below the bridge
- * with a stable `data.reason` but either no `data.recovery` at all
- * (`system_catalog_access`, `non_select_statement`, `register_as_clash`) or one
- * naming framework methods an MCP client cannot invoke (`missing_table`). The
- * `Recovery:` line the framework renders into `content[]` is read from
- * `data.recovery.hint` and never from the contract, so a declared `recovery`
- * reaches the caller only if it is put on the wire here. Reasons the calling
- * definition does not declare pass through untouched — `ctx.recoveryFor`
- * returns `{}` for them — so the tool's `errors[]` is the single place the set
- * of remapped reasons is written down.
+ * recovery hint. This deliberately replaces provider hints with EIA tool names
+ * and preserves the direct bridge-call contract covered by service tests.
+ * The framework fills absent hints at the tool boundary, but keeps an existing
+ * provider hint; this override ensures the server-specific guidance wins.
+ * Reasons the calling definition does not declare pass through untouched.
  */
 function withContractRecovery(ctx: Context, error: unknown): unknown {
   if (!(error instanceof McpError)) return error;

@@ -317,7 +317,6 @@ export const queryRouteTool = tool('eia_query_route', {
           route: input.route,
           start: input.start,
           end: input.end,
-          ...ctx.recoveryFor('no_data'),
         },
       );
     }

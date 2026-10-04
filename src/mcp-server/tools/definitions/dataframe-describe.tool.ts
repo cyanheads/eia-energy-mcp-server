@@ -98,9 +98,7 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
   async handler(input, ctx) {
     const bridge = getCanvasBridge();
     if (!bridge) {
-      throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.', {
-        ...ctx.recoveryFor('canvas_unavailable'),
-      });
+      throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.');
     }
 
     // Always list unscoped, then narrow locally: the full set is what
