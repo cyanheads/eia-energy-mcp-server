@@ -103,9 +103,21 @@ export interface RouteMetadata {
   defaultDateFormat: string;
   defaultFrequency: string;
   description: string;
+  /**
+   * Every facet the route metadata lists, in EIA's order. An entry named in
+   * `unfetchedFacets` carries no values — its list is not in hand, which is not
+   * the same as an empty facet.
+   */
   facets: Facet[];
   frequencies: RawFrequency[];
   route: string;
+  /**
+   * IDs of facets whose value lists are not in hand: every facet on an entry a
+   * query wrote from the route metadata alone, or the lists a describe could
+   * not fetch past their retries. The next describe of the route re-fetches
+   * them. Absent when every facet's values were fetched.
+   */
+  unfetchedFacets?: string[];
 }
 
 /** A data row from /v2/{route}/data/. All values are strings per EIA API. */
@@ -140,6 +152,12 @@ export interface DataResponse {
    * inline preview. `rows` starts with the preview rows and extends forward.
    */
   accumulated?: AccumulatedRows;
+  /**
+   * The caller's column projection as sent in `data[]`, after `period` and the
+   * route's facet IDs were dropped from it. Absent when no data column was
+   * named, in which case every data column was requested.
+   */
+  appliedColumns?: string[];
   data: DataRow[];
   dateFormat: string;
   frequency: string;
@@ -159,9 +177,9 @@ export interface SearchIndexEntry {
   description: string;
   /**
    * Pre-built filter hint for routes that require a specific facet value to
-   * query. Present on STEO series entries (`{ seriesId }`) and facet-value
-   * entries (`{ <facetId>: <valueId> }`) so callers can pass it straight to
-   * eia_query_route without parsing the description string.
+   * query. Present on named-series entries — STEO and SEDS, `{ seriesId }` —
+   * and facet-value entries (`{ <facetId>: <valueId> }`) so callers can pass
+   * it straight to eia_query_route without parsing the description string.
    */
   filter_hint?: Record<string, string>;
   isLeaf: boolean;

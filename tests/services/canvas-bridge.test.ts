@@ -121,7 +121,7 @@ function storedMeta(tableName: string, createdAt = new Date().toISOString()): Da
 
 describe('CanvasBridge', () => {
   describe('registerDataframe', () => {
-    it('returns undefined and skips when rows are empty', async () => {
+    it('reports skipped, touching no canvas, when rows are empty', async () => {
       const { mockCanvas } = makeMockCanvas();
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
@@ -132,7 +132,7 @@ describe('CanvasBridge', () => {
         queryParams: { route: 'steo' },
       });
 
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ status: 'skipped' });
       expect(mockCanvas.acquire).not.toHaveBeenCalled();
     });
 
@@ -155,36 +155,53 @@ describe('CanvasBridge', () => {
         truncated: false,
       });
 
-      expect(result).toBeDefined();
-      expect(result?.tableName).toBe('df_ABCDE_FGHIJ');
-      expect(result?.rowCount).toBe(2);
-      expect(result?.expiresAt).toBeDefined();
-      expect(result?.columnSchema).toBeDefined();
+      expect(result).toMatchObject({
+        status: 'registered',
+        tableName: 'df_ABCDE_FGHIJ',
+        rowCount: 2,
+        columnSchema: [
+          { name: 'period', type: 'VARCHAR', nullable: true },
+          { name: 'value', type: 'VARCHAR', nullable: true },
+        ],
+        renamedColumns: [],
+      });
     });
 
     // Regression for #30: the sliding window is the framework's, opted into via
     // ttlMs. Without it the table follows the canvas lifecycle and the bridge is
     // back to advertising a slide nothing performs.
     it('opts the table into the framework sliding TTL and stores no expiry of its own', async () => {
-      const { mockCanvas, mockInstance } = makeMockCanvas();
-      mockInstance.registerTable.mockResolvedValue({ tableName: 'df_TTL', rowCount: 1 });
-      const bridge = new CanvasBridge(mockCanvas as never);
-      const ctx = createMockContext({ tenantId: 'test' });
+      vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-10-12T00:00:00.000Z') });
+      try {
+        const { mockCanvas, mockInstance } = makeMockCanvas();
+        mockInstance.registerTable.mockResolvedValue({ tableName: 'df_TTL', rowCount: 1 });
+        const bridge = new CanvasBridge(mockCanvas as never);
+        const ctx = createMockContext({ tenantId: 'test' });
 
-      const result = await bridge.registerDataframe(ctx, {
-        rows: [{ period: '2024-01', value: '9.13' }],
-        sourceTool: 'eia_query_route',
-        queryParams: { route: 'steo' },
-      });
+        const result = await bridge.registerDataframe(ctx, {
+          rows: [{ period: '2024-01', value: '9.13' }],
+          sourceTool: 'eia_query_route',
+          queryParams: { route: 'steo' },
+        });
 
-      const [, , opts] = mockInstance.registerTable.mock.calls[0] as [
-        string,
-        Record<string, unknown>[],
-        { ttlMs?: number },
-      ];
-      expect(opts.ttlMs).toBe(86_400_000);
-      expect(result?.expiresAt).toBeDefined();
-      expect(await ctx.state.get('eia-df-meta/df_TTL')).not.toHaveProperty('expiresAt');
+        const [, , opts] = mockInstance.registerTable.mock.calls[0] as [
+          string,
+          Record<string, unknown>[],
+          { ttlMs?: number },
+        ];
+        expect(opts.ttlMs).toBe(86_400_000);
+        // The window the canvas just started, one default TTL past registration.
+        expect(result).toMatchObject({
+          status: 'registered',
+          expiresAt: '2026-10-13T00:00:00.000Z',
+        });
+        expect(await ctx.state.get('eia-df-meta/df_TTL')).toMatchObject({
+          createdAt: '2026-10-12T00:00:00.000Z',
+        });
+        expect(await ctx.state.get('eia-df-meta/df_TTL')).not.toHaveProperty('expiresAt');
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     // Regression for #30: the canvas sweeper removes tables without telling the
@@ -208,9 +225,12 @@ describe('CanvasBridge', () => {
       expect(await ctx.state.get('eia-df-meta/df_NEW')).not.toBeNull();
     });
 
-    it('returns undefined when canvas throws (best-effort)', async () => {
+    // #60 — a canvas failure is an outcome distinct from the empty-rows no-op,
+    // carrying the failure, and leaves neither provenance nor a partial table.
+    it('reports failed with the canvas message when registration throws', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
       mockInstance.registerTable.mockRejectedValue(new Error('DuckDB error'));
+      mockInstance.drop.mockResolvedValue(true);
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
 
@@ -220,7 +240,54 @@ describe('CanvasBridge', () => {
         queryParams: { route: 'steo' },
       });
 
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ status: 'failed', message: 'DuckDB error' });
+      const [attempted] = mockInstance.registerTable.mock.calls[0] as [string];
+      expect(mockInstance.drop).toHaveBeenCalledWith(attempted);
+      expect((await ctx.state.list('eia-df-meta/')).items).toEqual([]);
+    });
+
+    it('reports failed when the canvas cannot be acquired', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      mockCanvas.acquire.mockRejectedValue(new Error('capacity exhausted'));
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+
+      const result = await bridge.registerDataframe(ctx, {
+        rows: [{ period: '2024-01', value: '9.13' }],
+        sourceTool: 'eia_query_route',
+        queryParams: { route: 'steo' },
+      });
+
+      expect(result).toEqual({ status: 'failed', message: 'capacity exhausted' });
+      // No table was attempted, so there is nothing to clean up.
+      expect(mockInstance.drop).not.toHaveBeenCalled();
+    });
+
+    it('rethrows a failure that follows a caller abort instead of reporting it', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      const controller = new AbortController();
+      mockInstance.registerTable.mockImplementation(() => {
+        controller.abort();
+        return Promise.reject(controller.signal.reason);
+      });
+      mockInstance.drop.mockResolvedValue(true);
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test', signal: controller.signal });
+
+      await expect(
+        bridge.registerDataframe(ctx, {
+          rows: [{ period: '2024-01', value: '9.13' }],
+          sourceTool: 'eia_query_route',
+          queryParams: { route: 'steo' },
+        }),
+      ).rejects.toMatchObject({ name: 'AbortError' });
+      // The signal also reaches the canvas, so the append itself stops early.
+      const [, , opts] = mockInstance.registerTable.mock.calls[0] as [
+        string,
+        unknown,
+        { signal?: AbortSignal },
+      ];
+      expect(opts.signal).toBe(controller.signal);
     });
 
     // Regression for #25: EIA's {col}-units companion columns carry a hyphen the
@@ -241,7 +308,7 @@ describe('CanvasBridge', () => {
         queryParams: { route: 'electricity/retail-sales' },
       });
 
-      expect(result).toBeDefined();
+      expect(result.status).toBe('registered');
       expect(mockInstance.registerTable).toHaveBeenCalledTimes(1);
       const [, rows, opts] = mockInstance.registerTable.mock.calls[0] as [
         string,
@@ -255,7 +322,34 @@ describe('CanvasBridge', () => {
       expect(Object.keys(rows[0] ?? {})).toContain('revenue_units');
       expect(rows[0]?.revenue_units).toBe('million dollars');
       // Stored metadata advertises the sanitized names via eia_dataframe_describe.
-      expect(result?.columnSchema.map((c) => c.name)).toContain('revenue_units');
+      expect(result.status === 'registered' && result.columnSchema.map((c) => c.name)).toContain(
+        'revenue_units',
+      );
+      // #62 — the renames travel back so the tool can quote one to the caller.
+      expect(result).toMatchObject({
+        renamedColumns: [{ from: 'revenue-units', to: 'revenue_units' }],
+      });
+    });
+
+    it('reports every renamed column in column order, collisions included', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      mockInstance.registerTable.mockResolvedValue({ tableName: 'df_RENAMES', rowCount: 1 });
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+
+      const result = await bridge.registerDataframe(ctx, {
+        rows: [{ period: '2024', 'respondent-name': 'x', respondent_name: 'y', '2024total': '1' }],
+        sourceTool: 'eia_query_route',
+        queryParams: {},
+      });
+
+      expect(result).toMatchObject({
+        renamedColumns: [
+          { from: 'respondent-name', to: 'respondent_name' },
+          { from: 'respondent_name', to: 'respondent_name_2' },
+          { from: '2024total', to: '_2024total' },
+        ],
+      });
     });
 
     it('does not mutate the caller rows (inline preview keeps {col}-units keys)', async () => {
@@ -472,47 +566,111 @@ describe('CanvasBridge', () => {
   });
 
   describe('drop', () => {
-    it('returns true when canvas drop succeeds', async () => {
+    it('reports dropped and removes provenance when the canvas drops the table', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
       mockInstance.drop.mockResolvedValue(true);
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
+      await ctx.state.set('eia-df-meta/df_ABCDE_FGHIJ', storedMeta('df_ABCDE_FGHIJ'));
 
-      const result = await bridge.drop(ctx, 'df_ABCDE_FGHIJ');
-      expect(result).toBe(true);
+      expect(await bridge.drop(ctx, 'df_ABCDE_FGHIJ')).toEqual({ status: 'dropped' });
+      expect(await ctx.state.get('eia-df-meta/df_ABCDE_FGHIJ')).toBeNull();
     });
 
-    it('returns false when canvas drop returns false and no state meta exists', async () => {
+    it('reports absent when the canvas drops nothing and no state meta exists', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
       mockInstance.drop.mockResolvedValue(false);
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
 
-      const result = await bridge.drop(ctx, 'df_MISSING');
-      expect(result).toBe(false);
+      expect(await bridge.drop(ctx, 'df_MISSING')).toEqual({ status: 'absent' });
     });
 
     // The canvas is authoritative on existence now that it owns expiry: stale
     // provenance for a table its sweeper already removed must not report a drop.
-    it('returns false when the canvas no longer holds a table state still tracks', async () => {
+    it('reports absent and clears provenance the canvas no longer backs', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
       mockInstance.drop.mockResolvedValue(false);
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
       await ctx.state.set('eia-df-meta/df_HAS_META', storedMeta('df_HAS_META'));
 
-      expect(await bridge.drop(ctx, 'df_HAS_META')).toBe(false);
+      expect(await bridge.drop(ctx, 'df_HAS_META')).toEqual({ status: 'absent' });
       expect(await ctx.state.get('eia-df-meta/df_HAS_META')).toBeNull();
     });
 
-    it('falls back to stored provenance when the canvas itself is unreachable', async () => {
+    // #60 — provenance is deleted only after the canvas answers, so a drop the
+    // canvas could not perform leaves the table listed and retryable.
+    it('reports failed and keeps provenance when the canvas drop throws', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
       mockInstance.drop.mockRejectedValue(new Error('canvas gone'));
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
-      await ctx.state.set('eia-df-meta/df_HAS_META', storedMeta('df_HAS_META'));
+      const meta = storedMeta('df_HAS_META');
+      await ctx.state.set('eia-df-meta/df_HAS_META', meta);
 
-      expect(await bridge.drop(ctx, 'df_HAS_META')).toBe(true);
+      expect(await bridge.drop(ctx, 'df_HAS_META')).toEqual({
+        status: 'failed',
+        message: 'canvas gone',
+      });
+      expect(await ctx.state.get('eia-df-meta/df_HAS_META')).toEqual(meta);
+    });
+
+    it('reports failed and keeps provenance when no canvas can be acquired', async () => {
+      const { mockCanvas } = makeMockCanvas();
+      mockCanvas.acquire.mockRejectedValue(new Error('capacity exhausted'));
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+      const meta = storedMeta('df_HAS_META');
+      await ctx.state.set('eia-df-meta/df_HAS_META', meta);
+
+      expect(await bridge.drop(ctx, 'df_HAS_META')).toEqual({
+        status: 'failed',
+        message: 'capacity exhausted',
+      });
+      expect(await ctx.state.get('eia-df-meta/df_HAS_META')).toEqual(meta);
+    });
+  });
+
+  describe('shared canvas', () => {
+    it('replaces a stored canvas the registry no longer knows', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      mockCanvas.acquire
+        .mockRejectedValueOnce(
+          new McpError(JsonRpcErrorCode.NotFound, 'Canvas not found.', {
+            reason: 'canvas_not_found',
+          }),
+        )
+        .mockResolvedValueOnce({ ...mockInstance, canvasId: 'canvas-new' });
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+      await ctx.state.set('eia-canvas-id', 'canvas-old');
+
+      await bridge.describe(ctx);
+
+      expect(mockCanvas.acquire).toHaveBeenLastCalledWith(undefined, ctx);
+      expect(await ctx.state.get('eia-canvas-id')).toBe('canvas-new');
+    });
+
+    // #60 — forgetting a live canvas over any other failure orphans every
+    // table on it: the next call mints a new canvas and reconcile then deletes
+    // all provenance.
+    it('keeps the stored canvas id when acquiring it fails for another reason', async () => {
+      const { mockCanvas } = makeMockCanvas();
+      mockCanvas.acquire.mockRejectedValueOnce(new Error('registry shutting down'));
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+      await ctx.state.set('eia-canvas-id', 'canvas-live');
+      const meta = storedMeta('df_KEPT');
+      await ctx.state.set('eia-df-meta/df_KEPT', meta);
+
+      expect(await bridge.drop(ctx, 'df_KEPT')).toEqual({
+        status: 'failed',
+        message: 'registry shutting down',
+      });
+      expect(mockCanvas.acquire).toHaveBeenCalledTimes(1);
+      expect(await ctx.state.get('eia-canvas-id')).toBe('canvas-live');
+      expect(await ctx.state.get('eia-df-meta/df_KEPT')).toEqual(meta);
     });
   });
 });

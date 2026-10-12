@@ -144,6 +144,8 @@ describe('queryRouteTool', () => {
         rowCount: 25000,
         expiresAt: new Date().toISOString(),
         columnSchema: [],
+        renamedColumns: [],
+        status: 'registered',
       }),
     } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
     mockQuery.mockResolvedValue({
@@ -196,6 +198,8 @@ describe('queryRouteTool', () => {
           rowCount,
           expiresAt: new Date().toISOString(),
           columnSchema: [],
+          renamedColumns: [],
+          status: 'registered',
         }),
       } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
 
@@ -419,6 +423,8 @@ describe('queryRouteTool', () => {
         rowCount: 240,
         expiresAt: new Date().toISOString(),
         columnSchema: [],
+        renamedColumns: [],
+        status: 'registered',
       }),
     } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
     mockQuery.mockResolvedValue({
@@ -450,6 +456,8 @@ describe('queryRouteTool', () => {
         rowCount: 2,
         expiresAt: new Date().toISOString(),
         columnSchema: [],
+        renamedColumns: [],
+        status: 'registered',
       }),
     } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
     mockQuery.mockResolvedValue(SAMPLE_DATA_RESPONSE);

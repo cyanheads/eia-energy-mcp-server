@@ -1,17 +1,20 @@
 /**
  * @fileoverview Adapter between EIA tools and the framework DataCanvas
  * primitive. Mints df_<id> table handles, sanitizes column identifiers to the
- * canvas identifier shape (EIA's {col}-units companion columns carry a hyphen
- * the gate rejects), derives all-nullable column schemas (EIA data values are
- * all strings), and tracks provenance in ctx.state. Expiry is the canvas's:
+ * canvas identifier shape (EIA's hyphenated keys — {col}-units companions, and
+ * data and label columns such as respondent-name — fail the gate), derives
+ * all-nullable column schemas (EIA data values are all strings), and tracks
+ * provenance in ctx.state. Expiry is the canvas's:
  * every table is registered with the framework's per-table sliding TTL, which
  * the canvas extends whenever a query references the table and whose sweeper
  * drops it once the window lapses. Every path that reads or writes provenance
  * first reconciles it against the canvas's live table list, so an entry never
  * outlives the table it describes. Errors thrown below `query()` are re-thrown
  * carrying the calling tool's declared recovery hint.
- * Best-effort registration: a failed canvas registration logs a warning and
- * returns undefined so the caller's inline response remains useful.
+ * Registration and drop report their outcome as a value rather than a throw, so
+ * a tool can keep a valid inline response beside a failed stage, and fail a
+ * drop with its own declared reason. A caller abort is never folded into an
+ * outcome — it rethrows as cancellation.
  * @module services/canvas-bridge/canvas-bridge
  */
 
@@ -53,12 +56,37 @@ export interface DataframeEntry extends DataframeMeta {
   expiresAt: string | undefined;
 }
 
-export interface RegisterDataframeResult {
-  columnSchema: ColumnSchema[];
-  expiresAt: string;
-  rowCount: number;
-  tableName: string;
+/** A source column staging gave a different, canvas-safe name. */
+export interface ColumnRename {
+  from: string;
+  to: string;
 }
+
+/**
+ * What `registerDataframe` did: staged the rows, failed to (the canvas threw —
+ * no table is left behind), or skipped an empty row set.
+ */
+export type RegisterDataframeOutcome =
+  | {
+      status: 'registered';
+      columnSchema: ColumnSchema[];
+      expiresAt: string;
+      /** Every column staging renamed, in column order; empty when none was. */
+      renamedColumns: ColumnRename[];
+      rowCount: number;
+      tableName: string;
+    }
+  | { status: 'failed'; message: string }
+  | { status: 'skipped' };
+
+/**
+ * What `drop` did: removed a table the canvas held, found nothing under the
+ * name, or could not reach the canvas — provenance is left as it was.
+ */
+export type DropDataframeOutcome =
+  | { status: 'dropped' }
+  | { status: 'absent' }
+  | { status: 'failed'; message: string };
 
 export interface RegisterDataframeOptions {
   maxRows?: number;
@@ -105,13 +133,17 @@ export function sanitizeColumnName(name: string): string {
 
 /**
  * Remap row keys to canvas-safe column identifiers, returning new row objects so
- * the caller's inline preview keeps the original `{col}-units` keys for display.
- * The original→safe map is built once from the union of all row keys, so the
- * DuckDB appender — which reads `row[col.name]` per schema column — finds every
- * value even when a column is sparse; collisions (two source columns sanitizing
- * to the same identifier) are disambiguated with a numeric suffix.
+ * the caller's inline preview keeps the original `{col}-units` keys for display,
+ * plus every column whose name changed. The original→safe map is built once
+ * from the union of all row keys, so the DuckDB appender — which reads
+ * `row[col.name]` per schema column — finds every value even when a column is
+ * sparse; collisions (two source columns sanitizing to the same identifier) are
+ * disambiguated with a numeric suffix.
  */
-export function sanitizeRowsForCanvas(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+export function sanitizeRowsForCanvas(rows: Record<string, unknown>[]): {
+  renamedColumns: ColumnRename[];
+  rows: Record<string, unknown>[];
+} {
   const renameMap = new Map<string, string>();
   const used = new Set<string>();
   for (const row of rows) {
@@ -128,13 +160,18 @@ export function sanitizeRowsForCanvas(rows: Record<string, unknown>[]): Record<s
     }
   }
 
-  return rows.map((row) => {
-    const remapped: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(row)) {
-      remapped[renameMap.get(key) ?? key] = value;
-    }
-    return remapped;
-  });
+  return {
+    rows: rows.map((row) => {
+      const remapped: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(row)) {
+        remapped[renameMap.get(key) ?? key] = value;
+      }
+      return remapped;
+    }),
+    renamedColumns: [...renameMap]
+      .filter(([from, to]) => from !== to)
+      .map(([from, to]) => ({ from, to })),
+  };
 }
 
 /**
@@ -157,29 +194,43 @@ function withContractRecovery(ctx: Context, error: unknown): unknown {
 export class CanvasBridge {
   constructor(private readonly canvas: DataCanvas) {}
 
+  /**
+   * Stage `options.rows` as a new df_<id> table. A canvas failure comes back as
+   * a `failed` outcome, logged at warning, with any table the attempt created
+   * dropped again; a caller abort rethrows instead.
+   */
   async registerDataframe(
     ctx: Context,
     options: RegisterDataframeOptions,
-  ): Promise<RegisterDataframeResult | undefined> {
+  ): Promise<RegisterDataframeOutcome> {
     if (options.rows.length === 0) {
       ctx.log.debug('Skipping dataframe registration — no rows', {
         sourceTool: options.sourceTool,
       });
-      return;
+      return { status: 'skipped' };
     }
 
+    let attempt: { instance: CanvasInstance; tableName: string } | undefined;
     try {
       const instance = await this.acquireSharedCanvas(ctx);
       await this.reconcile(ctx, instance);
       const tableName = this.mintTableName();
-      // EIA's {col}-units companion columns carry a hyphen the canvas identifier
-      // gate rejects; sanitize keys before registration. options.rows (the
-      // caller's inline preview) keeps the original names.
-      const safeRows = sanitizeRowsForCanvas(options.rows);
+      /**
+       * EIA's hyphenated keys ({col}-units companions, and data and label
+       * columns) fail the canvas identifier gate; sanitize keys before
+       * registration. options.rows (the caller's inline preview) keeps the
+       * original names.
+       */
+      const { rows: safeRows, renamedColumns } = sanitizeRowsForCanvas(options.rows);
       const schema = deriveAllNullableSchema(safeRows);
 
       const ttlMs = getServerConfig().datasetTtlSeconds * 1000;
-      const result = await instance.registerTable(tableName, safeRows, { schema, ttlMs });
+      attempt = { instance, tableName };
+      const result = await instance.registerTable(tableName, safeRows, {
+        schema,
+        ttlMs,
+        signal: ctx.signal,
+      });
 
       const now = Date.now();
       const meta: DataframeMeta = {
@@ -201,6 +252,7 @@ export class CanvasBridge {
       });
 
       return {
+        status: 'registered',
         tableName: result.tableName,
         rowCount: result.rowCount,
         // Exact at this instant — the canvas started the sliding window on the
@@ -208,13 +260,19 @@ export class CanvasBridge {
         // the current value.
         expiresAt: new Date(now + ttlMs).toISOString(),
         columnSchema: schema,
+        renamedColumns,
       };
     } catch (error) {
+      // A partial append, or a table whose provenance never landed, would be
+      // reachable by SQL yet listed nowhere — remove it before reporting.
+      if (attempt) await attempt.instance.drop(attempt.tableName).catch(() => false);
+      if (ctx.signal.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
       ctx.log.warning('EIA dataframe registration failed', {
-        error: error instanceof Error ? error.message : String(error),
+        error: message,
         sourceTool: options.sourceTool,
       });
-      return;
+      return { status: 'failed', message };
     }
   }
 
@@ -276,25 +334,25 @@ export class CanvasBridge {
   }
 
   /**
-   * Drop a table and its provenance. The canvas is authoritative on whether
-   * anything was removed; the stored-provenance answer is the fallback only
-   * when the canvas itself is unreachable.
+   * Drop a table, then its provenance. The canvas is authoritative on whether
+   * anything was removed, so it is asked first: provenance is deleted only once
+   * it answers — including for a name it no longer holds, whose provenance is
+   * stale — and a canvas that cannot be reached or throws leaves table and
+   * provenance exactly as they were, reported as `failed`.
    */
-  async drop(ctx: Context, tableName: string): Promise<boolean> {
-    const metaKey = `${META_PREFIX}${tableName}`;
-    const hadMeta = (await ctx.state.get(metaKey)) !== null;
-    await ctx.state.delete(metaKey);
-
+  async drop(ctx: Context, tableName: string): Promise<DropDataframeOutcome> {
+    let dropped: boolean;
     try {
       const instance = await this.acquireSharedCanvas(ctx);
-      return await instance.drop(tableName);
+      dropped = await instance.drop(tableName);
     } catch (error) {
-      ctx.log.warning('Canvas drop failed', {
-        tableName,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return hadMeta;
+      if (ctx.signal.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.log.warning('Canvas drop failed', { tableName, error: message });
+      return { status: 'failed', message };
     }
+    await ctx.state.delete(`${META_PREFIX}${tableName}`);
+    return { status: dropped ? 'dropped' : 'absent' };
   }
 
   /**
@@ -339,12 +397,18 @@ export class CanvasBridge {
     } while (cursor);
   }
 
+  /**
+   * The tenant's one canvas. A stored id the canvas no longer knows (expired or
+   * swept) is replaced by a fresh canvas; any other failure propagates with the
+   * id kept, since forgetting a live canvas orphans every table on it.
+   */
   private async acquireSharedCanvas(ctx: Context): Promise<CanvasInstance> {
     const stored = await ctx.state.get<string>(CANVAS_ID_KEY);
     if (stored) {
       try {
         return await this.canvas.acquire(stored, ctx);
-      } catch {
+      } catch (error) {
+        if (!(error instanceof McpError && error.data?.reason === 'canvas_not_found')) throw error;
         await ctx.state.delete(CANVAS_ID_KEY);
       }
     }

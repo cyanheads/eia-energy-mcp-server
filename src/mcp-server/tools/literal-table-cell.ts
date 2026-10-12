@@ -14,3 +14,8 @@ export function literalTableCell(value: unknown): string {
     .replace(/[\\`*_{}[\]()|~]/g, '\\$&')
     .replace(/\r\n|\r|\n/g, '<br>');
 }
+
+/** One Markdown table row: `columns` read from `row`, each as a literal cell. */
+export function tableRow(row: Record<string, unknown>, columns: string[]): string {
+  return `| ${columns.map((c) => literalTableCell(row[c])).join(' | ')} |`;
+}

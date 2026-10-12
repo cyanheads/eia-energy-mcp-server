@@ -6,9 +6,10 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
+import { ECHO_BUDGET_BYTES, INLINE_BUDGET_BYTES } from '@/mcp-server/tools/inline-budget.js';
 import * as canvasBridge from '@/services/canvas-bridge/canvas-bridge.js';
 import * as eiaService from '@/services/eia/eia-service.js';
 
@@ -37,6 +38,31 @@ const BASE_RESPONSE = {
   ],
   warnings: undefined,
 };
+
+/** Point the canvas bridge at a registration that answers `outcome`; returns the register mock. */
+function bridgeAnswering(outcome: Record<string, unknown>) {
+  const register = vi.fn().mockResolvedValue(outcome);
+  vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+    registerDataframe: register,
+  } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+  return register;
+}
+
+/** A canvas that stages the rows as `tableName`; returns the register mock. */
+function registeringBridge(
+  tableName: string,
+  rowCount: number,
+  renamedColumns: Array<{ from: string; to: string }> = [],
+) {
+  return bridgeAnswering({
+    status: 'registered',
+    tableName,
+    rowCount,
+    expiresAt: new Date().toISOString(),
+    columnSchema: [],
+    renamedColumns,
+  });
+}
 
 describe('queryRouteTool — additional coverage', () => {
   beforeEach(() => {
@@ -192,7 +218,7 @@ describe('queryRouteTool — additional coverage', () => {
   });
 
   it('echoes appliedStart/appliedEnd/appliedFrequency/appliedColumns when provided', async () => {
-    mockQuery.mockResolvedValue(BASE_RESPONSE);
+    mockQuery.mockResolvedValue({ ...BASE_RESPONSE, appliedColumns: ['sales', 'revenue'] });
 
     const ctx = createMockContext({ errors: queryRouteTool.errors });
     const input = queryRouteTool.input.parse({
@@ -223,6 +249,139 @@ describe('queryRouteTool — additional coverage', () => {
     expect(enrichment.appliedEnd).toBeUndefined();
     expect(enrichment.appliedFrequency).toBeUndefined();
     expect(enrichment.appliedColumns).toBeUndefined();
+  });
+
+  // #55 — a filter whose value list is empty sends EIA nothing, so it is unset:
+  // dropped before the request, the appliedFilters echo, and staged provenance.
+  describe('empty collections are unset (#55)', () => {
+    it('drops a filter whose value list is empty from the request, echo, and provenance', async () => {
+      const mockRegister = registeringBridge('df_UNSET', 2);
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        filters: { stateid: [] },
+        stage: true,
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[1]).not.toHaveProperty('filters');
+      expect(getEnrichment(ctx).appliedFilters).toBeUndefined();
+      expect(mockRegister.mock.calls[0]?.[1].queryParams).not.toHaveProperty('filters');
+    });
+
+    it('keeps the filters that carry values beside one that does not', async () => {
+      const mockRegister = registeringBridge('df_UNSET', 2);
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        filters: { stateid: ['TX'], sectorid: [] },
+        stage: true,
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[1].filters).toEqual({ stateid: ['TX'] });
+      expect(getEnrichment(ctx).appliedFilters).toEqual({ stateid: ['TX'] });
+      expect(mockRegister.mock.calls[0]?.[1].queryParams.filters).toEqual({ stateid: ['TX'] });
+    });
+
+    it('passes filter values through untrimmed — a single space is a real facet value', async () => {
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/facility-fuel',
+        filters: { primeMover: ' ', state: 'TX', fuel2002: [' '] },
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      const sent = { primeMover: ' ', state: 'TX', fuel2002: [' '] };
+      expect(mockQuery.mock.calls[0]?.[1].filters).toEqual(sent);
+      expect(getEnrichment(ctx).appliedFilters).toEqual(sent);
+    });
+
+    it('records no empty columns or sort in staged provenance', async () => {
+      const mockRegister = registeringBridge('df_UNSET', 2);
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        columns: [],
+        sort: [],
+        stage: true,
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      expect(Object.keys(mockRegister.mock.calls[0]?.[1].queryParams)).toEqual([
+        'route',
+        'offset',
+        'length',
+      ]);
+      expect(getEnrichment(ctx).appliedColumns).toBeUndefined();
+      expect(getEnrichment(ctx).appliedSort).toBeUndefined();
+    });
+
+    it('treats null filters, columns, and sort as omitted on the wire', async () => {
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      // Clients send null for an unset optional field; the schema itself refuses it.
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        filters: null,
+        columns: null,
+        sort: null,
+      } as unknown as { route: string });
+
+      expect(result.isError).not.toBe(true);
+      const opts = mockQuery.mock.calls[0]?.[1];
+      expect(opts).not.toHaveProperty('filters');
+      expect(opts).not.toHaveProperty('sort');
+      expect(opts.columns ?? []).toEqual([]);
+      for (const key of ['appliedFilters', 'appliedColumns', 'appliedSort']) {
+        expect(result.structuredContent).not.toHaveProperty(key);
+      }
+    });
+  });
+
+  // #65 — the service drops `period` and facet IDs from `columns`; the echo and
+  // staged provenance name the projection it sent, not the caller's list.
+  describe('column projection as sent (#65)', () => {
+    it('echoes and records the projection the service sent', async () => {
+      const mockRegister = registeringBridge('df_PROJECTED', 2);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, appliedColumns: ['price'] });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        columns: ['stateid', 'period', 'price'],
+        stage: true,
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[1].columns).toEqual(['stateid', 'period', 'price']);
+      expect(getEnrichment(ctx).appliedColumns).toEqual(['price']);
+      expect(mockRegister.mock.calls[0]?.[1].queryParams.columns).toEqual(['price']);
+    });
+
+    it('echoes and records no projection when the list named no data column', async () => {
+      const mockRegister = registeringBridge('df_ALLCOLUMNS', 2);
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const input = queryRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        columns: ['period'],
+        stage: true,
+      });
+      await queryRouteTool.handler(input, ctx);
+
+      expect(getEnrichment(ctx).appliedColumns).toBeUndefined();
+      expect(mockRegister.mock.calls[0]?.[1].queryParams).not.toHaveProperty('columns');
+    });
   });
 
   it('echoes appliedOffset/appliedLength on every call', async () => {
@@ -288,9 +447,7 @@ describe('queryRouteTool — additional coverage', () => {
       ctx,
     );
 
-    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-      registerDataframe: vi.fn().mockResolvedValue(undefined),
-    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    bridgeAnswering({ status: 'skipped' });
 
     // A canvas alone is not the trigger — the caller has to ask.
     const unstaged = queryRouteTool.input.parse({ route: 'electricity/retail-sales' });
@@ -316,15 +473,7 @@ describe('queryRouteTool — additional coverage', () => {
       period: `2024-${String(i + 1).padStart(2, '0')}`,
       value: String(i),
     }));
-    const mockRegister = vi.fn().mockResolvedValue({
-      tableName: 'df_STAGED',
-      rowCount: 40,
-      expiresAt: new Date().toISOString(),
-      columnSchema: [],
-    });
-    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-      registerDataframe: mockRegister,
-    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    const mockRegister = registeringBridge('df_STAGED', 40);
 
     mockQuery.mockResolvedValue({
       ...BASE_RESPONSE,
@@ -355,14 +504,7 @@ describe('queryRouteTool — additional coverage', () => {
       period: `2024-${String((i % 12) + 1).padStart(2, '0')}`,
       value: String(i),
     }));
-    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-      registerDataframe: vi.fn().mockResolvedValue({
-        tableName: 'df_CAPPED',
-        rowCount: 25,
-        expiresAt: new Date().toISOString(),
-        columnSchema: [],
-      }),
-    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    registeringBridge('df_CAPPED', 25);
 
     mockQuery.mockResolvedValue({
       ...BASE_RESPONSE,
@@ -390,14 +532,7 @@ describe('queryRouteTool — additional coverage', () => {
       period: `2024-${String((i % 12) + 1).padStart(2, '0')}`,
       value: String(i),
     }));
-    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-      registerDataframe: vi.fn().mockResolvedValue({
-        tableName: 'df_PARTIAL',
-        rowCount: 5100,
-        expiresAt: new Date().toISOString(),
-        columnSchema: [],
-      }),
-    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    registeringBridge('df_PARTIAL', 5100);
 
     mockQuery.mockResolvedValue({
       ...BASE_RESPONSE,
@@ -420,28 +555,285 @@ describe('queryRouteTool — additional coverage', () => {
     expect(result.canvas_preview_note).not.toContain('EIA_CANVAS_MAX_ROWS');
   });
 
-  it('canvas_preview_note omitted when canvas is available and total equals length', async () => {
-    const mockRegister = vi.fn().mockResolvedValue({
-      tableName: 'df_XYZ',
-      rowCount: 2,
-      expiresAt: new Date().toISOString(),
-      columnSchema: [],
+  // ------------------------------------------------------------------
+  // #62 — a staged dataset names the tool that lists its columns before the
+  // one that runs SQL, on both surfaces, whenever dataset is set.
+  // ------------------------------------------------------------------
+
+  describe('dataframe pointer (#62)', () => {
+    const VALUE_RENAME = [{ from: 'value-units', to: 'value_units' }];
+    const POINTER_TAIL = 'then eia_dataframe_query to run SQL over it.';
+
+    const textOf = (result: { content?: unknown[] }) =>
+      (result.content ?? []).map((b) => (b as { text?: string }).text ?? '').join('');
+    const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
+
+    it('points at describe then query even when the whole match fits the preview', async () => {
+      registeringBridge('df_XYZ', 2, VALUE_RENAME);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 2 });
+
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        stage: true,
+      });
+      const sc = result.structuredContent as Record<string, unknown>;
+
+      expect(sc.dataset).toBe('df_XYZ');
+      expect(sc.canvas_preview_note).toBe(
+        `2 rows staged as df_XYZ — call eia_dataframe_describe for its column names (hyphens become underscores: value-units → value_units), ${POINTER_TAIL}`,
+      );
+      const text = textOf(result);
+      expect(text).toContain(sc.canvas_preview_note as string);
+      // One pointer per surface: the note replaces the old fixed format() line.
+      expect(occurrences(text, 'eia_dataframe_describe')).toBe(1);
+      expect(occurrences(text, 'eia_dataframe_query')).toBe(1);
+      expect(text).toContain('**Dataset:** `df_XYZ`');
     });
-    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-      registerDataframe: mockRegister,
-    } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
 
-    // total === data.length — no spillover note
-    mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 2 });
+    it('adds no rename clause when staging renamed nothing', async () => {
+      registeringBridge('df_XYZ', 2);
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        route: 'steo',
+        total: 2,
+        data: [
+          { period: '2024-01', seriesId: 'PAPR_WORLD', value: '1.2', unit: 'million b/d' },
+          { period: '2024-02', seriesId: 'PAPR_WORLD', value: '1.3', unit: 'million b/d' },
+        ],
+      });
 
-    const ctx = createMockContext({ errors: queryRouteTool.errors });
-    const input = queryRouteTool.input.parse({
-      route: 'electricity/retail-sales',
-      stage: true,
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const result = await queryRouteTool.handler(
+        queryRouteTool.input.parse({ route: 'steo', stage: true }),
+        ctx,
+      );
+
+      expect(result.canvas_preview_note).toBe(
+        `2 rows staged as df_XYZ — call eia_dataframe_describe for its column names, ${POINTER_TAIL}`,
+      );
     });
-    const result = await queryRouteTool.handler(input, ctx);
 
-    expect(result.canvas_preview_note).toBeUndefined();
+    it('quotes a hyphen rename over another kind when staging made both', async () => {
+      registeringBridge('df_XYZ', 2, [
+        { from: '2024total', to: '_2024total' },
+        { from: 'respondent-name', to: 'respondent_name' },
+      ]);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 2 });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const result = await queryRouteTool.handler(
+        queryRouteTool.input.parse({ route: 'electricity/retail-sales', stage: true }),
+        ctx,
+      );
+
+      expect(result.canvas_preview_note).toContain(
+        '(hyphens become underscores: respondent-name → respondent_name)',
+      );
+    });
+
+    it('names a non-hyphen rename as it is when no hyphen was renamed', async () => {
+      registeringBridge('df_XYZ', 2, [{ from: '2024total', to: '_2024total' }]);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 2 });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const result = await queryRouteTool.handler(
+        queryRouteTool.input.parse({ route: 'electricity/retail-sales', stage: true }),
+        ctx,
+      );
+
+      expect(result.canvas_preview_note).toContain(
+        '(staged names are SQL-safe identifiers: 2024total → _2024total)',
+      );
+      expect(result.canvas_preview_note).not.toContain('hyphens');
+    });
+
+    it('leads with the pointer and keeps the cap and resume sentences after it', async () => {
+      registeringBridge('df_CAPPED', 25000, VALUE_RENAME);
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        total: 113460,
+        accumulated: {
+          rows: Array.from({ length: 25000 }, (_, i) => ({ period: String(i) })),
+          capped: true,
+          cap: 25000,
+        },
+      });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const result = await queryRouteTool.handler(
+        queryRouteTool.input.parse({ route: 'electricity/retail-sales', stage: true }),
+        ctx,
+      );
+
+      const note = result.canvas_preview_note ?? '';
+      expect(note.startsWith('25,000 rows staged as df_CAPPED — call eia_dataframe_describe')).toBe(
+        true,
+      );
+      const cap =
+        'Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (25,000), so the staged rows are 1–25,000 of 113,460. Narrow with filters, start, or end — or re-query with offset 25,000 — to reach the rest.';
+      expect(note).toContain(`${POINTER_TAIL} ${cap}`);
+    });
+
+    it('names eia_dataframe_query on the unstaged note where a canvas is configured', async () => {
+      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+        registerDataframe: vi.fn(),
+      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 113460 });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const result = await queryRouteTool.handler(
+        queryRouteTool.input.parse({ route: 'electricity/retail-sales', length: 2 }),
+        ctx,
+      );
+
+      expect(result.canvas_preview_note).toContain(
+        'Re-run with stage: true to stage the matching rows for SQL with eia_dataframe_query, or page through with offset',
+      );
+    });
+
+    it('leaves the canvas-off note free of dataframe tool names', async () => {
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 113460 });
+
+      const ctx = createMockContext({ errors: queryRouteTool.errors });
+      const result = await queryRouteTool.handler(
+        queryRouteTool.input.parse({ route: 'electricity/retail-sales', length: 2 }),
+        ctx,
+      );
+
+      expect(result.canvas_preview_note).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+      expect(result.canvas_preview_note).not.toContain('eia_dataframe');
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Following next_offset with stage still on registers a second table and
+  // re-spends the accumulation, so a registered stage with rows left to page
+  // says to page with stage off — after the inline sentences, and only then.
+  // ------------------------------------------------------------------
+
+  describe('paging the inline rows after a registered stage', () => {
+    const PAGE_WITHOUT_STAGING =
+      'Page the inline rows with stage left off — another stage: true call stages a new table.';
+    const pointer = (rowCount: number) =>
+      `${rowCount} rows staged as df_XYZ — call eia_dataframe_describe for its column names (hyphens become underscores: value-units → value_units), then eia_dataframe_query to run SQL over it.`;
+
+    const rows = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        period: `2024-${String(from + i + 1).padStart(2, '0')}`,
+        stateid: 'TX',
+        value: String(9 + from + i),
+        'value-units': 'million kWh',
+      }));
+
+    const registered = (rowCount: number) =>
+      registeringBridge('df_XYZ', rowCount, [{ from: 'value-units', to: 'value_units' }]);
+
+    /** Both surfaces exactly as the caller receives them. */
+    async function stageCall(input: Record<string, unknown>) {
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        stage: true,
+        ...input,
+      });
+      expect(result.isError).not.toBe(true);
+      const sc = result.structuredContent as Record<string, unknown>;
+      const text = (result.content ?? []).map((b) => (b as { text?: string }).text ?? '').join('');
+      return { sc, text };
+    }
+
+    it('closes the note with it when a table registered and rows remain', async () => {
+      registered(5);
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        total: 5,
+        data: rows(0, 2),
+        accumulated: { rows: rows(0, 5), capped: false, cap: 25_000 },
+      });
+
+      const { sc, text } = await stageCall({ length: 2 });
+
+      expect(sc.dataset).toBe('df_XYZ');
+      expect(sc.next_offset).toBe(2);
+      expect(sc.canvas_preview_note).toBe(
+        `${pointer(5)} Showing 2 of 5 rows inline. Continue the inline page at next_offset 2. ${PAGE_WITHOUT_STAGING}`,
+      );
+      expect(text).toContain(`> ${sc.canvas_preview_note as string}`);
+    });
+
+    it('follows the cap and resume sentences too, when the stage stopped short of total', async () => {
+      registered(4);
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        total: 9,
+        data: rows(0, 2),
+        accumulated: { rows: rows(0, 4), capped: true, cap: 4 },
+      });
+
+      const { sc, text } = await stageCall({ length: 2 });
+
+      expect(sc.canvas_preview_note).toBe(
+        `${pointer(4)} Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (4), so the staged rows are 1–4 of 9. Narrow with filters, start, or end — or re-query with offset 4 — to reach the rest. Showing 2 of 9 rows inline. Continue the inline page at next_offset 2. ${PAGE_WITHOUT_STAGING}`,
+      );
+      expect(text).toContain(sc.canvas_preview_note as string);
+    });
+
+    it('leaves it out on the last page, where there is nothing to page to', async () => {
+      registered(2);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 5, data: rows(3, 2) });
+
+      const { sc, text } = await stageCall({ offset: 3, length: 2 });
+
+      expect(sc).not.toHaveProperty('next_offset');
+      expect(sc.canvas_preview_note).toBe(
+        `${pointer(2)} The staged rows are 4–5 of 5. Showing 2 of 5 rows inline.`,
+      );
+      expect(text).toContain(sc.canvas_preview_note as string);
+      expect(text).not.toContain(PAGE_WITHOUT_STAGING);
+    });
+
+    it('leaves it out when the whole match fits the inline page', async () => {
+      registered(2);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 2, data: rows(0, 2) });
+
+      const { sc, text } = await stageCall({});
+
+      expect(sc).not.toHaveProperty('next_offset');
+      expect(sc.canvas_preview_note).toBe(pointer(2));
+      expect(text).not.toContain(PAGE_WITHOUT_STAGING);
+    });
+
+    it('leaves it out when staging failed, though rows remain', async () => {
+      bridgeAnswering({ status: 'failed', message: 'appender failed' });
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        total: 5,
+        data: rows(0, 2),
+        accumulated: { rows: rows(0, 5), capped: false, cap: 25_000 },
+      });
+
+      const { sc, text } = await stageCall({ length: 2 });
+
+      expect(sc).not.toHaveProperty('dataset');
+      expect(sc.next_offset).toBe(2);
+      expect(sc.canvas_preview_note).toBe(
+        'Staging failed, so no dataframe was created — re-run with stage: true to try again, or page through with offset. Showing 2 of 5 rows inline. Continue the inline page at next_offset 2.',
+      );
+      expect(text).toContain(sc.canvas_preview_note as string);
+      expect(text).not.toContain(PAGE_WITHOUT_STAGING);
+    });
+
+    it('stages nothing and says nothing of it on an offset past the last row', async () => {
+      const register = registered(0);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, total: 5, data: [] });
+
+      const { sc, text } = await stageCall({ offset: 9 });
+
+      expect(register).not.toHaveBeenCalled();
+      expect(sc).not.toHaveProperty('dataset');
+      expect(sc).not.toHaveProperty('canvas_preview_note');
+      expect(sc.notice).toMatch(/^Offset 9 is past the last row/);
+      expect(text).not.toContain(PAGE_WITHOUT_STAGING);
+    });
   });
 
   // ------------------------------------------------------------------
@@ -451,18 +843,7 @@ describe('queryRouteTool — additional coverage', () => {
   // ------------------------------------------------------------------
 
   describe('opt-in staging (#50)', () => {
-    const bridgeWithRegister = () => {
-      const mockRegister = vi.fn().mockResolvedValue({
-        tableName: 'df_STAGED',
-        rowCount: 25000,
-        expiresAt: new Date().toISOString(),
-        columnSchema: [],
-      });
-      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-        registerDataframe: mockRegister,
-      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
-      return mockRegister;
-    };
+    const bridgeWithRegister = () => registeringBridge('df_STAGED', 25000);
 
     it('stages nothing and asks for no accumulation when stage is omitted', async () => {
       const mockRegister = bridgeWithRegister();
@@ -562,15 +943,7 @@ describe('queryRouteTool — additional coverage', () => {
     });
 
     it('records the normalized route in staged dataframe provenance', async () => {
-      const mockRegister = vi.fn().mockResolvedValue({
-        tableName: 'df_STAGED',
-        rowCount: 2,
-        expiresAt: new Date().toISOString(),
-        columnSchema: [],
-      });
-      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-        registerDataframe: mockRegister,
-      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+      const mockRegister = registeringBridge('df_STAGED', 2);
       mockQuery.mockResolvedValue(BASE_RESPONSE);
 
       const ctx = createMockContext({ errors: queryRouteTool.errors });
@@ -594,18 +967,7 @@ describe('queryRouteTool — additional coverage', () => {
   describe('sort provenance (#44)', () => {
     const SORT = [{ column: 'period', direction: 'asc' as const }];
 
-    const stagingBridge = () => {
-      const mockRegister = vi.fn().mockResolvedValue({
-        tableName: 'df_SORTED',
-        rowCount: 2,
-        expiresAt: new Date().toISOString(),
-        columnSchema: [],
-      });
-      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
-        registerDataframe: mockRegister,
-      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
-      return mockRegister;
-    };
+    const stagingBridge = () => registeringBridge('df_SORTED', 2);
 
     it('carries sort into the staged dataframe provenance and the enrichment echo', async () => {
       const mockRegister = stagingBridge();
@@ -874,5 +1236,334 @@ describe('queryRouteTool — additional coverage', () => {
       const text = (blocks[0] as { text: string }).text;
       expect(typeof text).toBe('string');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #58 — each response surface holds to a fixed byte budget, cut between whole
+// rows, with next_offset naming where the inline page continues.
+// ---------------------------------------------------------------------------
+
+describe('queryRouteTool — inline byte budget (#58)', () => {
+  const bytes = (text: string) => Buffer.byteLength(text, 'utf8');
+
+  /** A row whose first cell is a unique id, so its position shows on both surfaces. */
+  const row = (i: number, note = '') => ({
+    id: `r${String(i).padStart(4, '0')}`,
+    period: `2024-${String((i % 12) + 1).padStart(2, '0')}`,
+    stateid: 'TX',
+    note,
+  });
+  /** About the width of an electricity/operating-generator-capacity row (~1,100 bytes). */
+  const wide = (i: number) => row(i, `plant ${i} `.padEnd(1_040, 'w'));
+  /** About the width of an electricity/retail-sales row (~200 bytes). */
+  const narrow = (i: number) => row(i, 'cents per kilowatt-hour'.padEnd(120, '.'));
+
+  const respond = (data: Array<Record<string, unknown>>, total: number, extra = {}) =>
+    mockQuery.mockResolvedValue({
+      route: 'electricity/operating-generator-capacity',
+      total,
+      dateFormat: 'YYYY-MM',
+      frequency: 'monthly',
+      data,
+      warnings: undefined,
+      ...extra,
+    });
+
+  /** Both surfaces exactly as the caller receives them. */
+  async function call(input: Record<string, unknown>) {
+    const result = await runToolContract(queryRouteTool, {
+      route: 'electricity/operating-generator-capacity',
+      ...input,
+    });
+    expect(result.isError).not.toBe(true);
+    const sc = result.structuredContent as Record<string, unknown> & {
+      data: Array<Record<string, unknown>>;
+    };
+    const text = (result.content ?? []).map((b) => (b as { text?: string }).text ?? '').join('');
+    return { sc, text, scBytes: bytes(JSON.stringify(sc)), textBytes: bytes(text) };
+  }
+
+  /** Row ids in the order the content[] table lists them. */
+  const textIds = (text: string) => [...text.matchAll(/^\| (r\d{4}) \|/gm)].map((m) => m[1]);
+
+  beforeEach(() => {
+    vi.mocked(eiaService.getEiaApiService).mockReturnValue({
+      query: mockQuery,
+    } as unknown as ReturnType<typeof eiaService.getEiaApiService>);
+    vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue(undefined);
+    mockQuery.mockReset();
+  });
+
+  it('pins the budget at 64,000 bytes per surface and an echo at 4,000', () => {
+    expect(INLINE_BUDGET_BYTES).toBe(64_000);
+    expect(ECHO_BUDGET_BYTES).toBe(4_000);
+  });
+
+  it('keeps a default 100-row page whole on a narrow route', async () => {
+    const fetched = Array.from({ length: 100 }, (_, i) => narrow(i));
+    respond(fetched, 5000);
+
+    const { sc, text, scBytes, textBytes } = await call({});
+
+    expect(sc.data).toEqual(fetched);
+    expect(sc.returned_count).toBe(100);
+    expect(textIds(text)).toEqual(fetched.map((r) => r.id));
+    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+  });
+
+  it('ends a wide default page early, with the same rows and next call on both surfaces', async () => {
+    const fetched = Array.from({ length: 100 }, (_, i) => wide(i));
+    respond(fetched, 26_000);
+
+    const { sc, text, scBytes, textBytes } = await call({});
+    const shown = sc.data.length;
+
+    expect(shown).toBeGreaterThan(0);
+    expect(shown).toBeLessThan(100);
+    expect(sc.data).toEqual(fetched.slice(0, shown));
+    expect(textIds(text)).toEqual(fetched.slice(0, shown).map((r) => r.id));
+    expect(sc.returned_count).toBe(shown);
+    expect(sc.next_offset).toBe(shown);
+    expect(sc.returnedCount).toBe(shown);
+    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    // The page is as long as the budget allows: one more row overflows a surface.
+    const next = fetched[shown] as ReturnType<typeof wide>;
+    const nextJson = bytes(JSON.stringify(next)) + 1;
+    const nextLine = bytes(`\n| ${next.id} | ${next.period} | ${next.stateid} | ${next.note} |`);
+    expect(
+      scBytes + nextJson > INLINE_BUDGET_BYTES || textBytes + nextLine > INLINE_BUDGET_BYTES,
+    ).toBe(true);
+
+    const note = sc.canvas_preview_note as string;
+    expect(note).toContain(
+      `The 64,000-byte response budget ended this page at ${shown} of the 100 rows fetched; continue the inline page at next_offset ${shown}.`,
+    );
+    expect(text).toContain(note);
+    expect(text).toContain(`**Next offset:** ${shown}`);
+  });
+
+  it('holds both surfaces to the budget at the maximum length with wide multibyte strings', async () => {
+    const fetched = Array.from({ length: 5000 }, (_, i) =>
+      row(i, `é|<${'ü'.repeat(400)}>\n${'x'.repeat(300)}`),
+    );
+    respond(fetched, 5000);
+
+    const { sc, text, scBytes, textBytes } = await call({ length: 5000 });
+
+    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(sc.data.length).toBeGreaterThan(0);
+    expect(sc.returned_count).toBe(sc.data.length);
+    expect(sc.next_offset).toBe(sc.data.length);
+    expect(textIds(text)).toEqual(sc.data.map((r) => r.id));
+  });
+
+  /**
+   * Exact boundaries: the padding on the last row is tuned so the binding
+   * surface lands on exactly 64,000 bytes with every row inline, then one byte
+   * past it. Measured through the framework's own composition, so the
+   * handler's trailer estimate is held to what the caller actually receives.
+   */
+  async function tuneLastRow(
+    rows: (pad: number) => Array<Record<string, unknown>>,
+    total: number,
+    surface: 'scBytes' | 'textBytes',
+    input: Record<string, unknown> = {},
+  ) {
+    respond(rows(0), total);
+    const base = await call(input);
+    expect(base.sc.data).toHaveLength(rows(0).length);
+    const pad = INLINE_BUDGET_BYTES - base[surface];
+    expect(pad).toBeGreaterThan(0);
+    respond(rows(pad), total);
+    const exact = await call(input);
+    respond(rows(pad + 1), total);
+    const over = await call(input);
+    return { exact, over, count: rows(0).length };
+  }
+
+  it('fills structuredContent to exactly 64,000 bytes and drops a row one byte past it', async () => {
+    const rows = (pad: number) => [
+      ...Array.from({ length: 50 }, (_, i) => wide(i)),
+      row(50, `${'p'.repeat(pad)}`),
+    ];
+    const { exact, over, count } = await tuneLastRow(rows, 51, 'scBytes');
+
+    expect(exact.scBytes).toBe(INLINE_BUDGET_BYTES);
+    expect(exact.textBytes).toBeLessThan(INLINE_BUDGET_BYTES);
+    expect(exact.sc.data).toHaveLength(count);
+    expect(exact.sc).not.toHaveProperty('next_offset');
+
+    expect(over.sc.data).toHaveLength(count - 1);
+    expect(over.sc.next_offset).toBe(count - 1);
+    expect(over.scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+  });
+
+  it('fills content[] to exactly 64,000 bytes when escaped text binds, filters in the trailer', async () => {
+    // Every `<` costs one byte in JSON and four as `&lt;` in the table, so the
+    // text surface binds; the filter list ends in a bullet, which the trailer
+    // separates from the next field with a blank line.
+    const filters = { stateid: ['TX', 'CA'], sectorid: 'RES' };
+    const rows = (pad: number) => [
+      ...Array.from({ length: 36 }, (_, i) => row(i, '<'.repeat(380))),
+      row(36, `${'<'.repeat(100)}${'p'.repeat(pad)}`),
+    ];
+    const { exact, over, count } = await tuneLastRow(rows, 37, 'textBytes', { filters });
+
+    expect(exact.text).toContain('- **sectorid:** RES\n\n**appliedOffset:** 0');
+    expect(exact.textBytes).toBe(INLINE_BUDGET_BYTES);
+    expect(exact.scBytes).toBeLessThan(INLINE_BUDGET_BYTES);
+    expect(exact.sc.data).toHaveLength(count);
+
+    expect(over.sc.data).toHaveLength(count - 1);
+    expect(over.textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(textIds(over.text)).toEqual(over.sc.data.map((r) => r.id));
+  });
+
+  it('withholds a row larger than the budget and names the offset that skips it', async () => {
+    respond([row(0, 'x'.repeat(70_000)), wide(1)], 5000);
+
+    const { sc, text, scBytes, textBytes } = await call({ offset: 10, length: 2 });
+
+    expect(sc.data).toEqual([]);
+    expect(sc.returned_count).toBe(0);
+    // next_offset stays on the withheld row; the note says how to step past it.
+    expect(sc.next_offset).toBe(10);
+    const note = sc.canvas_preview_note as string;
+    expect(note).toContain(
+      'The row at offset 10 alone exceeds the 64,000-byte response budget, so no rows are shown inline — narrow it with columns, or skip it with offset 11.',
+    );
+    expect(text).toContain(note);
+    expect(text).toContain('_No rows returned._');
+    expect(sc).not.toHaveProperty('notice');
+    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+  });
+
+  it('pages a mixed-width match by next_offset with no gap or overlap', async () => {
+    // Widths vary row to row; row 137 alone overflows the budget.
+    const dataset = Array.from({ length: 420 }, (_, i) =>
+      i === 137 ? row(i, 'x'.repeat(80_000)) : row(i, 'v'.repeat((i * 97) % 2_400)),
+    );
+    mockQuery.mockImplementation(
+      async (_route: string, opts: { offset: number; length: number }) => ({
+        route: 'electricity/operating-generator-capacity',
+        total: dataset.length,
+        dateFormat: 'YYYY-MM',
+        frequency: 'monthly',
+        data: dataset.slice(opts.offset, opts.offset + opts.length),
+        warnings: undefined,
+      }),
+    );
+
+    const seen: Array<Record<string, unknown>> = [];
+    const skipped: number[] = [];
+    let offset = 0;
+    let pages = 0;
+    for (;;) {
+      const { sc, scBytes, textBytes } = await call({ offset, length: 100 });
+      pages++;
+      expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+      expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+      seen.push(...sc.data);
+      if (sc.next_offset === undefined) break;
+      expect(sc.next_offset).toBe(offset + (sc.returned_count as number));
+      if (sc.returned_count === 0) {
+        // The withheld-row note's own instruction: skip with offset + 1.
+        skipped.push(offset);
+        offset += 1;
+      } else {
+        offset = sc.next_offset as number;
+      }
+      expect(pages).toBeLessThan(100);
+    }
+
+    expect(skipped).toEqual([137]);
+    expect(seen).toEqual(dataset.filter((_, i) => i !== 137));
+    expect(pages).toBeGreaterThan(5);
+  });
+
+  it('omits next_offset on the last page, an empty match, and an offset past the end', async () => {
+    respond([narrow(0), narrow(1)], 52);
+    expect((await call({ offset: 50 })).sc).not.toHaveProperty('next_offset');
+
+    respond([], 0);
+    const empty = await call({});
+    expect(empty.sc).not.toHaveProperty('next_offset');
+    expect(empty.sc.notice).toMatch(/^No rows matched the filters/);
+
+    respond([], 52);
+    const past = await call({ offset: 60 });
+    expect(past.sc).not.toHaveProperty('next_offset');
+    expect(past.sc.notice).toMatch(/^Offset 60 is past the last row/);
+  });
+
+  it('stages every fetched row when the budget trims the inline page, pointer → range → inline', async () => {
+    const register = registeringBridge('df_WIDE', 500);
+    const fetched = Array.from({ length: 100 }, (_, i) => wide(i));
+    const accumulated = Array.from({ length: 500 }, (_, i) => wide(i));
+    respond(fetched, 26_000, { accumulated: { rows: accumulated, capped: true, cap: 500 } });
+
+    const { sc, text, scBytes, textBytes } = await call({ stage: true });
+    const shown = sc.data.length;
+
+    expect(register.mock.calls[0]?.[1].rows).toEqual(accumulated);
+    expect(shown).toBeLessThan(100);
+    expect(sc.next_offset).toBe(shown);
+    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+
+    const note = sc.canvas_preview_note as string;
+    const pointer = note.indexOf('500 rows staged as df_WIDE');
+    const range = note.indexOf('Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (500)');
+    const inline = note.indexOf(`Showing ${shown} of 26,000 rows inline.`);
+    const budget = note.indexOf(`The 64,000-byte response budget ended this page at ${shown}`);
+    const pageWithoutStaging = note.indexOf('Page the inline rows with stage left off');
+    expect(pointer).toBe(0);
+    expect(range).toBeGreaterThan(pointer);
+    expect(inline).toBeGreaterThan(range);
+    expect(budget).toBeGreaterThan(inline);
+    expect(pageWithoutStaging).toBeGreaterThan(budget);
+    expect(text).toContain(note);
+  });
+
+  it('bounds a huge filter echo with a marker and still sends every value', async () => {
+    const values = Array.from({ length: 20_000 }, (_, i) => `PLANT${String(i).padStart(6, '0')}`);
+    respond(
+      Array.from({ length: 100 }, (_, i) => wide(i)),
+      26_000,
+    );
+
+    const { sc, text, scBytes, textBytes } = await call({
+      filters: { plantid: values, stateid: 'TX' },
+    });
+
+    expect(mockQuery.mock.calls[0]?.[1].filters.plantid).toHaveLength(20_000);
+    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(sc.data.length).toBeGreaterThan(0);
+
+    const echo = sc.appliedFilters as Record<string, string | string[]>;
+    expect(bytes(JSON.stringify(echo))).toBeLessThanOrEqual(ECHO_BUDGET_BYTES);
+    const kept = echo.plantid as string[];
+    expect(kept).toEqual(values.slice(0, kept.length));
+    expect(echo).not.toHaveProperty('stateid');
+    // A facet cut whole is still named in the marker, with its count.
+    expect(echo['…']).toBe(
+      `${(20_001 - kept.length).toLocaleString()} of 20,001 filter values not echoed (plantid: ${(20_000 - kept.length).toLocaleString()}, stateid: 1) — the query applied every one.`,
+    );
+    expect(text).toContain(`- **…:** ${echo['…']}`);
+  });
+
+  it('echoes a filter set under the echo budget unchanged', async () => {
+    respond([narrow(0)], 1);
+    const filters = { stateid: ['TX', 'CA'], sectorid: 'RES' };
+
+    const { sc } = await call({ filters });
+
+    expect(sc.appliedFilters).toEqual(filters);
   });
 });
