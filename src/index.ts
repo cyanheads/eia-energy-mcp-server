@@ -14,7 +14,7 @@ import { describeRouteTool } from './mcp-server/tools/definitions/describe-route
 import { queryRouteTool } from './mcp-server/tools/definitions/query-route.tool.js';
 import { searchRoutesTool } from './mcp-server/tools/definitions/search-routes.tool.js';
 import { initCanvasBridge } from './services/canvas-bridge/canvas-bridge.js';
-import { initEiaApiService } from './services/eia/eia-service.js';
+import { initEiaApiService, shutdownEiaApiService } from './services/eia/eia-service.js';
 
 const serverConfig = getServerConfig();
 
@@ -56,7 +56,7 @@ await createApp({
   title: 'eia-energy-mcp-server',
   sessionMode: 'stateless',
   instructions:
-    'Use the `eia_*` tools for U.S. Energy Information Administration (EIA) API v2 energy data. Requires an `EIA_API_KEY`. Routes use path identifiers (e.g. `electricity`, `petroleum/pri`); leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling resolves the same way. Workflow: `eia_search_routes` or `eia_browse_routes` to find a leaf route → `eia_describe_route` for its facets and columns → `eia_query_route` with facet-ID filters. Facet values come only from describe, not route metadata, so describe before querying. Values arrive as strings. `eia_query_route` returns a preview and stages nothing by default; pass `stage: true` to also stage the matching rows as a DataCanvas table named by the `dataset` field, queried via SQL with `eia_dataframe_query`. Every dataset a tenant stages shares one canvas, so tables from different routes cross-join by name. The dataframe tools are listed only where a canvas is configured.',
+    'Use the `eia_*` tools for U.S. Energy Information Administration (EIA) API v2 energy data. Requires an `EIA_API_KEY`. Routes use path identifiers (e.g. `electricity`, `petroleum/pri`); leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling resolves the same way. Workflow: `eia_search_routes` or `eia_browse_routes` to find a leaf route → `eia_describe_route` for its facets and columns → `eia_query_route` with facet-ID filters. Facet values come only from describe, not route metadata, so describe before querying. Values arrive as strings. Row-returning responses hold each surface to 64,000 bytes, cutting between whole rows: continue `eia_query_route` at `next_offset`. `eia_query_route` returns a preview and stages nothing by default; pass `stage: true` to also stage the matching rows as a DataCanvas table named by the `dataset` field — call `eia_dataframe_describe` for its column names (staging turns hyphens into underscores), then query it via SQL with `eia_dataframe_query`. Every dataset a tenant stages shares one canvas, so tables from different routes cross-join by name. The dataframe tools are listed only where a canvas is configured.',
   tools: [
     browseRoutesTool,
     describeRouteTool,
@@ -70,5 +70,9 @@ await createApp({
   setup(core) {
     initEiaApiService();
     initCanvasBridge(core.canvas);
+  },
+  // The route-index warm outlives the request that starts it, so shutdown is what ends it.
+  teardown() {
+    shutdownEiaApiService();
   },
 });

@@ -7,6 +7,7 @@
  * @module tests/index.test
  */
 
+import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
 
@@ -25,15 +26,27 @@ function disabledMeta(def: unknown): DisabledMetadata | undefined {
 }
 
 /**
- * Import the entry point with `createApp` stubbed and return the tool list it
- * was handed, keyed by tool name.
+ * Every test re-imports the entry point after `vi.resetModules()`, so each one
+ * loads the server's whole module graph — the first in a worker also
+ * transforms it. That is well under a second idle and several seconds on a
+ * loaded machine, past Vitest's 5 s default.
  */
-async function registeredTools(): Promise<Map<string, unknown>> {
-  const captured: Array<{ tools: Array<{ name: string }>; sessionMode?: string }> = [];
+const IMPORT_TIMEOUT = { timeout: 30_000 };
+
+/** The slice of `createApp`'s options these tests read. */
+interface CapturedOptions {
+  sessionMode?: string;
+  teardown?: () => void | Promise<void>;
+  tools: Array<{ name: string }>;
+}
+
+/** Import the entry point with `createApp` stubbed and return the options it was handed. */
+async function composedOptions(): Promise<CapturedOptions> {
+  const captured: CapturedOptions[] = [];
 
   vi.doMock('@cyanheads/mcp-ts-core', async (importOriginal) => ({
     ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core')>()),
-    createApp: vi.fn((options: { tools: Array<{ name: string }>; sessionMode?: string }) => {
+    createApp: vi.fn((options: CapturedOptions) => {
       captured.push(options);
       return Promise.resolve(undefined);
     }),
@@ -43,11 +56,17 @@ async function registeredTools(): Promise<Map<string, unknown>> {
 
   const options = captured[0];
   if (!options) throw new Error('createApp was not called');
+  return options;
+}
+
+/** The tool list `createApp` was handed, keyed by tool name. */
+async function registeredTools(): Promise<Map<string, unknown>> {
+  const options = await composedOptions();
   expect(options.sessionMode).toBe('stateless');
   return new Map(options.tools.map((t) => [t.name, t]));
 }
 
-describe('tool registration', () => {
+describe('tool registration', IMPORT_TIMEOUT, () => {
   beforeEach(() => {
     vi.resetModules();
     vi.stubEnv('EIA_API_KEY', 'test-key');
@@ -128,5 +147,48 @@ describe('tool registration', () => {
     expect(disabledMeta(tools.get('eia_dataframe_query'))?.hint).toBe(
       'CANVAS_PROVIDER_TYPE=duckdb',
     );
+  });
+});
+
+describe('shutdown', IMPORT_TIMEOUT, () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    _resetServerConfig();
+  });
+
+  afterEach(() => {
+    vi.doUnmock('@cyanheads/mcp-ts-core');
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+  });
+
+  // The warm no request owns has exactly one way to stop: the teardown hook.
+  it('aborts the route-index warm from the teardown hook', async () => {
+    const options = await composedOptions();
+    // Same module registry as the entry point just imported, so the same service.
+    const { initEiaApiService, getEiaApiService } = await import('@/services/eia/eia-service.js');
+    initEiaApiService();
+    const fetched = Promise.withResolvers<AbortSignal | undefined>();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_input: string | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal ?? undefined;
+            signal?.addEventListener('abort', () => reject(signal.reason));
+            fetched.resolve(signal);
+          }),
+      ),
+    );
+
+    const browse = getEiaApiService().browse(undefined, createMockContext());
+    const warmSignal = await fetched.promise;
+    expect(warmSignal?.aborted).toBe(false);
+    await options.teardown?.();
+
+    expect(warmSignal?.aborted).toBe(true);
+    await expect(browse).rejects.toThrow('EIA service shut down');
   });
 });

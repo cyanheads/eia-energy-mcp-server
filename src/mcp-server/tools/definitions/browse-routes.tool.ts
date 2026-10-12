@@ -13,7 +13,7 @@ import { getEiaApiService } from '@/services/eia/eia-service.js';
 export const browseRoutesTool = tool('eia_browse_routes', {
   title: 'Browse EIA Routes',
   description:
-    'Lists child routes under a given path in the EIA dataset taxonomy. Start with no path to get the 14 top-level categories (electricity, petroleum, natural-gas, steo, aeo, ieo, seds, etc.), then drill into subcategories. Each result includes an isLeaf flag — leaf routes are queryable endpoints; non-leaf routes have children to browse. When isLeaf is true on the browsed path itself, switch to eia_describe_route.',
+    'Lists child routes under a given path in the EIA dataset taxonomy. Start with no path to get the 14 top-level categories (electricity, petroleum, natural-gas, steo, aeo, ieo, seds, etc.), then drill into subcategories. Each result includes an isLeaf flag — leaf routes are queryable endpoints; non-leaf routes have children to browse. When isLeaf is true on the browsed path itself, switch to eia_describe_route. The first call after server start waits up to 20s for the route tree to warm, then answers from EIA directly.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   inputAliases: { route: 'path' },
 
@@ -59,6 +59,23 @@ export const browseRoutesTool = tool('eia_browse_routes', {
       code: JsonRpcErrorCode.NotFound,
       when: 'Path does not exist in the EIA taxonomy.',
       recovery: 'Call eia_browse_routes without a path to see valid top-level categories.',
+    },
+    {
+      reason: 'rate_limited',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA rate limit hit (OVER_RATE_LIMIT) while building the route tree on the first call after server start, or on the live fetch of the browsed path a cold call falls back to.',
+      recovery: 'Back off and retry; use a production EIA API key for higher rate limits.',
+    },
+    {
+      reason: 'upstream_unreachable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA could not be reached (connection refused or reset, DNS failure) while building the route tree on the first call after server start, or on the live fetch of the browsed path a cold call falls back to.',
+      recovery:
+        'Retry after a short wait — EIA could not be reached; if it keeps failing, check api.eia.gov availability.',
     },
   ],
 

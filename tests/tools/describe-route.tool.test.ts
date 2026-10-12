@@ -342,6 +342,91 @@ describe('describeRouteTool', () => {
     });
   });
 
+  // #59 — the service names a value list EIA did not return in unfetchedFacets;
+  // the tool must not show it as a facet with value_count 0.
+  describe('unavailable facets', () => {
+    const PARTIAL_META = {
+      ...FULL_META,
+      facets: [
+        wideFacet('stateid', 3),
+        { id: 'sectorid', description: 'Sector', values: [] },
+        { id: 'emptyfacet', description: 'Empty', values: [] },
+      ],
+      unfetchedFacets: ['sectorid'],
+    };
+
+    it('leaves an unavailable facet out of facets[] and names it in unavailable_facets', async () => {
+      mockDescribe.mockResolvedValue(PARTIAL_META);
+
+      const ctx = createMockContext({ errors: describeRouteTool.errors });
+      const input = describeRouteTool.input.parse({ route: 'electricity/retail-sales' });
+      const result = await describeRouteTool.handler(input, ctx);
+
+      expect(result.facets.map((f) => [f.id, f.value_count])).toEqual([
+        ['stateid', 3],
+        ['emptyfacet', 0],
+      ]);
+      expect(result.unavailable_facets).toEqual(['sectorid']);
+      expect(describeRouteTool.output.parse(result)).toEqual(result);
+      const notice = getEnrichment(ctx).notice as string;
+      expect(notice).toContain('EIA did not return the values of sectorid');
+      expect(notice).toContain('call eia_describe_route again');
+
+      const text = (describeRouteTool.format?.(result) ?? [])
+        .map((c) => ('text' in c ? c.text : ''))
+        .join('\n');
+      expect(text).toContain('**Unavailable facets:** sectorid');
+      expect(text).not.toContain('- **sectorid**');
+      expect(text).toContain('- **emptyfacet** (0 values)');
+    });
+
+    it('carries the offset notice and the unavailable notice together', async () => {
+      mockDescribe.mockResolvedValue(PARTIAL_META);
+
+      const ctx = createMockContext({ errors: describeRouteTool.errors });
+      const input = describeRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        values_offset: 5,
+      });
+      await describeRouteTool.handler(input, ctx);
+
+      const notice = getEnrichment(ctx).notice as string;
+      expect(notice).toContain('stateid (3 values, last valid offset 2)');
+      expect(notice).toContain('EIA did not return the values of sectorid');
+    });
+
+    it('names the facet input to the service and reports no other facet when restricted', async () => {
+      mockDescribe.mockResolvedValue(PARTIAL_META);
+
+      const ctx = createMockContext({ errors: describeRouteTool.errors });
+      const input = describeRouteTool.input.parse({
+        route: 'electricity/retail-sales',
+        facet: 'stateid',
+      });
+      const result = await describeRouteTool.handler(input, ctx);
+
+      expect(mockDescribe).toHaveBeenCalledWith('electricity/retail-sales', ctx, {
+        facet: 'stateid',
+      });
+      expect(result.facets.map((f) => f.id)).toEqual(['stateid']);
+      expect(result).not.toHaveProperty('unavailable_facets');
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('sends no facet option when the input names none', async () => {
+      mockDescribe.mockResolvedValue(FULL_META);
+
+      const ctx = createMockContext({ errors: describeRouteTool.errors });
+      const result = await describeRouteTool.handler(
+        describeRouteTool.input.parse({ route: 'electricity/retail-sales' }),
+        ctx,
+      );
+
+      expect(mockDescribe).toHaveBeenCalledWith('electricity/retail-sales', ctx, {});
+      expect(result).not.toHaveProperty('unavailable_facets');
+    });
+  });
+
   describe('format()', () => {
     it('renders all required fields including query and alias', () => {
       const result = {

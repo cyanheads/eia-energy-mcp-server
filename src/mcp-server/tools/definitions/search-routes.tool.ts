@@ -2,33 +2,45 @@
  * @fileoverview Tool definition for eia_search_routes. Fuzzy text search across
  * route names, descriptions, and category labels using an in-memory Fuse.js
  * index. Resolves natural-language queries to route paths. Two further entry
- * classes join the index and answer with a `filter_hint`: STEO series names
- * (1,469 entries) and facet values — fuel types, sectors, coal ranks — so a
- * query naming a value resolves to the route that exposes it. A multi-term
- * query is additionally matched term by term, which is what reaches the route
- * behind a commodity + metric + sector question; `route-cache.ts` carries the
- * mechanism and `scripts/eval-search.ts` measures it.
+ * classes join the index and answer with a `filter_hint`: named series (STEO's
+ * 1,469 and SEDS's 968 `seriesId` values) and facet values — fuel types,
+ * sectors, coal ranks — so a query naming a value resolves to the route that
+ * exposes it. A multi-term query is additionally matched term by term, which is
+ * what reaches the route behind a commodity + metric + sector question, and a
+ * query spelling the end of a route's path ("retail sales") ranks that route
+ * first as an exact match; `route-cache.ts` carries the mechanism and
+ * `scripts/eval-search.ts` measures it.
  *
  * The first call waits for the whole corpus to warm, because a ranking over a
  * half-filled index is indistinguishable from a ranking over the full one: the
  * entry that belongs in the top slot is simply absent, and a mediocre hit takes
  * its place. That wait is capped, so an upstream slow enough to outlast the
  * caller still gets an answer out. `indexComplete` reports whether the wait
- * ended in a complete corpus; `indexGaps` names what is missing when it did not.
+ * ended in a complete corpus; `indexGaps` names what is missing when it did not,
+ * and the next search retries an index pass named there.
+ *
+ * `truncated` is measured, not inferred: the service looks one match past the
+ * cap, so a search that ends exactly at `limit` reads as complete. `limit`
+ * accepts up to 100 but each call returns at most `SEARCH_RESULT_CAP`; a larger
+ * value is served at the cap and disclosed rather than rejected.
  * @module mcp-server/tools/definitions/search-routes.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
+
+/** Most results one call returns, whatever `limit` asks for. */
+const SEARCH_RESULT_CAP = 30;
 
 /**
  * Score above which a hit is labelled a weak match.
  *
  * Derived by running `scripts/search-battery.ts` through `scripts/eval-search.ts`
- * against the live 2,103-entry corpus. The measurement found two clusters: the
- * routes the battery's answerable queries surface score at or below 0.6600, and
+ * against the live 3,165-entry corpus. The measurement found two clusters: the
+ * routes the battery's answerable queries surface score at or below 0.6638, and
  * the queries the taxonomy cannot answer score at or above 0.7632. 0.72 sits
- * between them, and no battery query falls between 0.6600 and 0.7632.
+ * between them, and no battery query falls between 0.6638 and 0.7632.
  *
  * One case falls on the wrong side, and it does not move by choosing a
  * different number — it sits above every off-target score, so any threshold
@@ -63,21 +75,26 @@ export const WEAK_MATCH_SCORE = 0.72;
 export const searchRoutesTool = tool('eia_search_routes', {
   title: 'Search EIA Routes',
   description:
-    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. Multi-term queries are also matched term by term, so combining a commodity, a metric, and a sector — "electricity price residential", "coal generation industrial sector" — reaches the route carrying that data even when no single entry reads like the whole phrase. STEO series names are indexed so queries like "ethanol net imports" or "crude oil production forecast" also resolve, and so are facet values, so a fuel type or sector term like "wind" or "anthracite coal" resolves to the route that exposes it, with filter_hint carrying the filter to pass on. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.72 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy. The first call after server start waits 24-30s while the index warms, and at most 45s; every later call returns in milliseconds. Check indexComplete before reading anything into a short or empty result set.',
+    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. Multi-term queries are also matched term by term, so combining a commodity, a metric, and a sector — "electricity price residential", "coal generation industrial sector" — reaches the route carrying that data even when no single entry reads like the whole phrase. A query spelling the end of a route path in words — "retail sales" for electricity/retail-sales — ranks that route first. STEO and SEDS series names are indexed so queries like "crude oil production forecast" or "motor gasoline total consumption" also resolve, and so are facet values, so a fuel type or sector term like "wind" or "anthracite coal" resolves to the route that exposes it, with filter_hint carrying the filter to pass on. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.72 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy. The first call after server start waits 24-30s while the index warms, and at most 45s; every later call returns in milliseconds. Check indexComplete before reading anything into a short or empty result set.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
     query: z
       .string()
-      .min(1)
-      .describe('Free-text search terms to match against route names and descriptions.'),
+      .trim()
+      .min(1, 'query must contain at least one non-whitespace character')
+      .describe(
+        'Free-text search terms to match against route names and descriptions. Leading and trailing whitespace is ignored.',
+      ),
     limit: z
       .number()
       .int()
       .min(1)
-      .max(30)
+      .max(100)
       .default(10)
-      .describe('Maximum results to return (default 10, max 30).'),
+      .describe(
+        `Maximum results to return (default 10). One call returns at most ${SEARCH_RESULT_CAP}; a larger limit is served at ${SEARCH_RESULT_CAP}, and truncated says whether more matches exist.`,
+      ),
   }),
 
   output: z.object({
@@ -104,7 +121,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
               .record(z.string(), z.string())
               .optional()
               .describe(
-                'Pre-built filter for eia_query_route when a specific facet value is required. Present on STEO series and facet-value results — pass directly as filters (e.g. eia_query_route(route="steo", filters=filter_hint)).',
+                'Pre-built filter for eia_query_route when a specific facet value is required. Present on STEO and SEDS series results and facet-value results — pass directly as filters (e.g. eia_query_route(route="seds", filters=filter_hint)).',
               ),
           })
           .describe('A search result entry.'),
@@ -113,10 +130,14 @@ export const searchRoutesTool = tool('eia_search_routes', {
   }),
 
   enrichment: {
-    effectiveQuery: z.string().describe('Query as submitted to the Fuse.js index.'),
+    effectiveQuery: z
+      .string()
+      .describe('Query as searched — the submitted text with surrounding whitespace trimmed.'),
     totalIndexed: z
       .number()
-      .describe('Total entries in the search index (routes + STEO series names + facet values).'),
+      .describe(
+        'Total entries in the search index (routes + STEO and SEDS series names + facet values).',
+      ),
     indexComplete: z
       .boolean()
       .describe(
@@ -126,16 +147,22 @@ export const searchRoutesTool = tool('eia_search_routes', {
       .array(z.string())
       .optional()
       .describe(
-        'Present only when indexComplete is false: route paths whose metadata could not be fetched (call eia_browse_routes on one to re-fetch it) and index passes that did not land ("steo_series", "facet_values").',
+        'Present only when indexComplete is false: route paths whose metadata could not be fetched (call eia_browse_routes on one to re-fetch it) and index passes that did not land ("steo_series", "seds_series", "facet_values"), which the next search retries.',
       ),
-    truncated: z.boolean().describe('True when matches were capped at limit; more may exist.'),
+    truncated: z
+      .boolean()
+      .describe('True when more matches exist past the ones returned; false when these are all.'),
     shown: z.number().describe('Number of results returned.'),
-    cap: z.number().describe('The limit that was applied.'),
+    cap: z
+      .number()
+      .describe(
+        `Most results this call could return — limit, or ${SEARCH_RESULT_CAP} when limit was larger.`,
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Recovery hint when no routes matched — suggests alternative queries or using eia_browse_routes.',
+        'Present when no routes matched, or when more matches exist than were returned — says how to narrow or widen the search.',
       ),
   },
 
@@ -144,10 +171,31 @@ export const searchRoutesTool = tool('eia_search_routes', {
     indexGaps: { render: (gaps: string[]) => `**indexGaps:** ${gaps.join(', ')}` },
   },
 
+  errors: [
+    {
+      reason: 'rate_limited',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA rate limit hit (OVER_RATE_LIMIT) while building the route tree on the first call after server start.',
+      recovery: 'Back off and retry; use a production EIA API key for higher rate limits.',
+    },
+    {
+      reason: 'upstream_unreachable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA could not be reached (connection refused or reset, DNS failure) while building the route tree on the first call after server start.',
+      recovery:
+        'Retry after a short wait — EIA could not be reached; if it keeps failing, check api.eia.gov availability.',
+    },
+  ],
+
   async handler(input, ctx) {
     ctx.log.info('Executing eia_search_routes', { query: input.query, limit: input.limit });
     const service = getEiaApiService();
-    const { results, status } = await service.search(input.query, input.limit, ctx);
+    const cap = Math.min(input.limit, SEARCH_RESULT_CAP);
+    const { results, hasMore, status } = await service.search(input.query, cap, ctx);
 
     const gaps = [...status.incompleteRoutes, ...status.pendingPasses];
 
@@ -155,7 +203,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
     ctx.enrich({
       totalIndexed: status.size,
       shown: results.length,
-      cap: input.limit,
+      cap,
       truncated: false,
       indexComplete: status.complete,
       ...(gaps.length > 0 && { indexGaps: gaps }),
@@ -166,11 +214,14 @@ export const searchRoutesTool = tool('eia_search_routes', {
           ? `No routes matched "${input.query}". Try different search terms or use eia_browse_routes to explore the taxonomy.`
           : `No routes matched "${input.query}", but part of the corpus is missing (see indexGaps) — a match may exist that was never scored. Try eia_browse_routes to explore the taxonomy directly.`,
       );
-    } else if (results.length >= input.limit) {
+    } else if (hasMore) {
       ctx.enrich.truncated({
         shown: results.length,
-        cap: input.limit,
-        guidance: 'More matches may exist — narrow the query or raise limit (max 30).',
+        cap,
+        guidance:
+          input.limit < SEARCH_RESULT_CAP
+            ? `More matches exist — narrow the query or raise limit (max ${SEARCH_RESULT_CAP}).`
+            : `More matches exist — one call returns at most ${SEARCH_RESULT_CAP}; narrow the query to reach the rest.`,
       });
     }
 

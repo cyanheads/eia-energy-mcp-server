@@ -48,7 +48,7 @@ const restatesPair = (alias: string, id: string, name: string): boolean => {
 /**
  * EIA sends one facet value in the taxonomy whose identifier is a single space
  * — `electricity/facility-fuel`'s `primeMover`, its unspecified-prime-mover
- * bucket, which filters 14,955 rows and so cannot be dropped. Printed raw it
+ * bucket, which filters real rows and so cannot be dropped. Printed raw it
  * leaves a hole in the comma-joined line (`FW=FW,  = , PV=PV`), so a reader of
  * `content[]` alone cannot see the value is there or what to pass. Quoting
  * makes the blank visible and its bounds copyable; every other value in the
@@ -59,7 +59,7 @@ const showBlank = (s: string): string => (s.trim() === '' ? `"${s}"` : s);
 export const describeRouteTool = tool('eia_describe_route', {
   title: 'Describe EIA Route',
   description:
-    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints and merged — results are cached per-route for the process lifetime to minimize API calls.',
+    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints, merged, and cached per route; a facet whose values EIA did not return is left out of facets, named in unavailable_facets, and fetched again by the next call.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   inputAliases: { path: 'route' },
 
@@ -131,7 +131,13 @@ export const describeRouteTool = tool('eia_describe_route', {
           .describe('A filterable dimension for this route.'),
       )
       .describe(
-        'Filterable dimensions. Each facet has an ID and a window of its valid values. Restricted to one entry when the facet input is set.',
+        'Filterable dimensions. Each facet has an ID and a window of its valid values. Restricted to one entry when the facet input is set. A facet named in unavailable_facets is left out.',
+      ),
+    unavailable_facets: z
+      .array(z.string().describe('Facet ID whose value list EIA did not return.'))
+      .optional()
+      .describe(
+        'Facet IDs whose value lists EIA did not return after retries, left out of facets. Each ID still filters eia_query_route — only its values are missing. Call eia_describe_route again to re-fetch these lists alone. Absent when every facet is in facets.',
       ),
     values_offset: z
       .number()
@@ -176,7 +182,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .optional()
       .describe(
-        'Guidance when values_offset lands past the last value of one or more facets — names each emptied facet, its value_count, and its last valid offset. Absent when every facet returned values.',
+        'Guidance when values_offset lands past the last value of one or more facets — naming each emptied facet, its value_count, and its last valid offset — or when EIA did not return the value list of a facet named in unavailable_facets. Absent when neither applies.',
       ),
   },
 
@@ -204,12 +210,30 @@ export const describeRouteTool = tool('eia_describe_route', {
         "Call eia_describe_route without facet to list this route's facet IDs, then retry with one of them.",
     },
     {
+      reason: 'facet_unavailable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'The facet input names a facet whose value list EIA did not return after retries.',
+      recovery:
+        'Retry the same call after a short wait; without the facet input the route describes with its other facets.',
+    },
+    {
       reason: 'rate_limited',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
       retryable: true,
-      when: 'EIA rate limit hit during facet fan-out.',
+      when: 'EIA rate limit hit on the route metadata request, or on the value list the facet input names.',
       recovery: 'Back off and retry; use a production EIA API key for higher rate limits.',
+    },
+    {
+      reason: 'upstream_unreachable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA could not be reached (connection refused or reset, DNS failure) on the route metadata request or the route-tree build. A value list the facet input names fails as facet_unavailable instead.',
+      recovery:
+        'Retry after a short wait — EIA could not be reached; if it keeps failing, check api.eia.gov availability.',
     },
   ],
 
@@ -220,20 +244,27 @@ export const describeRouteTool = tool('eia_describe_route', {
       valuesOffset: input.values_offset,
     });
     const service = getEiaApiService();
-    const meta = await service.describe(input.route, ctx);
+    // Naming the facet lets the service fail the call when that one list is
+    // the one EIA did not return, rather than hand back an empty window.
+    const meta = await service.describe(input.route, ctx, {
+      ...(input.facet !== undefined && { facet: input.facet }),
+    });
 
-    let facets = meta.facets;
+    const unavailable = new Set(meta.unfetchedFacets);
+    let facets = meta.facets.filter((f) => !unavailable.has(f.id));
     if (input.facet) {
       const selected = facets.find((f) => f.id === input.facet);
       if (!selected) {
         throw ctx.fail('facet_not_found', `Route "${input.route}" has no facet "${input.facet}".`, {
           route: input.route,
-          availableFacets: facets.map((f) => f.id),
+          availableFacets: meta.facets.map((f) => f.id),
           ...ctx.recoveryFor('facet_not_found'),
         });
       }
       facets = [selected];
     }
+    // A response restricted to one facet does not report on the others.
+    const unavailableFacets = input.facet ? [] : [...unavailable];
 
     const cap = getServerConfig().facetValueCap;
     const offset = input.values_offset;
@@ -260,6 +291,7 @@ export const describeRouteTool = tool('eia_describe_route', {
      * every narrower one beside it. Name those facets and their counts so the
      * two cases read apart and the caller has an offset to come back with.
      */
+    const notices: string[] = [];
     const overshot = windows.filter((f) => f.values.length === 0 && f.value_count > 0);
     if (overshot.length > 0) {
       const named = overshot
@@ -268,16 +300,29 @@ export const describeRouteTool = tool('eia_describe_route', {
             `${f.id} (${f.value_count.toLocaleString()} values, last valid offset ${(f.value_count - 1).toLocaleString()})`,
         )
         .join(', ');
-      ctx.enrich.notice(
+      notices.push(
         `values_offset ${offset.toLocaleString()} is past the last value of ${named}. Reduce values_offset to at most that facet's last valid offset, or pass facet to page one facet at a time so a shared offset stops emptying the narrower ones.`,
       );
     }
+    /**
+     * A list EIA did not return is not an empty facet, so it is named rather
+     * than shown with a value_count of 0 — and the retry is cheap, since the
+     * next call re-fetches only these lists.
+     */
+    if (unavailableFacets.length > 0) {
+      const one = unavailableFacets.length === 1;
+      notices.push(
+        `EIA did not return the values of ${unavailableFacets.join(', ')} after retries, so ${one ? 'it is' : 'they are'} left out of facets. ${one ? 'The ID still filters' : 'The IDs still filter'} eia_query_route; call eia_describe_route again to re-fetch only the missing value lists.`,
+      );
+    }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       route: meta.route,
       description: meta.description,
       values_offset: offset,
       facets: windows,
+      ...(unavailableFacets.length > 0 && { unavailable_facets: unavailableFacets }),
       data_columns: meta.dataColumns.map((c) => ({
         id: c.id,
         alias: c.alias,
@@ -358,6 +403,12 @@ export const describeRouteTool = tool('eia_describe_route', {
           : '';
         lines.push(`- **${facet.id}** (${scope}): ${facet.description}${valueList}${more}`);
       }
+    }
+
+    if (result.unavailable_facets?.length) {
+      lines.push(
+        `\n**Unavailable facets:** ${result.unavailable_facets.join(', ')} — EIA did not return their values; each ID still filters eia_query_route. Call eia_describe_route(route="${result.route}") again to re-fetch only these lists.`,
+      );
     }
 
     return [{ type: 'text', text: lines.join('\n') }];

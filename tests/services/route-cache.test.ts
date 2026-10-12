@@ -14,6 +14,7 @@ import {
   getIndexStatus,
   getNode,
   indexFacetValues,
+  indexNamedSeries,
   initRouteCache,
   isLeafNode,
   isRouteCacheReady,
@@ -258,11 +259,11 @@ describe('route-cache', () => {
   });
 
   describe('getIndexStatus / markIndexPassSettled', () => {
-    it('reports both passes pending before init', () => {
+    it('reports every pass pending before init', () => {
       expect(getIndexStatus()).toEqual({
         complete: false,
         incompleteRoutes: [],
-        pendingPasses: ['facet_values', 'steo_series'],
+        pendingPasses: ['facet_values', 'steo_series', 'seds_series'],
         size: 0,
       });
     });
@@ -272,10 +273,15 @@ describe('route-cache', () => {
       expect(getIndexStatus().complete).toBe(false);
 
       markIndexPassSettled('steo_series');
-      expect(getIndexStatus().pendingPasses).toEqual(['facet_values']);
+      expect(getIndexStatus().pendingPasses).toEqual(['facet_values', 'seds_series']);
       expect(getIndexStatus().complete).toBe(false);
 
       markIndexPassSettled('facet_values');
+      // Each named-series facet settles on its own: STEO landing says nothing about SEDS.
+      expect(getIndexStatus().pendingPasses).toEqual(['seds_series']);
+      expect(getIndexStatus().complete).toBe(false);
+
+      markIndexPassSettled('seds_series');
       expect(getIndexStatus()).toEqual({
         complete: true,
         incompleteRoutes: [],
@@ -287,6 +293,7 @@ describe('route-cache', () => {
     it('stays incomplete while a route subtree is missing, whatever the passes did', () => {
       initRouteCache([{ id: 'coal', name: 'Coal', incomplete: true }], []);
       markIndexPassSettled('steo_series');
+      markIndexPassSettled('seds_series');
       markIndexPassSettled('facet_values');
 
       const status = getIndexStatus();
@@ -518,6 +525,96 @@ describe('route-cache', () => {
       expect(routes).toContain('petroleum/pri/gnd');
     });
   });
+
+  describe('indexNamedSeries', () => {
+    /** `count` distinct SEDS-shaped series values. */
+    function series(count: number): Facet['values'] {
+      return Array.from({ length: count }, (_, i) => ({ id: `S${i}B`, name: `Series ${i}` }));
+    }
+
+    it('returns 0 before init', () => {
+      expect(indexNamedSeries('seds_series', series(3))).toBe(0);
+    });
+
+    it('indexes a SEDS series on the seds route with a seriesId filter hint', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      expect(
+        indexNamedSeries('seds_series', [
+          { id: 'MGTCB', name: 'Motor gasoline total consumption' },
+          { id: 'ESTXV', name: 'Electricity total end-use expenditures' },
+        ]),
+      ).toBe(2);
+
+      const [hit] = searchRoutes('motor gasoline total consumption', 5);
+      expect(hit?.entry).toEqual({
+        route: 'seds',
+        name: 'Motor gasoline total consumption',
+        description: 'SEDS series: Motor gasoline total consumption (MGTCB)',
+        isLeaf: true,
+        category: 'seds',
+        filter_hint: { seriesId: 'MGTCB' },
+      });
+    });
+
+    it('keeps a same-name pair as two entries told apart by id', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      const name = 'All petroleum products consumed by the commercial sector';
+      expect(
+        indexNamedSeries('seds_series', [
+          { id: 'PACCB', name },
+          { id: 'PACCP', name },
+        ]),
+      ).toBe(2);
+
+      const hits = searchRoutes(name, 5).filter((r) => r.entry.route === 'seds');
+      expect(hits.map((r) => r.entry.filter_hint)).toEqual([
+        { seriesId: 'PACCB' },
+        { seriesId: 'PACCP' },
+      ]);
+      expect(hits.map((r) => r.entry.description)).toEqual([
+        `SEDS series: ${name} (PACCB)`,
+        `SEDS series: ${name} (PACCP)`,
+      ]);
+    });
+
+    it('indexes a facet whole past the bound that keeps every other facet out', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      const values = series(968);
+      // The same 968 values on a facet that is not allowlisted stay out...
+      expect(indexFacetValues('seds', [{ id: 'seriesId', description: 'Series', values }])).toBe(0);
+      // ...and the allowlisted pass takes every one of them.
+      expect(indexNamedSeries('seds_series', values)).toBe(968);
+      expect(getIndexSize()).toBe(6 + 968);
+    });
+
+    it('adds nothing for an empty facet, and nothing on a repeat of the same values', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      expect(indexNamedSeries('seds_series', [])).toBe(0);
+      expect(indexNamedSeries('seds_series', series(3))).toBe(3);
+      expect(indexNamedSeries('seds_series', series(3))).toBe(0);
+      expect(getIndexSize()).toBe(9);
+    });
+
+    it('labels STEO series as STEO, keeping an alias only when it adds to the name', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      indexNamedSeries('steo_series', [
+        { id: 'COPRPUS', name: 'Crude oil production', alias: 'U.S. crude oil production' },
+        { id: 'BREPUUS', name: 'Brent crude oil spot price', alias: 'Brent crude oil spot price' },
+      ]);
+
+      const byId = new Map(
+        searchRoutes('crude oil', 10).map((r) => [r.entry.filter_hint?.seriesId, r.entry]),
+      );
+      expect(byId.get('COPRPUS')).toMatchObject({
+        route: 'steo',
+        category: 'steo',
+        description: 'STEO series: Crude oil production (COPRPUS) — U.S. crude oil production',
+      });
+      expect(byId.get('BREPUUS')?.description).toBe(
+        'STEO series: Brent crude oil spot price (BREPUUS)',
+      );
+    });
+  });
 });
 
 /**
@@ -531,7 +628,7 @@ describe('route-cache', () => {
  * routes rather than the two the phrase path alone needed. That size is load
  * bearing: term weights are `log(N / df)`, so a handful of entries makes every
  * term look equally rare and the gate behaves nothing like it does over the real
- * 2,103-entry corpus. At this size it does — `electricity price residential`
+ * 3,165-entry corpus. At this size it does — `electricity price residential`
  * reproduces the reported bug under the phrase path (no candidate at all) and
  * resolves under the tokenized one, which is the whole change in miniature.
  *
@@ -891,5 +988,159 @@ describe('tokenized candidate gate', () => {
     expect(full?.entry.route).toBe('full/route');
     expect(partial?.entry.route).toBe('partial/route');
     expect(partial?.score).toBeGreaterThan(full?.score as number);
+  });
+});
+
+/**
+ * #73 — a route's path segments are its identifier, and on some routes they
+ * carry words its name and description do not: electricity/retail-sales is
+ * named "Electricity Sales to Ultimate Customers". The STEO series named
+ * "Retail Sales of Electricity in …" read like the query from their first
+ * character and outranked the route the query spells.
+ */
+describe('a query spelling a route path (#73)', () => {
+  function leaf(id: string, name: string, description: string): RawRouteNode {
+    return { id, name, description, frequency: [], facets: [], data: {} };
+  }
+
+  const TREE: RawRouteNode[] = [
+    {
+      id: 'electricity',
+      name: 'Electricity',
+      description: 'EIA electricity survey data',
+      routes: [
+        leaf(
+          'retail-sales',
+          'Electricity Sales to Ultimate Customers',
+          'Electricity sales to ultimate customer by state and sector (number of customers, average price, revenue, and megawatthours of sales). Sources: Forms EIA-826, EIA-861, EIA-861M',
+        ),
+        {
+          id: 'state-electricity-profiles',
+          name: 'State Specific Data',
+          description: 'State Specific Data',
+          routes: [
+            leaf(
+              'source-disposition',
+              'Supply and Use by State',
+              'Annual supply and use by state.',
+            ),
+          ],
+        },
+      ],
+    },
+    leaf(
+      'steo',
+      'Short Term Energy Outlook',
+      'Monthly short term (18 month) projections using STEO model.',
+    ),
+  ];
+
+  /** STEO series that read like the slug queries from their first word. */
+  const STEO_SERIES: Facet['values'] = [
+    ...['Residential', 'Commercial', 'Industrial', 'Transportation', 'All Sectors'].flatMap(
+      (sector) =>
+        ['Mountain', 'Pacific', 'New England'].map((region, i) => ({
+          id: `EL${sector.slice(0, 2).toUpperCase()}CP_${i}`,
+          name: `Retail Sales of Electricity in ${sector} Sector, ${region}`,
+        })),
+    ),
+    { id: 'SDBAL_PAC', name: 'Source Disposition Balance, Pacific' },
+    { id: 'SPEPROF_US', name: 'State Electricity Profiles Summary, U.S.' },
+  ];
+
+  const SECTORS: Facet = {
+    id: 'sectorid',
+    description: 'Sector',
+    values: [
+      { id: 'RES', name: 'residential' },
+      { id: 'COM', name: 'commercial' },
+    ],
+  };
+
+  const RETAIL = 'electricity/retail-sales';
+  const PROFILES = 'electricity/state-electricity-profiles';
+  const DISPOSITION = `${PROFILES}/source-disposition`;
+
+  /** The route entry itself — not one of the facet values pointing back at it. */
+  const routeEntryRank = (query: string, route: string) =>
+    searchRoutes(query, 100).findIndex(
+      (r) => r.entry.route === route && r.entry.filter_hint === undefined,
+    );
+
+  beforeEach(() => {
+    _resetRouteCache();
+    initRouteCache(TREE, []);
+    indexNamedSeries('steo_series', STEO_SERIES);
+    indexFacetValues(RETAIL, [SECTORS]);
+  });
+
+  it('ranks the route first, as an exact match, for the words of its last segment', () => {
+    const [top, next] = searchRoutes('retail sales', 10);
+
+    expect(top?.entry.route).toBe(RETAIL);
+    expect(top?.entry.filter_hint).toBeUndefined();
+    expect(top?.score).toBe(0);
+    expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
+    // The series stay in the results, ranked behind the route.
+    expect(next?.entry.route).toBe('steo');
+    expect(next?.score).toBeGreaterThan(0);
+  });
+
+  it('reads the slug however the query separates or cases its words', () => {
+    for (const query of ['Retail Sales', 'retail   sales', 'retail-sales', ' retail_sales ']) {
+      expect(searchRoutes(query, 5)[0]?.entry.route, query).toBe(RETAIL);
+    }
+  });
+
+  it('matches any run of segments that ends the path, at every depth', () => {
+    for (const query of [
+      'source disposition',
+      'state electricity profiles source disposition',
+      'electricity state electricity profiles source disposition',
+    ]) {
+      const [top] = searchRoutes(query, 5);
+      expect(top?.entry.route, query).toBe(DISPOSITION);
+      expect(top?.score, query).toBe(0);
+    }
+
+    // The category the query names ranks first, ahead of the leaf below it.
+    const [category] = searchRoutes('state electricity profiles', 5);
+    expect(category?.entry.route).toBe(PROFILES);
+    expect(category?.entry.isLeaf).toBe(false);
+    expect(category?.score).toBe(0);
+  });
+
+  it('leaves a run that does not end the path, or splits a segment, to the other gates', () => {
+    for (const [query, route] of [
+      ['electricity retail', RETAIL],
+      ['sales retail', RETAIL],
+      ['electricity profiles', PROFILES],
+      ['state electricity', PROFILES],
+    ] as const) {
+      const hit = searchRoutes(query, 100).find(
+        (r) => r.entry.route === route && r.entry.filter_hint === undefined,
+      );
+      // Still found by the gates that read names and descriptions — just not lifted.
+      expect(hit?.score, query).toBeGreaterThan(0);
+    }
+  });
+
+  it('scores a one-word query exactly as the phrase path does, segment or not', () => {
+    for (const query of ['steo', 'sales', 'electricity']) {
+      expect(searchRoutes(query, 10)).toEqual(searchRoutes(query, 10, 'phrase'));
+    }
+  });
+
+  it('lifts only the route entry, never the facet values or series beside it', () => {
+    const results = searchRoutes('retail sales', 100);
+    const exact = results.filter((r) => r.score === 0);
+
+    expect(exact.map((r) => r.entry.route)).toEqual([RETAIL]);
+    expect(results.filter((r) => r.entry.filter_hint !== undefined).length).toBeGreaterThan(0);
+  });
+
+  it('leaves the phrase path where it was — the lift is the combined mode alone', () => {
+    expect(searchRoutes('retail sales', 5, 'phrase')[0]?.entry.route).toBe('steo');
+    expect(routeEntryRank('retail sales', RETAIL)).toBe(0);
   });
 });

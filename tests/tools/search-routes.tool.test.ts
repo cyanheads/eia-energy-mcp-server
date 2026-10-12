@@ -57,7 +57,7 @@ describe('searchRoutesTool', () => {
       status: settled(150),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'retail electricity' });
     const result = await searchRoutesTool.handler(input, ctx);
 
@@ -79,7 +79,7 @@ describe('searchRoutesTool', () => {
   it('returns empty results on no match', async () => {
     mockSearch.mockResolvedValue({ results: [], status: settled(150) });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'zzznomatch' });
     const result = await searchRoutesTool.handler(input, ctx);
 
@@ -95,8 +95,9 @@ describe('searchRoutesTool', () => {
     expect(enrichment.cap).toBe(10);
   });
 
-  it('flags truncation when results reach the limit', async () => {
-    const entries = Array.from({ length: 5 }, (_, i) => ({
+  /** `count` distinct leaf results, shaped as the service returns them. */
+  function ranked(count: number) {
+    return Array.from({ length: count }, (_, i) => ({
       entry: {
         route: `electricity/r${i}`,
         name: `Route ${i}`,
@@ -106,9 +107,12 @@ describe('searchRoutesTool', () => {
       },
       score: 0.1,
     }));
-    mockSearch.mockResolvedValue({ results: entries, status: settled(150) });
+  }
 
-    const ctx = createMockContext();
+  it('flags truncation when the service reports a match past the limit', async () => {
+    mockSearch.mockResolvedValue({ results: ranked(5), hasMore: true, status: settled(150) });
+
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'electricity', limit: 5 });
     await searchRoutesTool.handler(input, ctx);
 
@@ -116,13 +120,73 @@ describe('searchRoutesTool', () => {
     expect(enrichment.truncated).toBe(true);
     expect(enrichment.shown).toBe(5);
     expect(enrichment.cap).toBe(5);
-    expect(enrichment.notice).toMatch(/More matches may exist/);
+    expect(enrichment.notice).toBe(
+      'More matches exist — narrow the query or raise limit (max 30).',
+    );
+  });
+
+  it('does not flag truncation when the matches end exactly at the limit (#56)', async () => {
+    mockSearch.mockResolvedValue({ results: ranked(5), hasMore: false, status: settled(150) });
+
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
+    const input = searchRoutesTool.input.parse({ query: 'electricity', limit: 5 });
+    await searchRoutesTool.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(false);
+    expect(enrichment.shown).toBe(5);
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  // #70 — at or past the 30-per-call cap, a larger limit fixes nothing.
+  it.each([30, 50])(
+    'serves limit %i at 30 and names the cap instead of advising a larger limit',
+    async (limit) => {
+      mockSearch.mockResolvedValue({ results: ranked(30), hasMore: true, status: settled(2197) });
+
+      const ctx = createMockContext({ errors: searchRoutesTool.errors });
+      await searchRoutesTool.handler(
+        searchRoutesTool.input.parse({ query: 'electricity', limit }),
+        ctx,
+      );
+
+      expect(mockSearch).toHaveBeenCalledWith('electricity', 30, ctx);
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment).toMatchObject({ truncated: true, shown: 30, cap: 30 });
+      expect(enrichment.notice).toBe(
+        'More matches exist — one call returns at most 30; narrow the query to reach the rest.',
+      );
+    },
+  );
+
+  it('reports a limit past 30 that finds few matches as complete, with the cap applied', async () => {
+    mockSearch.mockResolvedValue({ results: ranked(3), hasMore: false, status: settled(2197) });
+
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
+    await searchRoutesTool.handler(
+      searchRoutesTool.input.parse({ query: 'electricity', limit: 50 }),
+      ctx,
+    );
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment).toMatchObject({ truncated: false, shown: 3, cap: 30 });
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  it('searches and echoes a padded query as its trimmed text (#55)', async () => {
+    mockSearch.mockResolvedValue({ results: [], hasMore: false, status: settled(150) });
+
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
+    await searchRoutesTool.handler(searchRoutesTool.input.parse({ query: '  coal  ' }), ctx);
+
+    expect(mockSearch).toHaveBeenCalledWith('coal', 10, ctx);
+    expect(getEnrichment(ctx).effectiveQuery).toBe('coal');
   });
 
   it('respects limit parameter', async () => {
     mockSearch.mockResolvedValue({ results: [], status: settled(0) });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'energy', limit: 5 });
     await searchRoutesTool.handler(input, ctx);
 
@@ -132,7 +196,7 @@ describe('searchRoutesTool', () => {
   it('uses default limit of 10', async () => {
     mockSearch.mockResolvedValue({ results: [], status: settled(0) });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'energy' });
     await searchRoutesTool.handler(input, ctx);
 
@@ -161,7 +225,7 @@ describe('searchRoutesTool', () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'wind' });
     await searchRoutesTool.handler(input, ctx);
 
@@ -176,7 +240,7 @@ describe('searchRoutesTool', () => {
   it('omits indexGaps and marks the corpus complete when nothing is missing', async () => {
     mockSearch.mockResolvedValue({ results: [], status: settled(2103) });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'zzznomatch' });
     await searchRoutesTool.handler(input, ctx);
 
@@ -193,7 +257,7 @@ describe('searchRoutesTool', () => {
       status: { complete: false, incompleteRoutes: [], pendingPasses: ['steo_series'], size: 634 },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'ethanol net imports' });
     await searchRoutesTool.handler(input, ctx);
 

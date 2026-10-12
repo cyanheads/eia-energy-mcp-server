@@ -33,8 +33,8 @@ export interface BatteryQuery {
  * Queries a route genuinely answers. The first two are the cases issue #37
  * measured directly; the middle group is multi-term questions against routes
  * that expose the matching facets; the last group is the single-concept
- * behavior #36 and the tool's own description promise, which a candidate-gate
- * change must leave standing.
+ * behavior #36 and the tool's own description promise, plus the named STEO and
+ * SEDS series, which a candidate-gate change must leave standing.
  */
 export const ON_TARGET: readonly BatteryQuery[] = [
   {
@@ -55,7 +55,7 @@ export const ON_TARGET: readonly BatteryQuery[] = [
   {
     query: 'natural gas emissions commercial sector',
     route: 'co2-emissions/co2-emissions-aggregates',
-    note: 'Multi-term across fuel, metric, and sector on a route exposing all three.',
+    note: 'Multi-term across fuel, metric, and sector on a route exposing all three. EIA marks the route deprecated in favor of seds but still serves it, and it ranks first; the SEDS series answering this query (NNCCE) is not reached by it, so retargeting to seds would score a miss.',
   },
   {
     query: 'solar capacity by state',
@@ -71,6 +71,11 @@ export const ON_TARGET: readonly BatteryQuery[] = [
     query: 'electricity retail sales by state',
     route: 'electricity/retail-sales',
     note: "The tool description's own example, and the route-entry half of the calibration.",
+  },
+  {
+    query: 'retail sales',
+    route: 'electricity/retail-sales',
+    note: 'The route path spelled in words (#73) — the route name carries neither word, and STEO "Retail Sales of Electricity" series read like the query.',
   },
   {
     query: 'natural gas imports',
@@ -91,6 +96,16 @@ export const ON_TARGET: readonly BatteryQuery[] = [
     query: 'crude oil production forecast',
     route: 'steo',
     note: 'A STEO series name — the entry class that crowds out everything else on short queries.',
+  },
+  {
+    query: 'motor gasoline total consumption',
+    route: 'seds',
+    note: 'A SEDS series name (MGTCB) — reachable only through the named-series pass (#57).',
+  },
+  {
+    query: 'electricity total end-use expenditures',
+    route: 'seds',
+    note: 'A SEDS series name (ESTXV) that matched nothing before SEDS series were indexed (#57).',
   },
   {
     query: 'recoverable reserves',

@@ -4,9 +4,9 @@
  * lifetime — EIA's taxonomy is stable between API releases and restarting the
  * server is the appropriate refresh mechanism. The Fuse.js index is built once
  * after the tree is populated, then grown with two further entry classes that
- * both carry a `filter_hint`: STEO series names, and facet values (fuel types,
- * sectors, coal ranks) so natural-language queries naming a value resolve to
- * the route that exposes it.
+ * both carry a `filter_hint`: named series (`NAMED_SERIES_FACETS` — STEO and
+ * SEDS series names), and facet values (fuel types, sectors, coal ranks) so
+ * natural-language queries naming a value resolve to the route that exposes it.
  *
  * Completeness is tracked, not assumed. A node whose warm-time metadata fetch
  * failed is held as an incomplete stub — never classified as a leaf, listed by
@@ -20,18 +20,40 @@
  * "electricity price residential", because no route's text contains that run
  * however well it holds the data. `tokenizedScores` asks the other question,
  * scoring each query term against the corpus and combining, and an entry keeps
- * whichever gate scored it better. `scripts/eval-search.ts` measures both.
+ * whichever gate scored it better. `scripts/eval-search.ts` measures both. A
+ * query that spells the end of a route's path (`retail sales` for
+ * `electricity/retail-sales`) is an exact match for that route entry, since the
+ * slug can carry words its name and description do not.
  * @module services/eia/route-cache
  */
 
 import Fuse, { type IFuseOptions } from 'fuse.js';
 import type { Facet, RawRouteNode, SearchIndexEntry } from './types.js';
 
+/**
+ * Facets whose values are named series — descriptive phrases a caller searches
+ * by ("Motor gasoline total consumption"), not opaque codes — and are indexed
+ * whole although they run past `MAX_INDEXED_FACET_VALUES`. Each is fetched with
+ * one `/facet/{facetId}` request by an index pass of its own, keyed here by that
+ * pass's name, so a vocabulary that failed to land is named on its own in
+ * `getIndexStatus().pendingPasses`.
+ */
+export const NAMED_SERIES_FACETS = {
+  steo_series: { route: 'steo', facetId: 'seriesId', label: 'STEO' },
+  seds_series: { route: 'seds', facetId: 'seriesId', label: 'SEDS' },
+} as const;
+
+/** An index pass that fetches one named-series facet. */
+export type NamedSeriesPass = keyof typeof NAMED_SERIES_FACETS;
+
 /** An index-widening pass that runs after the route tree is built. */
-export type IndexPass = 'facet_values' | 'steo_series';
+export type IndexPass = 'facet_values' | NamedSeriesPass;
 
 /** Every pass that must land before the corpus counts as complete. */
-const INDEX_PASSES: readonly IndexPass[] = ['facet_values', 'steo_series'];
+const INDEX_PASSES: readonly IndexPass[] = [
+  'facet_values',
+  ...(Object.keys(NAMED_SERIES_FACETS) as NamedSeriesPass[]),
+];
 
 /** Warm-time completeness of the search corpus. */
 export interface IndexStatus {
@@ -47,11 +69,11 @@ export interface IndexStatus {
 
 /** Holds the in-process route tree state. */
 interface CacheState {
-  /** Entries appended after the tree — STEO series and facet values. */
+  /** Entries appended after the tree — named series and facet values. */
   appendedEntries: SearchIndexEntry[];
   /** The exact array `fuseIndex` was built over — a Fuse `refIndex` indexes it. */
   entries: SearchIndexEntry[];
-  /** Fuse.js index built over routes + STEO series + facet values. */
+  /** Fuse.js index built over routes + named series + facet values. */
   fuseIndex: Fuse<SearchIndexEntry>;
   /** Route paths whose warm-time metadata fetch failed — subtrees unknown. */
   incompleteRoutes: Set<string>;
@@ -77,7 +99,7 @@ let _cache: CacheState | undefined;
  * vocabulary callers search with, and excludes the four facets that dominate
  * the taxonomy by volume (`duoarea`, `product`, `process`, `series` appear on
  * 165 leaf routes each). Measured against the live taxonomy, it resolves to 40
- * facet fetches carrying 460 values and 28 KB — against 892 facets in total.
+ * facet fetches carrying 470 values — against 892 facets in total.
  */
 const VOCABULARY_FACET_IDS = new Set([
   'coalrankid',
@@ -102,8 +124,9 @@ const VOCABULARY_FACET_IDS = new Set([
  * Upper bound on the values a single facet contributes to the index. Facets
  * above it are opaque-identifier dimensions (mine IDs, plant codes, `duoarea`
  * area codes) that nobody searches by name, and indexing them would swamp the
- * corpus. STEO's 1,469-value `seriesId` is above the bound and reaches the
- * index through its own dedicated pass instead.
+ * corpus. The `NAMED_SERIES_FACETS` allowlist is the one exception: STEO's and
+ * SEDS's `seriesId` facets are above the bound and reach the index whole, each
+ * through its own pass.
  */
 const MAX_INDEXED_FACET_VALUES = 200;
 
@@ -198,7 +221,7 @@ function buildEntries(nodeMap: Map<string, RawRouteNode>): SearchIndexEntry[] {
 }
 
 /**
- * Every entry class — routes, STEO series, facet values — shares these keys.
+ * Every entry class — routes, named series, facet values — shares these keys.
  * Fuse normalizes key weights against each other, so the weights and the
  * search options are corpus-wide: changing either moves the score of every
  * entry at once and invalidates `WEAK_MATCH_SCORE`. Appending entries under an
@@ -240,16 +263,19 @@ function reindex(cache: CacheState): void {
   cache.indexedKeys = new Set(allEntries.map(entryKey));
 }
 
-/** Initialize the cache with the fetched route tree and optional STEO entries. */
+/**
+ * Initialize the cache with the fetched route tree and entries to append after
+ * it — `scripts/eval-search.ts` replays a snapshot corpus through the second.
+ */
 export function initRouteCache(
   topLevelNodes: RawRouteNode[],
-  steoSeriesEntries: SearchIndexEntry[],
+  appendedEntries: SearchIndexEntry[],
 ): void {
   const nodeMap = new Map<string, RawRouteNode>();
   buildNodeMap(topLevelNodes, '', nodeMap);
 
   const cache: CacheState = {
-    appendedEntries: [...steoSeriesEntries],
+    appendedEntries: [...appendedEntries],
     entries: [],
     fuseIndex: new Fuse<SearchIndexEntry>([], FUSE_OPTIONS),
     incompleteRoutes: collectIncompleteRoutes(nodeMap),
@@ -266,7 +292,7 @@ export function initRouteCache(
  * Splice a re-fetched node and its subtree into the cached tree, replacing the
  * stub a failed warm-time fetch left behind. Route entries are rebuilt from the
  * updated map so the stub's stale `isLeaf` claim does not survive; the appended
- * STEO and facet entries are untouched.
+ * named-series and facet entries are untouched.
  */
 export function replaceNode(path: string, node: RawRouteNode): void {
   if (!_cache) return;
@@ -329,13 +355,12 @@ export function _resetRouteCache(): void {
   _cache = undefined;
 }
 
-/** Get a node by route path. Returns undefined when not found. */
+/**
+ * Get a node by route path. Returns undefined when not found, and for the root
+ * (empty path), which is no node — `getChildren('')` lists its top level.
+ */
 export function getNode(path: string): RawRouteNode | undefined {
-  if (!_cache) return;
-  if (!path) {
-    // Root — return a synthetic node with top-level children
-    return;
-  }
+  if (!_cache || !path) return;
   return _cache.nodeMap.get(path);
 }
 
@@ -382,8 +407,8 @@ const MAX_QUERY_TERMS = 8;
 /**
  * English function words, dropped before a query is weighted. They are the one
  * class of generic term document frequency cannot recognize: measured over this
- * corpus, `by` matches 151 of 2,103 entries and so reads as *rarer* than
- * `electricity` (812) — inverse document frequency would make the preposition
+ * corpus, `by` matches 365 of 3,165 entries and so reads as *rarer* than
+ * `electricity` (973) — inverse document frequency would make the preposition
  * the heaviest term in "electricity generation by fuel type". Frequency is the
  * wrong question for a word that never carried topic in the first place.
  *
@@ -432,8 +457,8 @@ function tokenizeQuery(query: string): string[] {
  * while an entry answering less of the query than it leaves open is not a
  * candidate at any length.
  *
- * Measured against the live 2,103-entry corpus, the widest share any off-target
- * query in `scripts/search-battery.ts` reached was 0.423 — the curve clears that
+ * Measured against the live 3,165-entry corpus, the widest share any off-target
+ * query in `scripts/search-battery.ts` reached was 0.403 — the curve clears that
  * at every length.
  */
 function coverageBar(termCount: number): number {
@@ -457,8 +482,8 @@ function minMatchedTerms(termCount: number): number {
  * Length at or below which a query term must appear verbatim before the term
  * path counts an entry as matching it. `FUSE_OPTIONS.threshold` admits a
  * one-edit match on any pattern this short, and a token this short has a large
- * one-edit neighbourhood: measured over the live 2,103-entry corpus, `cat`
- * fuzzy-matches 856 entries against the 17 that carry it, and `food` reaches
+ * one-edit neighbourhood: measured over the live 3,165-entry corpus, `cat`
+ * fuzzy-matches 1,206 entries against the 49 that carry it, and `food` reaches
  * `Wood`. Such a match satisfies the matched-term floor while carrying none of
  * the concept, which is how an unanswerable two-term query reaches a confident
  * score.
@@ -558,6 +583,41 @@ function tokenizedScores(cache: CacheState, terms: string[]): Map<number, number
 }
 
 /**
+ * Route entries whose path ends in the run of segments the query spells — the
+ * words of `retail-sales` for `electricity/retail-sales`, or of
+ * `state-electricity-profiles/source-disposition` for the leaf below it.
+ *
+ * A path segment is the route's identifier, and on some routes it is the only
+ * text carrying the words a caller searches by: `electricity/retail-sales` is
+ * named "Electricity Sales to Ultimate Customers". Fuse sees the slug only as
+ * part of one long `route` string, so a STEO series named "Retail Sales of
+ * Electricity in …" reads more like "retail sales" than the route the query
+ * spells. A query that names a route by its path is an exact match for it.
+ *
+ * The match is whole-word and in order, and the run must end the path, so a
+ * query spelling a parent's path names the parent, not each route beneath it.
+ * One-word queries are left to Fuse, which already matches a one-word segment
+ * against a name carrying the same word, and facet-value and named-series
+ * entries are never lifted — they point at a route without being it.
+ */
+function routePathMatches(cache: CacheState, query: string): number[] {
+  const words = query
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  if (words.length < 2) return [];
+  const spelled = words.join('-');
+
+  const refs: number[] = [];
+  for (const [ref, entry] of cache.entries.entries()) {
+    if (entry.filter_hint !== undefined) continue;
+    const segments = entry.route.toLowerCase().split('/');
+    if (segments.some((_, i) => segments.slice(i).join('-') === spelled)) refs.push(ref);
+  }
+  return refs;
+}
+
+/**
  * Fuzzy search across the index. Returns ranked matches, best first.
  *
  * A multi-term query is scored twice — once as a phrase by Fuse, once term by
@@ -566,7 +626,8 @@ function tokenizedScores(cache: CacheState, terms: string[]): Map<number, number
  * phrase path answers "this entry reads like your query", the term path answers
  * "this entry covers your query's concepts", and a query only needs one to be
  * true. A single-term query has nothing to tokenize, so it takes the phrase path
- * alone and scores exactly as Fuse scores it.
+ * alone and scores exactly as Fuse scores it. A query that spells the end of a
+ * route's path scores that route entry 0 (`routePathMatches`).
  *
  * `mode` is what `scripts/eval-search.ts` measures the gate's contribution
  * against: `'phrase'` is the un-tokenized behavior on its own.
@@ -591,10 +652,12 @@ export function searchRoutes(
         if (score < (scores.get(ref) ?? Number.POSITIVE_INFINITY)) scores.set(ref, score);
       }
     }
+    for (const ref of routePathMatches(cache, query)) scores.set(ref, 0);
   }
 
-  // Ties break on index position, which keeps route entries ahead of the STEO
-  // and facet-value entries appended after them — the order `reindex` produced.
+  // Ties break on index position, which keeps route entries ahead of the
+  // named-series and facet-value entries appended after them — the order
+  // `reindex` produced.
   return [...scores]
     .sort(([refA, scoreA], [refB, scoreB]) => scoreA - scoreB || refA - refB)
     .slice(0, limit)
@@ -618,7 +681,7 @@ export function getIndexEntries(): readonly SearchIndexEntry[] {
 /**
  * Append entries to an already-initialized cache, skipping any already indexed.
  * Returns how many were added; the Fuse index is rebuilt only when that is
- * non-zero. Used by both post-warm entry classes — STEO series and facet
+ * non-zero. Used by both post-warm entry classes — named series and facet
  * values — which arrive after `initRouteCache` and can overlap each other.
  */
 export function addEntriesToIndex(entries: SearchIndexEntry[]): number {
@@ -680,4 +743,28 @@ export function indexFacetValues(route: string, facets: Facet[]): number {
     }
   }
   return addEntriesToIndex(entries);
+}
+
+/**
+ * Index the values of one `NAMED_SERIES_FACETS` facet, whatever their count.
+ * Each value becomes an entry named for the series, pointing at the facet's
+ * route with a `filter_hint` on its id. The id also leads the description, which
+ * is what tells apart the SEDS pairs that share a name and differ only in unit
+ * (`PACCB` in Billion Btu, `PACCP` in thousand barrels) — entries dedupe on route
+ * + hint, so both stay. Returns how many entries were added.
+ */
+export function indexNamedSeries(pass: NamedSeriesPass, values: Facet['values']): number {
+  const { route, facetId, label } = NAMED_SERIES_FACETS[pass];
+  return addEntriesToIndex(
+    values.map((value) => ({
+      route,
+      name: value.name,
+      description: `${label} series: ${value.name} (${value.id})${
+        value.alias && value.alias !== value.name ? ` — ${value.alias}` : ''
+      }`,
+      isLeaf: true,
+      category: route,
+      filter_hint: { [facetId]: value.id },
+    })),
+  );
 }

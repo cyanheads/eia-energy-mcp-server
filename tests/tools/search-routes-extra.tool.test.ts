@@ -40,20 +40,26 @@ describe('searchRoutesTool — additional coverage', () => {
       expect(() => searchRoutesTool.input.parse({ query: '' })).toThrow();
     });
 
-    it('rejects limit = 0 (min 1)', () => {
-      expect(() => searchRoutesTool.input.parse({ query: 'energy', limit: 0 })).toThrow();
+    it('rejects a query of whitespace alone (#55)', () => {
+      const message = 'query must contain at least one non-whitespace character';
+      expect(() => searchRoutesTool.input.parse({ query: '   ' })).toThrow(message);
+      expect(() => searchRoutesTool.input.parse({ query: '\t\n' })).toThrow(message);
     });
 
-    it('rejects limit > 30 (max 30)', () => {
-      expect(() => searchRoutesTool.input.parse({ query: 'energy', limit: 31 })).toThrow();
+    it('trims surrounding whitespace and keeps inner whitespace (#55)', () => {
+      expect(searchRoutesTool.input.parse({ query: '  coal  ' }).query).toBe('coal');
+      expect(searchRoutesTool.input.parse({ query: 'retail   sales' }).query).toBe(
+        'retail   sales',
+      );
     });
 
-    it('accepts limit exactly at max (30)', () => {
-      expect(() => searchRoutesTool.input.parse({ query: 'energy', limit: 30 })).not.toThrow();
+    // 1 to 100 is accepted; past the 30-per-call cap the tool serves 30 (#70).
+    it.each([0, 101])('rejects limit %i', (limit) => {
+      expect(() => searchRoutesTool.input.parse({ query: 'energy', limit })).toThrow();
     });
 
-    it('accepts limit exactly at min (1)', () => {
-      expect(() => searchRoutesTool.input.parse({ query: 'energy', limit: 1 })).not.toThrow();
+    it.each([1, 30, 31, 100])('accepts limit %i', (limit) => {
+      expect(searchRoutesTool.input.parse({ query: 'energy', limit }).limit).toBe(limit);
     });
   });
 
@@ -79,7 +85,7 @@ describe('searchRoutesTool — additional coverage', () => {
       status: settled(1500),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'crude oil production' });
     const result = await searchRoutesTool.handler(input, ctx);
 
@@ -105,7 +111,7 @@ describe('searchRoutesTool — additional coverage', () => {
       status: settled(2103),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'solar photovoltaic generation' });
     const result = await searchRoutesTool.handler(input, ctx);
 
@@ -134,7 +140,7 @@ describe('searchRoutesTool — additional coverage', () => {
       status: settled(150),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'retail sales' });
     const result = await searchRoutesTool.handler(input, ctx);
 
@@ -224,7 +230,7 @@ describe('searchRoutesTool — additional coverage', () => {
   it('handles unicode query without crashing', async () => {
     mockSearch.mockResolvedValue({ results: [], status: settled(100) });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchRoutesTool.errors });
     const input = searchRoutesTool.input.parse({ query: 'électricité données' });
     const result = await searchRoutesTool.handler(input, ctx);
 
