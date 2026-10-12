@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-10-04 05:42:32
+Generated on: 2026-10-12 22:41:07
 
 ```text
 eia-energy-mcp-server/
@@ -157,6 +157,7 @@ eia-energy-mcp-server/
 │   │       │   ├── describe-route.tool.ts
 │   │       │   ├── query-route.tool.ts
 │   │       │   └── search-routes.tool.ts
+│   │       ├── inline-budget.ts
 │   │       └── literal-table-cell.ts
 │   ├── services/
 │   │   ├── canvas-bridge/
@@ -171,6 +172,7 @@ eia-energy-mcp-server/
 │   ├── resources/
 │   ├── services/
 │   │   ├── canvas-bridge.test.ts
+│   │   ├── cold-start.test.ts
 │   │   ├── eia-service.test.ts
 │   │   ├── http-classification.test.ts
 │   │   ├── normalize-description.test.ts
