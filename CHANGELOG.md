@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.5](changelog/0.4.x/0.4.5.md) — 2026-10-21
+
+Query diagnostics and recoverable EIA failures, with DataCanvas enabled by default.
+
 ## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-10-12
 
 Improves search recall (SEDS series, whole-phrase route matches), bounds cold-start waits, caps inline row payloads at 64,000 bytes per surface, and reports DataCanvas and upstream failures instead of masking them.
