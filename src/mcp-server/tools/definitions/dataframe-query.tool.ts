@@ -284,9 +284,9 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       if (result.rowCount > materialized) {
         const guidance =
           (input.preview ?? input.row_limit) < 10000
-            ? `raise it to see more${meta?.tableName ? `, or query ${meta.tableName} directly` : ''}.`
-            : paging;
-        return `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — preview capped the inline slice (it defaults to row_limit); ${guidance}`;
+            ? `; raise it to see more${meta?.tableName ? `, or query ${meta.tableName} directly` : ''}.`
+            : `. ${paging}`;
+        return `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — preview capped the inline slice (it defaults to row_limit)${guidance}`;
       }
       return;
     };

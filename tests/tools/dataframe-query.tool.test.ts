@@ -302,6 +302,18 @@ describe('dataframeQueryTool — inline byte budget (#58)', () => {
     );
   });
 
+  it('never advises raising a bound already clamped to its 10,000 ceiling (#85)', async () => {
+    answer([row(0), row(1)], { truncated: true });
+    expect((await call({ row_limit: 20_000 })).sc.notice).toBe(
+      'Requested row_limit 20000 was clamped to 10000. Showing 2 rows — more rows matched than the row_limit cap of 10,000 and the remainder was dropped uncounted, so totalRows is that cap and not a total. Re-run with register_as to stage the whole result as a new dataframe, which reports an exact row count.',
+    );
+
+    answer([row(0), row(1)], { rowCount: 20_000 }, meta('df_OUT', 20_000));
+    expect((await call({ register_as: 'df_OUT', preview: 20_000 })).sc.notice).toBe(
+      'Requested preview 20000 was clamped to 10000. Showing 2 of 20,000 rows — preview capped the inline slice (it defaults to row_limit). The whole result is staged as df_OUT: page it with SELECT * FROM df_OUT ORDER BY <columns> LIMIT 2 OFFSET 2.',
+    );
+  });
+
   it('ends the inline rows at the budget alone with an exact count and register_as paging', async () => {
     const rows = Array.from({ length: 1000 }, (_, i) => wide(i));
     answer(rows);
