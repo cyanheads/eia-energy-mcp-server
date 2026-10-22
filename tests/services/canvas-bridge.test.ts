@@ -502,6 +502,9 @@ describe('CanvasBridge', () => {
       ['invalid_sql', JsonRpcErrorCode.ValidationError],
       ['register_as_clash', JsonRpcErrorCode.ValidationError],
       ['system_catalog_access', JsonRpcErrorCode.ValidationError],
+      ['denied_function', JsonRpcErrorCode.ValidationError],
+      ['multi_statement', JsonRpcErrorCode.ValidationError],
+      ['sql_read_only', JsonRpcErrorCode.ValidationError],
     ] as const)('reason %s', (reason, code) => {
       it('is re-thrown with the calling contract recovery, code and message intact', async () => {
         const { mockCanvas, mockInstance } = makeMockCanvas();

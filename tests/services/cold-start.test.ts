@@ -251,6 +251,32 @@ describe('a cold browse, describe, or query answers within a bounded wait (#74)'
     ]);
   });
 
+  it('classifies a missing cold-browse metadata envelope as retryable upstream_invalid_response', async () => {
+    const eia = stubEia({ ...coldBodies(), electricity: {} });
+    eia.hold('');
+    const pending = runToolContract(browseRoutesTool, { path: 'electricity' });
+    await vi.advanceTimersByTimeAsync(ROUTE_WARM_BUDGET_MS);
+    const result = await pending;
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: {
+          reason: 'upstream_invalid_response',
+          retryable: true,
+          recovery: { hint: 'Retry the call; if it persists, check api.eia.gov availability.' },
+        },
+      },
+    });
+    expect(eia.count('electricity')).toBe(1);
+    expect(result.content).toContainEqual(
+      expect.objectContaining({
+        text: expect.stringContaining(
+          'Retry the call; if it persists, check api.eia.gov availability.',
+        ),
+      }),
+    );
+  });
+
   it('browses a leaf live as a leaf, and the root live as its top-level routes', async () => {
     const eia = stubEia(coldBodies());
     // Block the build below the root, so the caller's own root fetch still answers.
@@ -343,7 +369,12 @@ describe('a cold browse, describe, or query answers within a bounded wait (#74)'
     const meta = await described;
     expect(meta.route).toBe('electricity/retail-sales');
     expect(meta.facets).toEqual([
-      { id: 'stateid', description: 'Facet', values: [{ id: 'TX', name: 'Texas' }] },
+      {
+        id: 'stateid',
+        description: 'Facet',
+        values: [{ id: 'TX', name: 'Texas' }],
+        complete: true,
+      },
     ]);
     await expect(category).rejects.toMatchObject({ data: { reason: 'route_not_queryable' } });
     await expect(missing).rejects.toMatchObject({ data: { reason: 'route_not_found' } });

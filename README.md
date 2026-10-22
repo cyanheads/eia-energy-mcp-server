@@ -39,11 +39,13 @@ US energy data from the Energy Information Administration (EIA): electricity, pe
 | `eia_dataframe_query` | Runs a read-only SQL SELECT against staged DataCanvas dataframes. |
 | `eia_dataframe_drop` | Drops a DataCanvas dataframe, freeing its memory. |
 
-The three `eia_dataframe_*` tools are callable and listed by MCP only when `CANVAS_PROVIDER_TYPE=duckdb` is set; `eia_dataframe_drop` additionally requires `EIA_DATAFRAME_DROP_ENABLED=true`. Disabled definitions remain in the server manifest with their enable hints. A default deployment lists the first four tools.
+The three `eia_dataframe_*` tools need DataCanvas, which is on by default; `eia_dataframe_drop` additionally requires `EIA_DATAFRAME_DROP_ENABLED=true`. With `CANVAS_PROVIDER_TYPE=none`, which the Claude Desktop bundle sets, they are neither callable nor listed by MCP. Disabled definitions remain in the server manifest with their enable hints. A default deployment lists the first six tools.
 
 ## Capability reference
 
-Browse accepts `route` as an alias for `path`; describe and query accept `path` as an alias for `route`. Supplying both spellings is rejected. Leading, trailing, and repeated slashes are normalized.
+Browse accepts `route` as an alias for `path`; describe and query accept `path` as an alias for `route`. Supplying both spellings is rejected. Whitespace and slashes are normalized, then exactly one complete leading `v2` segment is removed: `/v2/electricity/retail-sales/` resolves to `electricity/retail-sales`, and `/v2/` browses root. Full URLs, `/data` suffixes, interior `v2`, and case remain unchanged.
+
+All four route tools distinguish retryable upstream failures: `rate_limited` for HTTP 429 or `OVER_RATE_LIMIT`, `upstream_unreachable` for transport failures, `upstream_unavailable` for HTTP service outages, and `upstream_invalid_response` for unusable bodies or missing envelopes. Recovery hints reach both response surfaces. HTTP 501 remains definitive, 504 remains a timeout, and caller cancellation stays cancellation.
 
 ### `eia_browse_routes` <sub>tool</sub>
 
@@ -56,6 +58,7 @@ Browse accepts `route` as an alias for `path`; describe and query accept `path` 
 ### `eia_describe_route` <sub>tool</sub>
 
 - Pass a leaf `route` for facets, data columns, frequencies, and date range. Each facet window is capped at `EIA_FACET_VALUE_CAP` (default 50); page with `facet` and `values_offset`.
+- `date_range` is metadata for the default frequency; another frequency may extend outside it. Both response surfaces carry this caveat beside the unchanged start/end values.
 - `value_count` and `values_truncated` describe each window. A facet whose values EIA did not return is listed in `unavailable_facets`; the next call retries it.
 - Errors: `route_not_found`, `route_not_queryable`, `facet_not_found`, and retryable `facet_unavailable`, `rate_limited`, `upstream_unreachable`.
 
@@ -63,7 +66,7 @@ Browse accepts `route` as an alias for `path`; describe and query accept `path` 
 
 ### `eia_search_routes` <sub>tool</sub>
 
-- Search route names, descriptions, STEO's 1,469 and SEDS's 968 series names, and facet values. `limit` defaults to 10 and is served at no more than 30 (up to 100 accepted); `truncated` is true when more matches exist.
+- Search route names, descriptions, STEO's 1,469 and SEDS's 968 series names, and facet values. `limit` defaults to 10; positive integers above 30 are clamped to 30 with requested/effective values disclosed, even on short or empty results. `truncated` is true when more matches exist.
 - Matches carry `score` (0 exact, 1 no match; above 0.72 is weak) and may carry a `filter_hint` for `eia_query_route`. Check `indexComplete` and `indexGaps` before trusting a short result set.
 - The first search builds the index and normally takes 17–30 s (at most 45 s); later calls are fast. If EIA rate-limits or cannot be reached, the call fails with retryable `rate_limited` or `upstream_unreachable`.
 
@@ -71,8 +74,10 @@ Browse accepts `route` as an alias for `path`; describe and query accept `path` 
 
 ### `eia_query_route` <sub>tool</sub>
 
-- Pass a leaf `route`, with optional facet-ID `filters`, `columns`, `frequency`, `start`/`end`, and `sort`. Page with `offset` and `length` (default 100, max 5000).
+- Pass a leaf `route`, with optional facet-ID `filters`, `columns`, `frequency`, `start`/`end`, and `sort`. Page with `offset` and `length` (default 100; positive integers above 5000 are clamped to 5000 with a notice).
 - Responses stay within 64,000 bytes: a page may end early at the last whole row that fits, and `next_offset` gives where to continue. A single row too large to fit is withheld, and the note gives the offset that skips it.
+- After describe has cached a complete facet vocabulary, query notices name unmatched filter values and suggest case-sensitive IDs when possible. Filters and their echoes stay unchanged; diagnostics never fetch metadata or facet values.
+- With effective monthly `YYYY-MM` data, a year-only bound means January: `end: "2021"` stops at `2021-01`; use `2021-12` for the full year. Query notices disclose this for either bound without expanding it.
 - `total` reports the full match count; values remain strings and units appear as `{col}-units`. Errors cover invalid route, facet, column, frequency, sort, or period, inverted ranges (`no_data`), a filter list too long for EIA's ~8 KB request URI (`uri_too_long`; split the values across calls), and retryable `rate_limited` and `upstream_unreachable`.
 - `stage: true` stages up to `EIA_CANVAS_MAX_ROWS` (default 25000) as a `dataset` handle for SQL via `eia_dataframe_describe` and `eia_dataframe_query` (hyphens in column names become underscores). If staging fails, `dataset` is absent and the note says so.
 
@@ -87,9 +92,9 @@ Browse accepts `route` as an alias for `path`; describe and query accept `path` 
 
 ### `eia_dataframe_query` <sub>tool</sub>
 
-- Run one read-only SQL SELECT against staged handles. `row_limit` defaults to 1000 and caps at 10000; `preview` narrows the inline slice, and the 64,000-byte per-surface budget can end it sooner.
+- Run one read-only SQL SELECT against staged handles. `row_limit` defaults to 1000; `preview` narrows the inline slice and accepts zero. Integers above 10000 on either input are clamped to 10000 with requested/effective values disclosed; the 64,000-byte per-surface budget can end rows sooner. `register_as` still stages the complete result.
 - `truncated: true` means `totalRows` is a cap, not a full count. `register_as` stages the complete result under an unused name with an exact count; the notice gives the `ORDER BY … LIMIT/OFFSET` query that pages the rest.
-- Cast EIA VARCHAR values for arithmetic. Writes, file reads, and system catalogs are rejected; declared failures include `missing_table`, `invalid_sql`, `non_select_statement`, `system_catalog_access`, and `register_as_clash`.
+- Cast EIA VARCHAR values for arithmetic. Writes, file reads, and system catalogs are rejected; declared failures include `missing_table`, `invalid_sql`, `non_select_statement`, `denied_function`, `multi_statement`, `sql_read_only`, `system_catalog_access`, and `register_as_clash`.
 
 ---
 
@@ -108,7 +113,7 @@ EIA-specific:
 - Fuzzy search (Fuse.js) over route names/descriptions, all 1,469 STEO and 968 SEDS series names, and facet values
 - Facet values are fetched and cached per route by `eia_describe_route`; a list EIA does not return is reported in `unavailable_facets` and retried on the next call
 - Routes whose metadata could not be fetched are reported through `eia_search_routes` instead of dropped
-- DataCanvas (DuckDB) staging is opt-in per call; without canvas the three dataframe tools are not callable
+- DataCanvas (DuckDB) is on by default and staging is opt-in per call; with the canvas off the three dataframe tools are not callable
 
 Agent-friendly output:
 
@@ -240,10 +245,10 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `EIA_API_KEY` | **Required.** Free API key from api.eia.gov — appended as `api_key` on every request. | — |
 | `EIA_BASE_URL` | EIA API base URL. | `https://api.eia.gov/v2` |
 | `EIA_DATASET_TTL_SECONDS` | Dataframe lifetime in seconds; each `eia_dataframe_query` that references a dataframe extends it. | `86400` (24 h) |
-| `EIA_DATAFRAME_DROP_ENABLED` | Set to `true` to expose `eia_dataframe_drop` (also requires `CANVAS_PROVIDER_TYPE=duckdb`). Off by default to avoid accidental canvas cleanup. | `false` |
+| `EIA_DATAFRAME_DROP_ENABLED` | Set to `true` to expose `eia_dataframe_drop` (no effect with `CANVAS_PROVIDER_TYPE=none`). Off by default to avoid accidental canvas cleanup. | `false` |
 | `EIA_CANVAS_MAX_ROWS` | Row ceiling for `eia_query_route` staging; reaching it adds ~8.5 s to a call. | `25000` |
 | `EIA_FACET_VALUE_CAP` | Facet values `eia_describe_route` returns per facet before truncating; page with `facet` and `values_offset`. | `50` |
-| `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas (Node only), which adds the three `eia_dataframe_*` tools and `stage: true`. | — |
+| `CANVAS_PROVIDER_TYPE` | DataCanvas provider. `duckdb` enables `eia_dataframe_describe`, `eia_dataframe_query`, and `stage: true`; drop also needs `EIA_DATAFRAME_DROP_ENABLED=true`. `none` disables DataCanvas. The Claude Desktop bundle sets `none`. | `duckdb` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_HTTP_ENDPOINT_PATH` | HTTP endpoint path. | `/mcp` |

@@ -62,6 +62,29 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
 
   errors: [
     {
+      reason: 'denied_function',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'SQL calls a denied function, including engine settings, file reads, or SQL built from strings.',
+      recovery:
+        'Select from staged dataframes using ordinary SQL expressions; eia_dataframe_describe lists their columns.',
+    },
+    {
+      reason: 'multi_statement',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'SQL contains more than one statement.',
+      recovery: 'Send one SELECT per eia_dataframe_query call; use register_as to chain results.',
+    },
+    {
+      reason: 'sql_read_only',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'SQL attempts a write, external file access, or another operation refused by the read-only gate.',
+      recovery:
+        'Query staged dataframes with a read-only SELECT; use register_as to persist results.',
+    },
+    {
       reason: 'canvas_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'DataCanvas service is not configured for this deployment.',
@@ -126,19 +149,17 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       .number()
       .int()
       .min(0)
-      .max(10000)
       .optional()
       .describe(
-        'Rows to include in the immediate response. Defaults to row_limit. Set lower when chaining via register_as and only a sample is needed inline. The 64,000-byte response budget can end the inline rows sooner.',
+        'Rows to include in the immediate response. Defaults to row_limit; larger integers are clamped to 10000 with a notice. Set lower when chaining via register_as and only a sample is needed inline. The 64,000-byte response budget can end the inline rows sooner.',
       ),
     row_limit: z
       .number()
       .int()
       .min(1)
-      .max(10000)
       .default(1000)
       .describe(
-        'Hard cap on rows materialized (default 1000, max 10000). Rows past the cap are dropped without being counted — the response then carries truncated: true and a totalRows equal to the cap rather than a true total. Pass register_as to materialize the whole result instead and get an exact count. Of the rows materialized, only as many go inline as fit the 64,000-byte response budget.',
+        'Hard cap on rows materialized (default 1000; larger integers are clamped to 10000 with a notice). Rows past the cap are dropped without being counted — the response then carries truncated: true and a totalRows equal to the cap rather than a true total. Pass register_as to materialize the whole result instead and get an exact count. Of the rows materialized, only as many go inline as fit the 64,000-byte response budget.',
       ),
   }),
 
@@ -195,11 +216,27 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       .string()
       .optional()
       .describe(
-        'Guidance when row_limit, preview, or the 64,000-byte response budget ended the inline rows — names each bound that applied and how to reach the rows it withheld (raise the cap, or page a register_as table with ORDER BY … LIMIT/OFFSET).',
+        'Discloses requested/effective row_limit and preview when clamped, including on short or empty results. When row_limit, preview, or the 64,000-byte response budget ended the inline rows, names each bound and how to reach the rows it withheld (raise a bound below its ceiling, or page a register_as table with ORDER BY … LIMIT/OFFSET).',
       ),
   },
 
-  async handler(input, ctx) {
+  async handler(requestedInput, ctx) {
+    const input = {
+      ...requestedInput,
+      row_limit: Math.min(requestedInput.row_limit, 10000),
+      ...(requestedInput.preview !== undefined && {
+        preview: Math.min(requestedInput.preview, 10000),
+      }),
+    };
+    const clampNotices: string[] = [];
+    if (requestedInput.row_limit > input.row_limit)
+      clampNotices.push(
+        `Requested row_limit ${requestedInput.row_limit} was clamped to ${input.row_limit}.`,
+      );
+    if (requestedInput.preview !== undefined && requestedInput.preview > (input.preview ?? 0))
+      clampNotices.push(
+        `Requested preview ${requestedInput.preview} was clamped to ${input.preview}.`,
+      );
     const bridge = getCanvasBridge();
     if (!bridge) {
       throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.');
@@ -224,7 +261,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
      * A budget-ended page points at `register_as` paged with LIMIT/OFFSET, the
      * one retrieval path that is stable across calls.
      */
-    const noticeFor = (shown: number): string | undefined => {
+    const boundNoticeFor = (shown: number): string | undefined => {
       const shownText = shown.toLocaleString();
       const shownRows = `${shownText} row${shown === 1 ? '' : 's'}`;
       const rowLimitCut = `more rows matched than the row_limit cap of ${input.row_limit.toLocaleString()} and the remainder was dropped uncounted, so totalRows is that cap and not a total`;
@@ -242,12 +279,20 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
           : `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — the ${budget} ended the inline rows. ${paging}`;
       }
       if (truncated) {
-        return `Showing ${shownRows} — ${rowLimitCut}. Raise row_limit, or re-run with register_as to stage the whole result as a new dataframe, which reports an exact row count.`;
+        return `Showing ${shownRows} — ${rowLimitCut}. ${input.row_limit < 10000 ? 'Raise row_limit, or re-run' : 'Re-run'} with register_as to stage the whole result as a new dataframe, which reports an exact row count.`;
       }
       if (result.rowCount > materialized) {
-        return `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — preview capped the inline slice (it defaults to row_limit); raise it to see more${meta?.tableName ? `, or query ${meta.tableName} directly` : ''}.`;
+        const guidance =
+          (input.preview ?? input.row_limit) < 10000
+            ? `raise it to see more${meta?.tableName ? `, or query ${meta.tableName} directly` : ''}.`
+            : paging;
+        return `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — preview capped the inline slice (it defaults to row_limit); ${guidance}`;
       }
       return;
+    };
+    const noticeFor = (shown: number): string | undefined => {
+      const notices = [...clampNotices, boundNoticeFor(shown)].filter(Boolean);
+      return notices.length ? notices.join(' ') : undefined;
     };
 
     /**

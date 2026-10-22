@@ -3,7 +3,7 @@
  * route with optional facet filters, date range, frequency, and column
  * selection. Data values come back as strings per the EIA API. Staging is
  * opt-in: with `stage: true` and a canvas configured
- * (CANVAS_PROVIDER_TYPE=duckdb) the service walks offset pages up to
+ * (CANVAS_PROVIDER_TYPE=duckdb, the default) the service walks offset pages up to
  * EIA_CANVAS_MAX_ROWS and registers the accumulated set, returning a dataset
  * handle whose note points at eia_dataframe_describe for its column names and
  * eia_dataframe_query for SQL. Left off, the call costs one upstream
@@ -205,7 +205,7 @@ function renderQueryResult(result: QueryRouteResult): string {
   );
 
   if (result.notice) {
-    lines.push(`> ${result.notice}\n`);
+    lines.push(`> ${literalTableCell(result.notice)}\n`);
   }
   if (result.canvas_preview_note) {
     lines.push(`> ${result.canvas_preview_note}\n`);
@@ -240,7 +240,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .min(1)
       .describe(
-        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling like "/electricity/retail-sales/" resolves to the same route.',
+        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales". Full URLs and /data suffixes are not normalized.',
       ),
     filters: z
       .record(z.string(), z.union([z.string(), z.array(z.string())]))
@@ -290,16 +290,15 @@ export const queryRouteTool = tool('eia_query_route', {
       .number()
       .int()
       .min(1)
-      .max(5000)
       .default(100)
       .describe(
-        'Rows to fetch for the inline page (default 100, max 5000 per EIA limit). Every fetched row is used, but the response carries only as many as fit a 64,000-byte budget per surface — wide routes end the page early, said so in canvas_preview_note, with next_offset naming where to continue. With stage: true, staging is not bounded by this — it pages past the preview on its own.',
+        'Rows to fetch for the inline page (default 100; larger integers are clamped to 5000 with a notice). Every fetched row is used, but the response carries only as many as fit a 64,000-byte budget per surface — wide routes end the page early, said so in canvas_preview_note, with next_offset naming where to continue. With stage: true, staging is not bounded by this — it pages past the preview on its own.',
       ),
     stage: z
       .boolean()
       .default(false)
       .describe(
-        'Stage the matching rows as a DataCanvas table for SQL (default false). Off, the call makes one upstream request and returns the preview alone. On, the service pages past the preview up to EIA_CANVAS_MAX_ROWS and registers the accumulated rows, returning the handle in dataset — several extra upstream requests and seconds of latency on a large route, so turn it on when moving to analysis, not while exploring. Requires a canvas (CANVAS_PROVIDER_TYPE=duckdb); without one nothing is staged whatever this is set to.',
+        'Stage the matching rows as a DataCanvas table for SQL (default false). Off, the call makes one upstream request and returns the preview alone. On, the service pages past the preview up to EIA_CANVAS_MAX_ROWS and registers the accumulated rows, returning the handle in dataset — several extra upstream requests and seconds of latency on a large route, so turn it on when moving to analysis, not while exploring. Requires a canvas, which is on unless the server sets CANVAS_PROVIDER_TYPE=none; without one nothing is staged whatever this is set to.',
       ),
   }),
 
@@ -307,7 +306,7 @@ export const queryRouteTool = tool('eia_query_route', {
     route: z
       .string()
       .describe(
-        'The route path queried, in canonical spelling — any leading, trailing, or doubled slashes the input carried are stripped. Reusable verbatim in a follow-up call.',
+        'The canonical route path queried: whitespace/slashes normalized and one complete leading v2 segment removed. Reusable verbatim in a follow-up call.',
       ),
     data: z
       .array(z.object({}).passthrough().describe('A single data row with dynamic column keys.'))
@@ -336,7 +335,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Informational message when EIA returned no rows — either zero rows matched the filters (broaden the query) or offset paged past the last row (reduce offset below total). A page left empty because its first row alone exceeds the response budget carries no notice; canvas_preview_note names the offset that skips it.',
+        'Composed guidance for empty results or an offset past total, unmatched filter values in complete cached vocabularies, year-only bounds on effective monthly YYYY-MM data, and requested/effective length when clamped. Submitted filters and date bounds are preserved. A row withheld by the response byte budget is explained in canvas_preview_note.',
       ),
     dataset: z
       .string()
@@ -411,6 +410,22 @@ export const queryRouteTool = tool('eia_query_route', {
   enrichmentTrailer,
 
   errors: [
+    {
+      reason: 'upstream_invalid_response',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA returned an unusable response body or a missing route or data envelope.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA answered with a retryable HTTP service failure.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
     {
       reason: 'route_not_found',
       thrownBy: 'service',
@@ -497,7 +512,8 @@ export const queryRouteTool = tool('eia_query_route', {
     },
   ],
 
-  async handler(input, ctx) {
+  async handler(requestedInput, ctx) {
+    const input = { ...requestedInput, length: Math.min(requestedInput.length, 5000) };
     ctx.log.info('Executing eia_query_route', {
       route: input.route,
       offset: input.offset,
@@ -561,6 +577,20 @@ export const queryRouteTool = tool('eia_query_route', {
 
     const fetched = dataResp.data;
     const { total } = dataResp;
+    const notices = [...(dataResp.notices ?? [])];
+    if (requestedInput.length > input.length)
+      notices.push(`Requested length ${requestedInput.length} was clamped to ${input.length}.`);
+    // Only monthly year-bound interpretation has been verified against EIA.
+    if (dataResp.frequency === 'monthly' && dataResp.dateFormat === 'YYYY-MM') {
+      for (const bound of ['start', 'end'] as const) {
+        const value = input[bound];
+        if (value?.length !== 4 || ![...value].every((char) => char >= '0' && char <= '9'))
+          continue;
+        notices.push(
+          `At the effective monthly frequency (YYYY-MM), ${bound} ${JSON.stringify(value)} means ${value}-01 (January).${bound === 'end' ? ` Use ${value}-12 as end to include the full year.` : ''} The submitted bound was preserved.`,
+        );
+      }
+    }
 
     /**
      * DataCanvas spillover — the caller asked for it and a canvas is
@@ -752,6 +782,9 @@ export const queryRouteTool = tool('eia_query_route', {
         result.truncation_warning = advisories
           .map((w) => `${w.warning}: ${w.description}`)
           .join('; ');
+      }
+      if (notices.length) {
+        result.notice = [result.notice, ...notices].filter(Boolean).join(' ');
       }
       return result;
     };

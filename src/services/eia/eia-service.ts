@@ -194,8 +194,8 @@ function awaitShared(
 }
 
 /**
- * Canonical spelling of a route path: no leading or trailing slash, no repeated
- * internal ones. EIA's own docs and data browser write routes as
+ * Canonical spelling of a route path: trim whitespace, normalize slashes, then
+ * remove exactly one complete leading v2 segment. EIA's docs write routes as
  * `/v2/electricity/retail-sales/`, so those spellings reach the tools verbatim,
  * while the node map and the per-route metadata cache are keyed on the bare
  * form. Normalizing at the service boundary is what makes every spelling resolve
@@ -203,10 +203,11 @@ function awaitShared(
  * entries and costing three facet fan-outs.
  */
 function normalizeRoutePath(path: string): string {
-  return path
+  const normalized = path
     .trim()
     .replace(/\/{2,}/g, '/')
     .replace(/^\/+|\/+$/g, '');
+  return normalized === 'v2' ? '' : normalized.startsWith('v2/') ? normalized.slice(3) : normalized;
 }
 
 /** The `route_not_found` failure for a route absent from the EIA taxonomy. */
@@ -532,16 +533,11 @@ class EiaApiService {
           );
         }
 
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable('EIA API returned HTML — likely rate-limited or unavailable.', {
-            reason: 'rate_limited',
-          });
-        }
-
         if (!response.ok) {
           if (response.status === 429 || text.includes('OVER_RATE_LIMIT')) {
             throw serviceUnavailable('EIA rate limit exceeded.', {
               reason: 'rate_limited',
+              retryable: true,
             });
           }
 
@@ -566,6 +562,13 @@ class EiaApiService {
               status === 400 ? JsonRpcErrorCode.ValidationError : undefined,
           });
           error.message = detail;
+          if (error.code === JsonRpcErrorCode.ServiceUnavailable && response.status !== 501) {
+            throw serviceUnavailable(
+              detail,
+              { ...error.data, reason: 'upstream_unavailable', retryable: true },
+              { cause: error },
+            );
+          }
           throw error;
         }
 
@@ -574,7 +577,8 @@ class EiaApiService {
           parsed = JSON.parse(text);
         } catch {
           throw serviceUnavailable('EIA API returned non-JSON response.', {
-            reason: 'rate_limited',
+            reason: 'upstream_invalid_response',
+            retryable: true,
           });
         }
 
@@ -585,6 +589,7 @@ class EiaApiService {
         if (typeof parsedResponse === 'string' && parsedResponse.includes('OVER_RATE_LIMIT')) {
           throw serviceUnavailable('EIA rate limit exceeded (OVER_RATE_LIMIT).', {
             reason: 'rate_limited',
+            retryable: true,
           });
         }
 
@@ -708,7 +713,10 @@ class EiaApiService {
     const topLevelNodes = rootResponse?.response?.routes ?? [];
 
     if (topLevelNodes.length === 0) {
-      throw serviceUnavailable('EIA root endpoint returned no routes.');
+      throw serviceUnavailable('EIA root endpoint returned no routes.', {
+        reason: 'upstream_invalid_response',
+        retryable: true,
+      });
     }
 
     using gate = createPacer({ name: 'eia-tree', maxConcurrent: TREE_BUILD_CONCURRENCY });
@@ -869,6 +877,8 @@ class EiaApiService {
 
     if (!repaired || repaired.incomplete) {
       throw serviceUnavailable(`EIA did not return metadata for route "${path}".`, {
+        reason: 'upstream_invalid_response',
+        retryable: true,
         route: path,
         recovery: { hint: 'Retry the call; if it persists, check api.eia.gov availability.' },
       });
@@ -918,6 +928,12 @@ class EiaApiService {
     return {
       id: meta.id,
       description: meta.description,
+      complete:
+        Number.isInteger(resp?.response?.totalFacets) &&
+        resp.response.totalFacets >= 0 &&
+        resp.response.facets?.length === resp.response.totalFacets &&
+        new Set(resp.response.facets.filter((v) => v.id != null).map((v) => v.id)).size ===
+          resp.response.totalFacets,
       values: (resp?.response?.facets ?? [])
         .filter((v): v is RawFacetValue & { id: string } => v.id != null)
         .map((v) => ({
@@ -1036,6 +1052,8 @@ class EiaApiService {
     }
     if (!node) {
       throw serviceUnavailable(`EIA returned no metadata for route "${path || '(root)'}".`, {
+        reason: 'upstream_invalid_response',
+        retryable: true,
         route: path,
         recovery: { hint: 'Retry the call; if it persists, check api.eia.gov availability.' },
       });
@@ -1128,7 +1146,10 @@ class EiaApiService {
     }
     const rawNode = metaRespRaw?.response;
     if (!rawNode) {
-      throw notFound(`Route "${route}" returned empty metadata.`, { reason: 'route_not_found' });
+      throw serviceUnavailable(`EIA returned no metadata for route "${route}".`, {
+        reason: 'upstream_invalid_response',
+        retryable: true,
+      });
     }
 
     if (!isLeafNode(rawNode)) {
@@ -1341,6 +1362,38 @@ class EiaApiService {
       ...(appliedColumns && { appliedColumns }),
     };
 
+    const notices: string[] = [];
+    const meta = _routeMetaCache.get(normalizedRoute);
+    for (const facet of meta?.facets ?? []) {
+      const submitted = opts.filters?.[facet.id];
+      if (!facet.complete || meta?.unfetchedFacets?.includes(facet.id) || submitted === undefined)
+        continue;
+      const ids = new Set(facet.values.map((v) => v.id));
+      const unmatched = [...new Set(Array.isArray(submitted) ? submitted : [submitted])].filter(
+        (value) => !ids.has(value),
+      );
+      if (unmatched.length === 0) continue;
+      const folded = new Map<string, string[]>();
+      for (const id of ids) {
+        const key = id.toLowerCase();
+        const matches = folded.get(key) ?? [];
+        matches.push(id);
+        folded.set(key, matches);
+      }
+      const suggestions = unmatched.flatMap((value) => {
+        const matches = folded.get(value.toLowerCase());
+        return matches
+          ? [
+              `For ${JSON.stringify(value)}, did you mean ${matches.map((id) => JSON.stringify(id)).join(' or ')}?`,
+            ]
+          : [];
+      });
+      notices.push(
+        `Filter ${facet.id} ${unmatched.length === 1 ? 'value' : 'values'} ${unmatched.map((value) => JSON.stringify(value)).join(', ')} ${unmatched.length === 1 ? 'is' : 'are'} not in the complete cached vocabulary.${suggestions.length > 0 ? ` Facet values are case-sensitive; ${suggestions.join(' ')}` : ''} The submitted filter was preserved.`,
+      );
+    }
+    if (notices.length > 0) result.notices = notices;
+
     if (opts.accumulate && data.length > 0 && offset + data.length < total) {
       result.accumulated = await this.accumulatePages(
         normalizedRoute,
@@ -1393,11 +1446,11 @@ class EiaApiService {
       throw err;
     }
 
-    // A 200 with no `response` envelope is an upstream shape failure, not a
-    // caller error — it carries no declared reason, so it bubbles as a baseline
-    // ServiceUnavailable rather than borrowing a contract reason it doesn't fit.
+    // A successful HTTP status does not establish a usable data envelope.
     if (!resp?.response) {
       throw serviceUnavailable(`EIA returned no data envelope for route "${route}".`, {
+        reason: 'upstream_invalid_response',
+        retryable: true,
         route,
         recovery: { hint: 'Retry the query; if it persists, check api.eia.gov availability.' },
       });

@@ -5,6 +5,7 @@
  */
 
 import { createApp, disabledTool } from '@cyanheads/mcp-ts-core';
+import { parseConfig, resetConfig } from '@cyanheads/mcp-ts-core/config';
 import { getServerConfig, isCanvasEnabled } from './config/server-config.js';
 import { browseRoutesTool } from './mcp-server/tools/definitions/browse-routes.tool.js';
 import { dataframeDescribeTool } from './mcp-server/tools/definitions/dataframe-describe.tool.js';
@@ -15,6 +16,11 @@ import { queryRouteTool } from './mcp-server/tools/definitions/query-route.tool.
 import { searchRoutesTool } from './mcp-server/tools/definitions/search-routes.tool.js';
 import { initCanvasBridge } from './services/canvas-bridge/canvas-bridge.js';
 import { initEiaApiService, shutdownEiaApiService } from './services/eia/eia-service.js';
+
+parseConfig();
+// DataCanvas defaults on; set CANVAS_PROVIDER_TYPE=none to disable it.
+process.env.CANVAS_PROVIDER_TYPE ||= 'duckdb';
+resetConfig();
 
 const serverConfig = getServerConfig();
 
@@ -30,7 +36,7 @@ const serverConfig = getServerConfig();
 const canvasEnabled = isCanvasEnabled();
 
 const canvasDisabled = {
-  reason: 'DataCanvas is not configured in this deployment.',
+  reason: 'DataCanvas is disabled in this deployment.',
   hint: 'CANVAS_PROVIDER_TYPE=duckdb',
 };
 
@@ -56,7 +62,7 @@ await createApp({
   title: 'eia-energy-mcp-server',
   sessionMode: 'stateless',
   instructions:
-    'Use the `eia_*` tools for U.S. Energy Information Administration (EIA) API v2 energy data. Requires an `EIA_API_KEY`. Routes use path identifiers (e.g. `electricity`, `petroleum/pri`); leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling resolves the same way. Workflow: `eia_search_routes` or `eia_browse_routes` to find a leaf route → `eia_describe_route` for its facets and columns → `eia_query_route` with facet-ID filters. Facet values come only from describe, not route metadata, so describe before querying. Values arrive as strings. Row-returning responses hold each surface to 64,000 bytes, cutting between whole rows: continue `eia_query_route` at `next_offset`. `eia_query_route` returns a preview and stages nothing by default; pass `stage: true` to also stage the matching rows as a DataCanvas table named by the `dataset` field — call `eia_dataframe_describe` for its column names (staging turns hyphens into underscores), then query it via SQL with `eia_dataframe_query`. Every dataset a tenant stages shares one canvas, so tables from different routes cross-join by name. The dataframe tools are listed only where a canvas is configured.',
+    'Use the `eia_*` tools for U.S. Energy Information Administration (EIA) API v2 energy data. Requires an `EIA_API_KEY`. Routes use path identifiers (e.g. `electricity`, `petroleum/pri`); whitespace and slashes are normalized, then exactly one complete leading v2 segment is removed, so /v2/electricity/retail-sales/ resolves to electricity/retail-sales. Full URLs and /data suffixes are not normalized. Workflow: `eia_search_routes` or `eia_browse_routes` to find a leaf route → `eia_describe_route` for its facets and columns → `eia_query_route` with facet-ID filters. Facet values come only from describe, not route metadata, so describe before querying. Values arrive as strings. Row-returning responses hold each surface to 64,000 bytes, cutting between whole rows: continue `eia_query_route` at `next_offset`. `eia_query_route` returns a preview and stages nothing by default; pass `stage: true` to also stage the matching rows as a DataCanvas table named by the `dataset` field — call `eia_dataframe_describe` for its column names (staging turns hyphens into underscores), then query it via SQL with `eia_dataframe_query`. Every dataset a tenant stages shares one canvas, so tables from different routes cross-join by name. The dataframe tools are listed only where a canvas is configured.',
   tools: [
     browseRoutesTool,
     describeRouteTool,

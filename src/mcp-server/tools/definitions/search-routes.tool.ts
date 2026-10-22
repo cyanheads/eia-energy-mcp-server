@@ -21,7 +21,7 @@
  *
  * `truncated` is measured, not inferred: the service looks one match past the
  * cap, so a search that ends exactly at `limit` reads as complete. `limit`
- * accepts up to 100 but each call returns at most `SEARCH_RESULT_CAP`; a larger
+ * accepts positive integers but each call returns at most `SEARCH_RESULT_CAP`; a larger
  * value is served at the cap and disclosed rather than rejected.
  * @module mcp-server/tools/definitions/search-routes.tool
  */
@@ -90,7 +90,6 @@ export const searchRoutesTool = tool('eia_search_routes', {
       .number()
       .int()
       .min(1)
-      .max(100)
       .default(10)
       .describe(
         `Maximum results to return (default 10). One call returns at most ${SEARCH_RESULT_CAP}; a larger limit is served at ${SEARCH_RESULT_CAP}, and truncated says whether more matches exist.`,
@@ -162,7 +161,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
       .string()
       .optional()
       .describe(
-        'Present when no routes matched, or when more matches exist than were returned — says how to narrow or widen the search.',
+        'Discloses requested/effective limits when clamped, and guidance when no routes matched or more matches exist.',
       ),
   },
 
@@ -172,6 +171,22 @@ export const searchRoutesTool = tool('eia_search_routes', {
   },
 
   errors: [
+    {
+      reason: 'upstream_invalid_response',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA returned an unusable response body or a missing route or data envelope.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA answered with a retryable HTTP service failure.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
     {
       reason: 'rate_limited',
       thrownBy: 'service',
@@ -208,22 +223,23 @@ export const searchRoutesTool = tool('eia_search_routes', {
       indexComplete: status.complete,
       ...(gaps.length > 0 && { indexGaps: gaps }),
     });
+    let notice: string | undefined;
     if (results.length === 0) {
-      ctx.enrich.notice(
-        status.complete
-          ? `No routes matched "${input.query}". Try different search terms or use eia_browse_routes to explore the taxonomy.`
-          : `No routes matched "${input.query}", but part of the corpus is missing (see indexGaps) — a match may exist that was never scored. Try eia_browse_routes to explore the taxonomy directly.`,
-      );
+      notice = status.complete
+        ? `No routes matched "${input.query}". Try different search terms or use eia_browse_routes to explore the taxonomy.`
+        : `No routes matched "${input.query}", but part of the corpus is missing (see indexGaps) — a match may exist that was never scored. Try eia_browse_routes to explore the taxonomy directly.`;
     } else if (hasMore) {
-      ctx.enrich.truncated({
-        shown: results.length,
-        cap,
-        guidance:
-          input.limit < SEARCH_RESULT_CAP
-            ? `More matches exist — narrow the query or raise limit (max ${SEARCH_RESULT_CAP}).`
-            : `More matches exist — one call returns at most ${SEARCH_RESULT_CAP}; narrow the query to reach the rest.`,
-      });
+      ctx.enrich({ truncated: true });
+      notice =
+        input.limit < SEARCH_RESULT_CAP
+          ? `More matches exist — narrow the query or raise limit (max ${SEARCH_RESULT_CAP}).`
+          : `More matches exist — one call returns at most ${SEARCH_RESULT_CAP}; narrow the query to reach the rest.`;
     }
+    if (input.limit > cap)
+      notice = [`Requested limit ${input.limit} was clamped to ${cap}.`, notice]
+        .filter(Boolean)
+        .join(' ');
+    if (notice !== undefined) ctx.enrich.notice(notice);
 
     return {
       results: results.map(({ entry, score }) => ({

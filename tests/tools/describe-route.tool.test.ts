@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
 import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
@@ -83,6 +83,30 @@ describe('describeRouteTool', () => {
     expect(result.frequencies).toHaveLength(2);
     expect(result.date_range.start).toBe('2001-01');
     expect(result.default_frequency).toBe('monthly');
+  });
+
+  it('preserves date_range and discloses its default-frequency context on both surfaces', async () => {
+    mockDescribe.mockResolvedValue({
+      ...FULL_META,
+      defaultFrequency: 'weekly',
+      dateRange: { start: '1986-01-03', end: '2026-10-16' },
+      unfetchedFacets: ['sectorid'],
+    });
+    const result = await runToolContract(describeRouteTool, {
+      route: 'petroleum/pri/spt',
+      values_offset: 10,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      date_range: { start: '1986-01-03', end: '2026-10-16' },
+      default_frequency: 'weekly',
+      notice: expect.stringContaining('another frequency may extend outside'),
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('Date range (default frequency weekly)');
+    expect(text).toContain('another frequency may extend outside');
+    expect(text).toContain('past the last value');
+    expect(text).toContain('EIA did not return the values of sectorid');
   });
 
   it('keeps the alias output field even when format() leaves it off the line', async () => {
@@ -261,14 +285,16 @@ describe('describeRouteTool', () => {
       expect(notice).not.toContain('stateid');
     });
 
-    it('omits the notice when every facet returned values', async () => {
+    it('reports only date context when every facet returned values', async () => {
       mockDescribe.mockResolvedValue({ ...FULL_META, facets: [wideFacet('sectorid', 6)] });
 
       const ctx = createMockContext({ errors: describeRouteTool.errors });
       const input = describeRouteTool.input.parse({ route: 'electricity/retail-sales' });
       await describeRouteTool.handler(input, ctx);
 
-      expect(getEnrichment(ctx).notice).toBeUndefined();
+      expect(getEnrichment(ctx).notice).toBe(
+        'date_range reports route metadata for the default frequency (monthly); another frequency may extend outside this range.',
+      );
     });
 
     it('does not report a facet with no upstream values as an overshoot', async () => {
@@ -285,7 +311,7 @@ describe('describeRouteTool', () => {
       const result = await describeRouteTool.handler(input, ctx);
 
       expect(result.facets[0]?.value_count).toBe(0);
-      expect(getEnrichment(ctx).notice).toBeUndefined();
+      expect(getEnrichment(ctx).notice).not.toContain('past the last value');
     });
 
     it('restricts the response to the requested facet', async () => {
@@ -410,7 +436,7 @@ describe('describeRouteTool', () => {
       });
       expect(result.facets.map((f) => f.id)).toEqual(['stateid']);
       expect(result).not.toHaveProperty('unavailable_facets');
-      expect(getEnrichment(ctx).notice).toBeUndefined();
+      expect(getEnrichment(ctx).notice).not.toContain('sectorid');
     });
 
     it('sends no facet option when the input names none', async () => {

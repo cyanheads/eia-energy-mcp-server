@@ -20,6 +20,7 @@
       "args": ["${__dirname}/dist/index.js"],
       "env": {
         "EIA_API_KEY": "${user_config.eia_api_key}",
+        "CANVAS_PROVIDER_TYPE": "none",
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
         "NODE_ENV": "production"

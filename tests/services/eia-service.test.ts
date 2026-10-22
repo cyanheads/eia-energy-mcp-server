@@ -15,6 +15,7 @@ import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
 import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
+import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
 import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import {
   _resetEiaApiService,
@@ -147,6 +148,200 @@ function seedRouteCache() {
     [],
   );
 }
+
+describe('cached facet diagnostics (#81)', () => {
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    _resetServerConfig();
+    _resetEiaApiService();
+    _resetRouteCache();
+    initEiaApiService();
+    seedRouteCache();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    _resetEiaApiService();
+    _resetRouteCache();
+    _resetServerConfig();
+  });
+
+  it.each([undefined, 3, 2])(
+    'uses only proven complete vocabularies (total %s)',
+    async (totalFacets) => {
+      const { paths, urls } = stubApiPaths({
+        [LEAF]: {
+          response: {
+            id: 'retail-sales',
+            facets: [{ id: 'stateid', description: 'State' }],
+            data: { price: { alias: 'Price', units: 'cents' } },
+          },
+        },
+        [`${LEAF}/facet/stateid`]: {
+          response: {
+            totalFacets,
+            facets: [
+              { id: 'TX', name: 'Texas' },
+              { id: 'CA', name: 'California' },
+            ],
+          },
+        },
+        [`${LEAF}/data`]: {
+          response: {
+            total: '1',
+            frequency: 'annual',
+            dateFormat: 'YYYY',
+            data: [{ stateid: 'TX', price: '10' }],
+          },
+        },
+      });
+      await getEiaApiService().describe(LEAF, createMockContext());
+      paths.length = 0;
+      const filters = { stateid: ['TX', 'ZZ', 'tx'] };
+      const result = await runToolContract(queryRouteTool, { route: LEAF, filters });
+      expect(paths).toEqual([`${LEAF}/data`]);
+      expect(urls.at(-1)?.searchParams.getAll('facets[stateid][]')).toEqual(['TX', 'ZZ', 'tx']);
+      expect(result.structuredContent).toMatchObject({ appliedFilters: filters });
+      if (totalFacets === 2) {
+        const expectedNotice =
+          'Filter stateid values "ZZ", "tx" are not in the complete cached vocabulary. Facet values are case-sensitive; For "tx", did you mean "TX"? The submitted filter was preserved.';
+        expect(result.structuredContent).toMatchObject({ notice: expectedNotice });
+        expect(result.content).toContainEqual(
+          expect.objectContaining({ text: expect.stringContaining(expectedNotice) }),
+        );
+      } else {
+        expect(result.structuredContent).not.toHaveProperty('notice');
+      }
+    },
+  );
+
+  it.each([0, 1])(
+    'composes diagnostics on an empty page with total %i using values beyond the describe window',
+    async (total) => {
+      vi.stubEnv('EIA_FACET_VALUE_CAP', '1');
+      _resetServerConfig();
+      const { paths } = stubApiPaths({
+        [LEAF]: {
+          response: {
+            id: 'retail-sales',
+            facets: [{ id: 'stateid', description: 'State' }],
+            data: {},
+          },
+        },
+        [`${LEAF}/facet/stateid`]: {
+          response: {
+            totalFacets: 2,
+            facets: [
+              { id: 'CA', name: 'California' },
+              { id: 'TX', name: 'Texas' },
+            ],
+          },
+        },
+        [`${LEAF}/data`]: { response: { total: String(total), data: [] } },
+      });
+      const described = await runToolContract(describeRouteTool, { route: LEAF });
+      expect(described.structuredContent).toMatchObject({
+        facets: [{ values: [{ id: 'CA' }], value_count: 2 }],
+      });
+      paths.length = 0;
+      const result = await runToolContract(queryRouteTool, {
+        route: LEAF,
+        columns: ['price'],
+        filters: { stateid: ['TX', 'ZZ'] },
+        offset: 4,
+      });
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain(total ? 'Offset 4' : 'No rows matched');
+      expect(notice).toContain('value "ZZ"');
+      expect(notice).not.toContain('value "TX"');
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text).toContain('value "ZZ"');
+      expect(text).toContain(total ? 'Offset 4' : 'No rows matched');
+      expect(paths).toEqual([`${LEAF}/data`]);
+    },
+  );
+
+  it('does not fetch a vocabulary to diagnose a cold query', async () => {
+    const { paths } = stubApiPaths({ [`${LEAF}/data`]: { response: { total: '0', data: [] } } });
+    await getEiaApiService().query(
+      LEAF,
+      { filters: { stateid: 'ZZ' }, columns: ['price'] },
+      createMockContext(),
+    );
+    expect(paths).toEqual([`${LEAF}/data`]);
+  });
+
+  it.each([
+    ['repeated', Array<string>(1000).fill('ZZ')],
+    ['distinct', Array.from({ length: 120 }, (_, i) => `S${String(i).padStart(3, '0')}`)],
+  ] as const)(
+    'keeps %s filter diagnostics within the response budget without dropping values',
+    async (kind, values) => {
+      const { paths, urls } = stubApiPaths({
+        [LEAF]: {
+          response: {
+            id: 'retail-sales',
+            facets: [{ id: 'stateid', description: 'State' }],
+            data: {},
+          },
+        },
+        [`${LEAF}/facet/stateid`]: {
+          response: { totalFacets: 1, facets: [{ id: 'TX', name: 'Texas' }] },
+        },
+        [`${LEAF}/data`]: { response: { total: '0', data: [] } },
+      });
+      await getEiaApiService().describe(LEAF, createMockContext());
+      paths.length = 0;
+      const result = await runToolContract(queryRouteTool, {
+        route: LEAF,
+        filters: { stateid: values },
+        columns: ['price'],
+      });
+      expect(result.isError).not.toBe(true);
+      const structured = result.structuredContent as { notice: string };
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(Buffer.byteLength(JSON.stringify(structured))).toBeLessThanOrEqual(64000);
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(64000);
+      for (const value of new Set(values)) {
+        expect(structured.notice).toContain(JSON.stringify(value));
+        expect(text).toContain(JSON.stringify(value));
+      }
+      expect(urls.at(-1)?.searchParams.getAll('facets[stateid][]')).toEqual(values);
+      expect(paths).toEqual([`${LEAF}/data`]);
+      if (kind === 'distinct') expect(urls.at(-1)?.href.length).toBeLessThan(8192);
+      else expect(structured.notice.match(/"ZZ"/g)).toHaveLength(1);
+    },
+  );
+
+  it('renders unmatched values literally while retaining raw notice data', async () => {
+    const value = '`code` [link](https://example.test) <b> & _text_';
+    stubApiPaths({
+      [LEAF]: {
+        response: {
+          id: 'retail-sales',
+          facets: [{ id: 'stateid', description: 'State' }],
+          data: {},
+        },
+      },
+      [`${LEAF}/facet/stateid`]: {
+        response: { totalFacets: 1, facets: [{ id: 'TX', name: 'Texas' }] },
+      },
+      [`${LEAF}/data`]: { response: { total: '0', data: [] } },
+    });
+    await getEiaApiService().describe(LEAF, createMockContext());
+    const result = await runToolContract(queryRouteTool, {
+      route: LEAF,
+      columns: ['price'],
+      filters: { stateid: value },
+    });
+    expect((result.structuredContent as { notice: string }).notice).toContain(value);
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    const noticeLine = text.split('\n').find((line) => line.startsWith('> '));
+    expect(noticeLine).toContain('\\`code\\`');
+    expect(noticeLine).toContain('\\[link\\]\\(https://example.test\\)');
+    expect(noticeLine).toContain('&lt;b&gt; &amp;');
+  });
+});
 
 describe('EiaApiService.query', () => {
   beforeEach(() => {
@@ -850,7 +1045,12 @@ describe('EiaApiService.query — data columns for a query without columns (#69)
     // without fetching the metadata the query already has.
     expect(paths).toEqual(['coal', 'coal/data', 'coal/facet/stateId']);
     expect(meta.facets).toEqual([
-      { id: 'stateId', description: 'State', values: [{ id: 'WY', name: 'Wyoming' }] },
+      {
+        id: 'stateId',
+        description: 'State',
+        values: [{ id: 'WY', name: 'Wyoming' }],
+        complete: true,
+      },
     ]);
     expect(meta.dataColumns.map((c) => c.id)).toEqual(['production', 'price']);
     expect(searchRoutes('Wyoming', 5)[0]?.entry.filter_hint).toEqual({ stateId: 'WY' });
@@ -1375,7 +1575,9 @@ describe('EiaApiService.describe — a facet value list that fails past its retr
       const result = await settle(() => runToolContract(describeRouteTool, { route: ROUTE }));
 
       expect(result.structuredContent).not.toHaveProperty('unavailable_facets');
-      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(result.structuredContent).toMatchObject({
+        notice: expect.stringContaining('default frequency'),
+      });
       const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
       expect(text).not.toContain('Unavailable');
     });
@@ -1445,6 +1647,8 @@ describe('EiaApiService — route path normalization (#53)', () => {
     `/${CANONICAL}/`,
     'electricity//retail-sales',
     ` ${CANONICAL} `,
+    `/v2/${CANONICAL}/`,
+    ` //v2///${CANONICAL}// `,
   ];
 
   /** Leaf metadata for the canonical path only — a variant that leaks through 404s. */
@@ -1497,7 +1701,7 @@ describe('EiaApiService — route path normalization (#53)', () => {
     stubApiPaths({});
     const ctx = createMockContext();
 
-    for (const variant of ['/electricity', 'electricity/', '/electricity/']) {
+    for (const variant of ['/electricity', 'electricity/', '/electricity/', '/v2/electricity/']) {
       const result = await getEiaApiService().browse(variant, ctx);
       expect(result.path).toBe('electricity');
       expect(result.isLeaf).toBe(false);
@@ -1544,7 +1748,7 @@ describe('EiaApiService — route path normalization (#53)', () => {
     const { fetchMock } = stubDataEndpoint({ total: 4 });
     const ctx = createMockContext();
 
-    for (const variant of ['/electricity', 'electricity/', '/electricity/']) {
+    for (const variant of ['/electricity', 'electricity/', '/electricity/', '/v2/electricity/']) {
       await expect(
         getEiaApiService().query(variant, { columns: ['price'] }, ctx),
       ).rejects.toMatchObject({ data: { reason: 'route_not_queryable' } });
@@ -1554,6 +1758,33 @@ describe('EiaApiService — route path normalization (#53)', () => {
     // to hit — every variant used to cost an upstream round trip to learn the
     // same thing.
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('browses /v2/ as root without a fetch', async () => {
+    const { fetchMock } = stubApiPaths({});
+    const result = await getEiaApiService().browse(' //v2/// ', createMockContext());
+    expect(result.path).toBe('');
+    expect(result.children.map((child) => child.route)).toEqual(['electricity']);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['v20/electricity', 'v20/electricity'],
+    ['electricity/v2/retail-sales', 'electricity/v2/retail-sales'],
+    ['v2/v2/steo', 'v2/steo'],
+    ['v2/steo/data', 'steo/data'],
+    ['https://api.eia.gov/v2/steo', 'https:/api.eia.gov/v2/steo'],
+  ])('only removes one leading complete v2 segment from %s', async (route, canonical) => {
+    const { urls } = stubApiPaths({
+      [`${canonical}/data`]: { response: { total: '0', data: [] } },
+    });
+    const result = await getEiaApiService().query(
+      route,
+      { columns: ['price'] },
+      createMockContext(),
+    );
+    expect(result.route).toBe(canonical);
+    expect(urls[0]?.pathname).toBe(`/v2/${canonical}/data/`);
   });
 });
 
@@ -3105,7 +3336,7 @@ describe('eia_search_routes — truthful truncation over a real index (#56, #70,
 
     expect(routes).toHaveLength(3);
     expect(structured).toMatchObject({ truncated: false, shown: 3, cap: 30 });
-    expect(structured.notice).toBeUndefined();
+    expect(structured.notice).toBe('Requested limit 50 was clamped to 30.');
     expect(text).not.toMatch(/More matches|at most 30/);
   });
 
@@ -3117,7 +3348,22 @@ describe('eia_search_routes — truthful truncation over a real index (#56, #70,
     expect(structured.notice).toMatch(/^No routes matched "qqxjjvv"/);
   });
 
-  for (const limit of [0, 101]) {
+  it('clamps limit 101 over a real index without false truncation', async () => {
+    const { result, structured, routes, text } = await searchThroughTool({
+      query: 'zinc',
+      limit: 101,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(routes).toHaveLength(3);
+    expect(structured).toMatchObject({
+      cap: 30,
+      truncated: false,
+      notice: 'Requested limit 101 was clamped to 30.',
+    });
+    expect(text).toContain('Requested limit 101 was clamped to 30.');
+  });
+
+  for (const limit of [0]) {
     it(`rejects limit ${limit} at input validation`, async () => {
       const { result } = await searchThroughTool({ query: 'zinc', limit });
 

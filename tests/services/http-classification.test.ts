@@ -12,7 +12,7 @@ import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route
 import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
 import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import { _resetEiaApiService, initEiaApiService } from '@/services/eia/eia-service.js';
-import { _resetRouteCache, initRouteCache } from '@/services/eia/route-cache.js';
+import { _resetRouteCache, getNode, initRouteCache } from '@/services/eia/route-cache.js';
 
 describe('EIA HTTP classification', () => {
   beforeEach(() => {
@@ -81,8 +81,6 @@ describe('EIA HTTP classification', () => {
       'an OVER_RATE_LIMIT response envelope on a 200',
       () => Response.json({ response: 'OVER_RATE_LIMIT: API rate limit exceeded' }),
     ],
-    ['an HTML body on a 503', () => new Response(HTML_503, { status: 503 })],
-    ['an HTML body on a 200', () => new Response(HTML_503, { status: 200 })],
   ])('classifies %s as rate_limited and spends the retry budget on it', async (_, answer) => {
     const fetchMock = vi.fn(async () => answer());
     vi.stubGlobal('fetch', fetchMock);
@@ -100,6 +98,109 @@ describe('EIA HTTP classification', () => {
     // withRetry's default budget: the first attempt plus three retries.
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
+
+  it.each([
+    [500, 'outage', 'upstream_unavailable', JsonRpcErrorCode.ServiceUnavailable],
+    [502, HTML_503, 'upstream_unavailable', JsonRpcErrorCode.ServiceUnavailable],
+    [503, HTML_503, 'upstream_unavailable', JsonRpcErrorCode.ServiceUnavailable],
+    [200, HTML_503, 'upstream_invalid_response', JsonRpcErrorCode.ServiceUnavailable],
+    [200, 'not JSON', 'upstream_invalid_response', JsonRpcErrorCode.ServiceUnavailable],
+    [504, HTML_503, undefined, JsonRpcErrorCode.Timeout],
+  ] as const)(
+    'classifies HTTP %i body without inventing rate limiting',
+    async (status, body, reason, code) => {
+      const fetchMock = vi.fn(async () => new Response(body, { status }));
+      vi.stubGlobal('fetch', fetchMock);
+      const pending = runToolContract(queryRouteTool, { route: 'steo', columns: ['value'] });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(result.structuredContent).toMatchObject({ error: { code } });
+      if (reason) {
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            data: {
+              reason,
+              retryable: true,
+              recovery: { hint: expect.stringContaining('availability') },
+            },
+          },
+        });
+        expect(JSON.stringify(result.content)).toContain('Recovery:');
+      }
+      expect(JSON.stringify(result)).not.toContain('rate_limited');
+    },
+  );
+
+  it.each([
+    [describeRouteTool, { route: 'steo' }],
+    [queryRouteTool, { route: 'steo', columns: ['value'] }],
+  ] as const)('classifies missing warm envelopes', async (definition, input) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({})),
+    );
+    const result = await runToolContract(definition, input);
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'upstream_invalid_response', retryable: true } },
+    });
+    expect(JSON.stringify(result.content)).toContain('availability');
+  });
+
+  it('classifies a repair that still lacks metadata without replacing the cached stub', async () => {
+    initRouteCache([{ id: 'steo', name: 'STEO', incomplete: true }], []);
+    const fetchMock = vi.fn(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await runToolContract(browseRoutesTool, { path: 'steo' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getNode('steo')?.incomplete).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: {
+          reason: 'upstream_invalid_response',
+          retryable: true,
+          recovery: { hint: 'Retry the call; if it persists, check api.eia.gov availability.' },
+        },
+      },
+    });
+    expect(result.content).toContainEqual(
+      expect.objectContaining({
+        text: expect.stringContaining(
+          'Retry the call; if it persists, check api.eia.gov availability.',
+        ),
+      }),
+    );
+  });
+
+  it.each([
+    [browseRoutesTool, {}],
+    [searchRoutesTool, { query: 'coal' }],
+    [describeRouteTool, { route: 'steo' }],
+    [queryRouteTool, { route: 'steo', columns: ['value'] }],
+  ] as const)(
+    'declares malformed root envelopes across route tools (%#)',
+    async (definition, input) => {
+      _resetRouteCache();
+      const fetchMock = vi.fn(async () => Response.json({ response: {} }));
+      vi.stubGlobal('fetch', fetchMock);
+      const pending = runToolContract(definition, input);
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: {
+            reason: 'upstream_invalid_response',
+            retryable: true,
+            recovery: { hint: expect.stringContaining('availability') },
+          },
+        },
+      });
+      expect(JSON.stringify(result.content)).toContain('Recovery:');
+    },
+  );
 
   describe('a request URI too long for EIA (#71)', () => {
     /** The page nginx serves in front of api.eia.gov for an over-long request line. */

@@ -154,7 +154,7 @@ describe('searchRoutesTool', () => {
       const enrichment = getEnrichment(ctx);
       expect(enrichment).toMatchObject({ truncated: true, shown: 30, cap: 30 });
       expect(enrichment.notice).toBe(
-        'More matches exist — one call returns at most 30; narrow the query to reach the rest.',
+        `${limit > 30 ? `Requested limit ${limit} was clamped to 30. ` : ''}More matches exist — one call returns at most 30; narrow the query to reach the rest.`,
       );
     },
   );
@@ -170,7 +170,7 @@ describe('searchRoutesTool', () => {
 
     const enrichment = getEnrichment(ctx);
     expect(enrichment).toMatchObject({ truncated: false, shown: 3, cap: 30 });
-    expect(enrichment.notice).toBeUndefined();
+    expect(enrichment.notice).toBe('Requested limit 50 was clamped to 30.');
   });
 
   it('searches and echoes a padded query as its trimmed text (#55)', async () => {

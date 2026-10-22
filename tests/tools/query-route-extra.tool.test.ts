@@ -73,6 +73,65 @@ describe('queryRouteTool — additional coverage', () => {
     mockQuery.mockReset();
   });
 
+  it.each([undefined, 'monthly'])(
+    'discloses year bounds from effective monthly metadata (%s requested)',
+    async (frequency) => {
+      mockQuery.mockResolvedValue(BASE_RESPONSE);
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        start: '2020',
+        end: '2021',
+        ...(frequency && { frequency }),
+      });
+      expect(result.isError).not.toBe(true);
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain('start "2020" means 2020-01');
+      expect(notice).toContain('end "2021" means 2021-01');
+      expect(notice).toContain('2021-12');
+      expect(JSON.stringify(result.content)).toContain('2021-12');
+      expect(mockQuery.mock.calls[0]?.[1]).toMatchObject({ start: '2020', end: '2021' });
+      expect(result.structuredContent).toMatchObject({ appliedStart: '2020', appliedEnd: '2021' });
+    },
+  );
+
+  it.each([
+    ['annual', 'YYYY', '2021'],
+    ['monthly', 'YYYY-MM', '2021-12'],
+    ['daily', 'YYYY-MM-DD', '2021'],
+    ['monthly', '', '2021'],
+  ])('preserves fully specified or unverified %s/%s bounds', async (frequency, dateFormat, end) => {
+    mockQuery.mockResolvedValue({ ...BASE_RESPONSE, frequency, dateFormat });
+    const result = await runToolContract(queryRouteTool, { route: 'steo', end });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).not.toHaveProperty('notice');
+  });
+
+  it.each([false, true])(
+    'composes coarse bounds with empty/staged responses (stage %s)',
+    async (stage) => {
+      const register = registeringBridge('df_MONTHLY', 2);
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        ...(stage ? {} : { total: 0, data: [] }),
+        notices: ['Cached facet diagnostic.'],
+        warnings: [{ warning: 'advisory', description: 'Keep this upstream message.' }],
+      });
+      const result = await runToolContract(queryRouteTool, { route: 'steo', end: '2021', stage });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        notice: expect.stringContaining('2021-12'),
+        truncation_warning: 'advisory: Keep this upstream message.',
+      });
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text).toContain('Cached facet diagnostic.');
+      expect(text).toContain('2021-12');
+      if (stage) {
+        expect(register.mock.calls[0]?.[1].queryParams.end).toBe('2021');
+        expect(result.structuredContent).toMatchObject({ dataset: 'df_MONTHLY' });
+      } else expect(text).toContain('No rows matched');
+    },
+  );
+
   // ------------------------------------------------------------------
   // Input validation via Zod schema
   // ------------------------------------------------------------------
@@ -90,13 +149,20 @@ describe('queryRouteTool — additional coverage', () => {
       expect(() => queryRouteTool.input.parse({ route: 'steo', length: 0 })).toThrow();
     });
 
-    it('rejects length > 5000 (max 5000)', () => {
-      expect(() => queryRouteTool.input.parse({ route: 'steo', length: 5001 })).toThrow();
+    it('accepts length > 5000 for clamping', () => {
+      expect(() => queryRouteTool.input.parse({ route: 'steo', length: 5001 })).not.toThrow();
     });
 
     it('accepts length exactly at max (5000)', () => {
       expect(() => queryRouteTool.input.parse({ route: 'steo', length: 5000 })).not.toThrow();
     });
+
+    it.each([1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+      'rejects non-integer/non-finite length %s',
+      (length) => {
+        expect(() => queryRouteTool.input.parse({ route: 'steo', length })).toThrow();
+      },
+    );
 
     it('accepts offset = 0 (boundary)', () => {
       expect(() => queryRouteTool.input.parse({ route: 'steo', offset: 0 })).not.toThrow();
@@ -120,6 +186,27 @@ describe('queryRouteTool — additional coverage', () => {
       ).not.toThrow();
     });
   });
+
+  it.each([false, true])(
+    'clamps length before fetch, echoes, and staged provenance (stage %s)',
+    async (stage) => {
+      const register = registeringBridge('df_CLAMP', 2);
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, ...(stage ? {} : { total: 0, data: [] }) });
+      const result = await runToolContract(queryRouteTool, { route: 'steo', length: 5001, stage });
+      expect(result.isError).not.toBe(true);
+      expect(mockQuery.mock.calls[0]?.[1].length).toBe(5000);
+      expect(result.structuredContent).toMatchObject({
+        appliedLength: 5000,
+        notice: expect.stringContaining('length 5001 was clamped to 5000'),
+      });
+      expect(JSON.stringify(result.content)).toContain('length 5001 was clamped to 5000');
+      if (stage)
+        expect(register.mock.calls[0]?.[1]).toMatchObject({
+          maxRows: 5000,
+          queryParams: { length: 5000 },
+        });
+    },
+  );
 
   // ------------------------------------------------------------------
   // Pre-flight: inverted date range

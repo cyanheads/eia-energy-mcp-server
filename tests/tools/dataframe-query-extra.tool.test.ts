@@ -6,7 +6,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import * as canvasBridge from '@/services/canvas-bridge/canvas-bridge.js';
@@ -44,16 +44,20 @@ describe('dataframeQueryTool — additional coverage', () => {
       expect(() => dataframeQueryTool.input.parse({ sql: 'SELECT 1', preview: 0 })).not.toThrow();
     });
 
-    it('rejects preview > 10000 (max 10000)', () => {
-      expect(() => dataframeQueryTool.input.parse({ sql: 'SELECT 1', preview: 10001 })).toThrow();
+    it('accepts preview > 10000 for clamping', () => {
+      expect(() =>
+        dataframeQueryTool.input.parse({ sql: 'SELECT 1', preview: 10001 }),
+      ).not.toThrow();
     });
 
     it('rejects row_limit = 0 (min 1)', () => {
       expect(() => dataframeQueryTool.input.parse({ sql: 'SELECT 1', row_limit: 0 })).toThrow();
     });
 
-    it('rejects row_limit > 10000 (max 10000)', () => {
-      expect(() => dataframeQueryTool.input.parse({ sql: 'SELECT 1', row_limit: 10001 })).toThrow();
+    it('accepts row_limit > 10000 for clamping', () => {
+      expect(() =>
+        dataframeQueryTool.input.parse({ sql: 'SELECT 1', row_limit: 10001 }),
+      ).not.toThrow();
     });
 
     it('accepts row_limit at max boundary (10000)', () => {
@@ -61,6 +65,33 @@ describe('dataframeQueryTool — additional coverage', () => {
         dataframeQueryTool.input.parse({ sql: 'SELECT 1', row_limit: 10000 }),
       ).not.toThrow();
     });
+
+    it.each([1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+      'rejects non-integer/non-finite row bounds %s',
+      (value) => {
+        expect(() =>
+          dataframeQueryTool.input.parse({ sql: 'SELECT 1', row_limit: value }),
+        ).toThrow();
+        expect(() => dataframeQueryTool.input.parse({ sql: 'SELECT 1', preview: value })).toThrow();
+      },
+    );
+  });
+
+  it.each([0, 1])('clamps row_limit and preview before canvas work on %i rows', async (count) => {
+    mockQuery.mockResolvedValue({
+      result: { columns: ['x'], rows: count ? [{ x: 1 }] : [], rowCount: count },
+    });
+    const result = await runToolContract(dataframeQueryTool, {
+      sql: 'SELECT 1',
+      row_limit: 10001,
+      preview: 10002,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(mockQuery.mock.calls[0]?.[2]).toMatchObject({ rowLimit: 10000, preview: 10000 });
+    expect(result.structuredContent).toMatchObject({
+      notice: expect.stringContaining('row_limit 10001 was clamped to 10000'),
+    });
+    expect(JSON.stringify(result.content)).toContain('preview 10002 was clamped to 10000');
   });
 
   // ------------------------------------------------------------------
@@ -123,6 +154,9 @@ describe('dataframeQueryTool — additional coverage', () => {
       ['register_as_clash', JsonRpcErrorCode.ValidationError],
       ['system_catalog_access', JsonRpcErrorCode.ValidationError],
       ['canvas_unavailable', JsonRpcErrorCode.ServiceUnavailable],
+      ['denied_function', JsonRpcErrorCode.ValidationError],
+      ['multi_statement', JsonRpcErrorCode.ValidationError],
+      ['sql_read_only', JsonRpcErrorCode.ValidationError],
     ] as const)('declares %s at the code the framework actually throws', (reason, code) => {
       const entry = dataframeQueryTool.errors?.find((e) => e.reason === reason);
       expect(entry).toBeDefined();

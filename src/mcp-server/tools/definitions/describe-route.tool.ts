@@ -68,7 +68,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .min(1)
       .describe(
-        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling like "/electricity/retail-sales/" resolves to the same route.',
+        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales". Full URLs and /data suffixes are not normalized.',
       ),
     facet: z
       .string()
@@ -167,10 +167,20 @@ export const describeRouteTool = tool('eia_describe_route', {
       .describe('Valid frequency options for eia_query_route.'),
     date_range: z
       .object({
-        start: z.string().describe('Earliest available period.'),
-        end: z.string().describe('Latest available period.'),
+        start: z
+          .string()
+          .describe(
+            'Metadata start period for the default frequency; another frequency may extend earlier.',
+          ),
+        end: z
+          .string()
+          .describe(
+            'Metadata end period for the default frequency; another frequency may extend later.',
+          ),
       })
-      .describe('Available date range for this route.'),
+      .describe(
+        'Route metadata date range in the default-frequency context, not a bound across all frequencies.',
+      ),
     default_frequency: z.string().describe('Default frequency ID used when none is specified.'),
     default_date_format: z
       .string()
@@ -182,11 +192,27 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .optional()
       .describe(
-        'Guidance when values_offset lands past the last value of one or more facets — naming each emptied facet, its value_count, and its last valid offset — or when EIA did not return the value list of a facet named in unavailable_facets. Absent when neither applies.',
+        'Default-frequency date-range context, composed with guidance for exhausted facet windows or unavailable facet values.',
       ),
   },
 
   errors: [
+    {
+      reason: 'upstream_invalid_response',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA returned an unusable response body or a missing route or data envelope.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA answered with a retryable HTTP service failure.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
     {
       reason: 'route_not_found',
       thrownBy: 'service',
@@ -291,7 +317,9 @@ export const describeRouteTool = tool('eia_describe_route', {
      * every narrower one beside it. Name those facets and their counts so the
      * two cases read apart and the caller has an offset to come back with.
      */
-    const notices: string[] = [];
+    const notices: string[] = [
+      `date_range reports route metadata for the default frequency (${meta.defaultFrequency || 'unspecified'}); another frequency may extend outside this range.`,
+    ];
     const overshot = windows.filter((f) => f.values.length === 0 && f.value_count > 0);
     if (overshot.length > 0) {
       const named = overshot
@@ -315,7 +343,7 @@ export const describeRouteTool = tool('eia_describe_route', {
         `EIA did not return the values of ${unavailableFacets.join(', ')} after retries, so ${one ? 'it is' : 'they are'} left out of facets. ${one ? 'The ID still filters' : 'The IDs still filter'} eia_query_route; call eia_describe_route again to re-fetch only the missing value lists.`,
       );
     }
-    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
+    ctx.enrich.notice(notices.join(' '));
 
     return {
       route: meta.route,
@@ -348,7 +376,9 @@ export const describeRouteTool = tool('eia_describe_route', {
     lines.push(`## ${result.route}`);
     if (result.description) lines.push(`\n${result.description}\n`);
 
-    lines.push(`**Date range:** ${result.date_range.start} → ${result.date_range.end}`);
+    lines.push(
+      `**Date range (default frequency ${result.default_frequency || 'unspecified'}):** ${result.date_range.start} → ${result.date_range.end}`,
+    );
     lines.push(
       `**Default frequency:** ${result.default_frequency} (format: ${result.default_date_format})\n`,
     );

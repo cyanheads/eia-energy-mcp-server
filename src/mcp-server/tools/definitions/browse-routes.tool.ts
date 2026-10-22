@@ -22,7 +22,7 @@ export const browseRoutesTool = tool('eia_browse_routes', {
       .string()
       .optional()
       .describe(
-        'Route path to browse (e.g. "electricity", "petroleum/pri"). Omit for root. Leading, trailing, and doubled slashes are stripped, so an EIA-doc spelling like "/electricity/retail-sales/" resolves to the same route.',
+        'Route path to browse (e.g. "electricity", "petroleum/pri"). Omit for root. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales", and "/v2/" to root. Full URLs and /data suffixes are not normalized.',
       ),
   }),
 
@@ -53,6 +53,22 @@ export const browseRoutesTool = tool('eia_browse_routes', {
   }),
 
   errors: [
+    {
+      reason: 'upstream_invalid_response',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA returned an unusable response body or a missing route or data envelope.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'EIA answered with a retryable HTTP service failure.',
+      recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
     {
       reason: 'route_not_found',
       thrownBy: 'service',

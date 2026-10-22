@@ -80,8 +80,25 @@ describe('tool registration', IMPORT_TIMEOUT, () => {
     _resetServerConfig();
   });
 
-  it('gates every canvas-only tool when no canvas is configured', async () => {
-    vi.stubEnv('CANVAS_PROVIDER_TYPE', '');
+  it.each([
+    ['unset', undefined],
+    ['empty', ''],
+  ])('defaults to the DuckDB canvas when CANVAS_PROVIDER_TYPE is %s', async (_label, value) => {
+    vi.stubEnv('CANVAS_PROVIDER_TYPE', value);
+
+    const tools = await registeredTools();
+
+    // The framework reads the provider from the environment once createApp runs.
+    expect(process.env.CANVAS_PROVIDER_TYPE).toBe('duckdb');
+    expect(disabledMeta(tools.get('eia_dataframe_describe'))).toBeUndefined();
+    expect(disabledMeta(tools.get('eia_dataframe_query'))).toBeUndefined();
+    expect(disabledMeta(tools.get('eia_dataframe_drop'))?.hint).toBe(
+      'EIA_DATAFRAME_DROP_ENABLED=true',
+    );
+  });
+
+  it('gates every canvas-only tool when the canvas is disabled', async () => {
+    vi.stubEnv('CANVAS_PROVIDER_TYPE', 'none');
 
     const tools = await registeredTools();
 
@@ -131,22 +148,12 @@ describe('tool registration', IMPORT_TIMEOUT, () => {
   });
 
   it('keeps the drop tool gated on the canvas even when its own flag is set', async () => {
-    vi.stubEnv('CANVAS_PROVIDER_TYPE', '');
+    vi.stubEnv('CANVAS_PROVIDER_TYPE', 'none');
     vi.stubEnv('EIA_DATAFRAME_DROP_ENABLED', 'true');
 
     const tools = await registeredTools();
 
     expect(disabledMeta(tools.get('eia_dataframe_drop'))?.hint).toBe('CANVAS_PROVIDER_TYPE=duckdb');
-  });
-
-  it('treats a provider type other than duckdb as no canvas', async () => {
-    vi.stubEnv('CANVAS_PROVIDER_TYPE', 'none');
-
-    const tools = await registeredTools();
-
-    expect(disabledMeta(tools.get('eia_dataframe_query'))?.hint).toBe(
-      'CANVAS_PROVIDER_TYPE=duckdb',
-    );
   });
 });
 

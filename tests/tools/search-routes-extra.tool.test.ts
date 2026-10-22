@@ -4,7 +4,7 @@
  * @module tests/tools/search-routes-extra.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import * as eiaService from '@/services/eia/eia-service.js';
@@ -53,14 +53,32 @@ describe('searchRoutesTool — additional coverage', () => {
       );
     });
 
-    // 1 to 100 is accepted; past the 30-per-call cap the tool serves 30 (#70).
-    it.each([0, 101])('rejects limit %i', (limit) => {
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('rejects limit %s', (limit) => {
       expect(() => searchRoutesTool.input.parse({ query: 'energy', limit })).toThrow();
     });
 
-    it.each([1, 30, 31, 100])('accepts limit %i', (limit) => {
+    it.each([1, 30, 31, 100, 101, 500])('accepts limit %i', (limit) => {
       expect(searchRoutesTool.input.parse({ query: 'energy', limit }).limit).toBe(limit);
     });
+  });
+
+  it.each([0, 1])('discloses a clamped limit on %i matches', async (count) => {
+    mockSearch.mockResolvedValue({
+      results: count
+        ? [{ entry: { route: 'steo', name: 'STEO', description: '', isLeaf: true }, score: 0 }]
+        : [],
+      hasMore: false,
+      status: settled(1),
+    });
+    const result = await runToolContract(searchRoutesTool, { query: 'energy', limit: 500 });
+    expect(result.isError).not.toBe(true);
+    expect(mockSearch.mock.calls[0]?.[1]).toBe(30);
+    expect(result.structuredContent).toMatchObject({
+      cap: 30,
+      truncated: false,
+      notice: expect.stringContaining('limit 500 was clamped to 30'),
+    });
+    expect(JSON.stringify(result.content)).toContain('limit 500 was clamped to 30');
   });
 
   // ------------------------------------------------------------------

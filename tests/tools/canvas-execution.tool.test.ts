@@ -138,6 +138,71 @@ it('preserves an execution-time conversion error and succeeds after TRY_CAST', D
 );
 
 it(
+  'declares SQL gate reasons and applies their recoveries to real staged-table failures',
+  DUCKDB_TIMEOUT,
+  () =>
+    withCanvas(async () => {
+      const ctx = createMockContext({ errors: dataframeQueryTool.errors });
+      await dataframeQueryTool.handler(
+        dataframeQueryTool.input.parse({ sql: 'SELECT 1 AS value', register_as: 'df_GATE' }),
+        ctx,
+      );
+      for (const [sql, reason, recovery] of [
+        [
+          "SELECT current_setting('threads') FROM df_GATE",
+          'denied_function',
+          'Select from staged dataframes using ordinary SQL expressions; eia_dataframe_describe lists their columns.',
+        ],
+        [
+          'SELECT * FROM df_GATE; SELECT 1',
+          'multi_statement',
+          'Send one SELECT per eia_dataframe_query call; use register_as to chain results.',
+        ],
+        [
+          "COPY df_GATE TO '/tmp/never-written.csv'",
+          'sql_read_only',
+          'Query staged dataframes with a read-only SELECT; use register_as to persist results.',
+        ],
+      ] as const) {
+        const declared = dataframeQueryTool.errors?.find((entry) => entry.reason === reason);
+        expect(declared).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          thrownBy: 'service',
+          recovery,
+        });
+        await expect(
+          dataframeQueryTool.handler(dataframeQueryTool.input.parse({ sql }), ctx),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason, recovery: { hint: recovery } },
+        });
+      }
+    }),
+);
+
+it('keeps register_as materialize-all and preview zero after clamping', DUCKDB_TIMEOUT, () =>
+  withCanvas(async () => {
+    const ctx = createMockContext({ errors: dataframeQueryTool.errors });
+    const staged = await dataframeQueryTool.handler(
+      dataframeQueryTool.input.parse({
+        sql: 'WITH d(x) AS (VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)) SELECT a.x FROM d a, d b, d c, d e, d f LIMIT 10001',
+        register_as: 'df_WHOLE',
+        row_limit: 10001,
+        preview: 0,
+      }),
+      ctx,
+    );
+    expect(staged.rows).toEqual([]);
+    expect(staged.registered_as).toBe('df_WHOLE');
+    const counted = await dataframeQueryTool.handler(
+      dataframeQueryTool.input.parse({ sql: 'SELECT COUNT(*) AS n FROM df_WHOLE' }),
+      ctx,
+    );
+    expect(Number(counted.rows[0]?.n)).toBe(10001);
+  }),
+);
+
+it(
   'refuses the engine-setting, string-built, and file-reading SQL its description names',
   DUCKDB_TIMEOUT,
   () =>

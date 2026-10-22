@@ -84,6 +84,8 @@ export interface RawFacetResponse {
 
 /** Normalized facet with all values populated. */
 export interface Facet {
+  /** True only when the upstream total proves every filterable value is cached. */
+  complete?: boolean;
   description: string;
   id: string;
   values: Array<{ id: string; name: string; alias?: string }>;
@@ -161,6 +163,8 @@ export interface DataResponse {
   data: DataRow[];
   dateFormat: string;
   frequency: string;
+  /** Advisory diagnostics from complete cached facet vocabularies; never alter filters. */
+  notices?: string[];
   /**
    * The route the query resolved to, in canonical spelling — no leading,
    * trailing, or repeated slashes. Mirrors `RouteMetadata.route` so a tool can

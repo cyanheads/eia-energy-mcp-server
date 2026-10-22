@@ -36,7 +36,7 @@
         },
         {
           "name": "EIA_DATAFRAME_DROP_ENABLED",
-          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup. Also requires CANVAS_PROVIDER_TYPE=duckdb.",
+          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup. Has no effect with CANVAS_PROVIDER_TYPE=none.",
           "format": "string",
           "isRequired": false,
           "default": "false"
@@ -57,9 +57,10 @@
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable DataCanvas (Node.js only). Registers the three eia_dataframe_* tools and lets eia_query_route stage rows when called with stage: true.",
+          "description": "DataCanvas provider. 'duckdb', the default, registers eia_dataframe_describe and eia_dataframe_query and lets eia_query_route stage rows when called with stage: true; eia_dataframe_drop also requires EIA_DATAFRAME_DROP_ENABLED=true. 'none' disables DataCanvas.",
           "format": "string",
-          "isRequired": false
+          "isRequired": false,
+          "default": "duckdb"
         },
         {
           "name": "MCP_LOG_LEVEL",
@@ -101,7 +102,7 @@
         },
         {
           "name": "EIA_DATAFRAME_DROP_ENABLED",
-          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup. Also requires CANVAS_PROVIDER_TYPE=duckdb.",
+          "description": "Set to 'true' to expose eia_dataframe_drop for manual canvas cleanup. Has no effect with CANVAS_PROVIDER_TYPE=none.",
           "format": "string",
           "isRequired": false,
           "default": "false"
@@ -122,9 +123,10 @@
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable DataCanvas (Node.js only). Registers the three eia_dataframe_* tools and lets eia_query_route stage rows when called with stage: true.",
+          "description": "DataCanvas provider. 'duckdb', the default, registers eia_dataframe_describe and eia_dataframe_query and lets eia_query_route stage rows when called with stage: true; eia_dataframe_drop also requires EIA_DATAFRAME_DROP_ENABLED=true. 'none' disables DataCanvas.",
           "format": "string",
-          "isRequired": false
+          "isRequired": false,
+          "default": "duckdb"
         },
         {
           "name": "MCP_HTTP_HOST",
