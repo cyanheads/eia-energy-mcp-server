@@ -524,8 +524,9 @@ class EiaApiService {
         }
 
         // EIA refuses a request line past about 8 KB with an HTML 414 page. The
-        // same URI fails the same way on every attempt, so the status is read
-        // before the HTML test, which would otherwise call it rate limiting.
+        // same URI fails the same way on every attempt, so it is never retried.
+        // Status decides every non-OK answer; only a 200 body that fails to
+        // parse as JSON is classified from its contents.
         if (response.status === 414) {
           throw validationError(
             `EIA rejected the request as too long (HTTP 414): its URI ran to ${url.length.toLocaleString('en-US')} characters, past EIA's limit of about 8 KB.`,
