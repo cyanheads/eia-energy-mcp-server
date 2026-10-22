@@ -92,7 +92,11 @@ describe('EIA HTTP classification', () => {
     expect(result.structuredContent).toMatchObject({
       error: {
         code: JsonRpcErrorCode.ServiceUnavailable,
-        data: { reason: 'rate_limited', recovery: { hint: expect.stringContaining('Back off') } },
+        data: {
+          reason: 'rate_limited',
+          retryable: true,
+          recovery: { hint: expect.stringContaining('Back off') },
+        },
       },
     });
     // withRetry's default budget: the first attempt plus three retries.
