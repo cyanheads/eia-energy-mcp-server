@@ -489,7 +489,7 @@ export const queryRouteTool = tool('eia_query_route', {
       reason: 'invalid_period',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'start or end was not in a period format the route accepts, named a month, day, or hour that does not exist at a daily, weekly, hourly, or local-hourly frequency, or lacked its UTC offset at local-hourly frequency.',
+      when: 'start or end was not in a period format the route accepts, named a month, day, or hour that does not exist in the period shape its frequency reads exactly (YYYY-MM-DD at daily or weekly, YYYY-MM-DDTHH at hourly, YYYY-MM-DDTHH±HH at local-hourly), or lacked its UTC offset at local-hourly frequency.',
       recovery:
         'Call eia_describe_route and use the period format frequencies[].format gives for the chosen frequency, with a month 01–12, a day its month has, and an hour 00–23; at local-hourly each bound needs its hour and UTC offset, e.g. 2024-02-01T02-06.',
     },
