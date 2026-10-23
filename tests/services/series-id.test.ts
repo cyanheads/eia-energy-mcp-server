@@ -51,7 +51,7 @@ describe('parseSeriesId', () => {
     expect(parseSeriesId(query)).toBeUndefined();
   });
 
-  describe('timing over caller-sized text', () => {
+  describe('work over caller-sized text', () => {
     /** Thread CPU milliseconds for `reps` runs of `fn`, the least of three trials. */
     function cpuMs(fn: () => void, reps: number): number {
       let best = Number.POSITIVE_INFINITY;
@@ -64,7 +64,7 @@ describe('parseSeriesId', () => {
       return best;
     }
 
-    /** Doubling from 5k to 320k characters: the absolute bound at each size, then the span ratio. */
+    /** Doubling the input at each step: the absolute bound at each size, then the span ratio. */
     function assertLinear(shape: (n: number) => string): void {
       const reps = 20;
       const timings: number[] = [];
@@ -82,8 +82,8 @@ describe('parseSeriesId', () => {
       ['a long digit run', (n: number) => `${'1'.repeat(n)}.1.A`],
       ['many valid segments', (n: number) => `${'A.'.repeat(n / 2)}M`],
       ['many segments failing at the last one', (n: number) => `${'A.'.repeat(n / 2)} .M`],
-      ['a line-broken run', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`],
-      ['a CRLF whitespace run', (n: number) => '  \r\n'.repeat(n / 4)],
+      ['mixed text', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`],
+      ['whitespace alone', (n: number) => '  \r\n'.repeat(n / 4)],
       ['a dot run', (n: number) => `${'.'.repeat(n)}M`],
     ])('stays linear on %s', (_name, shape) => {
       assertLinear(shape);
