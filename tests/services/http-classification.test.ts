@@ -177,6 +177,128 @@ describe('EIA HTTP classification', () => {
     );
   });
 
+  describe('a failed repair of a route the warm left incomplete (#92)', () => {
+    const contractHint = (reason: string) =>
+      browseRoutesTool.errors!.find((entry) => entry.reason === reason)!.recovery;
+
+    it.each([
+      [
+        'a rate limit',
+        () => Response.json({ error: 'slow down' }, { status: 429 }),
+        'rate_limited',
+        JsonRpcErrorCode.ServiceUnavailable,
+      ],
+      [
+        'an HTTP outage',
+        () => new Response('down', { status: 503 }),
+        'upstream_unavailable',
+        JsonRpcErrorCode.ServiceUnavailable,
+      ],
+      [
+        'an unreachable host',
+        () => {
+          throw new TypeError('fetch failed', {
+            cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9'), {
+              code: 'ECONNREFUSED',
+            }),
+          });
+        },
+        'upstream_unreachable',
+        JsonRpcErrorCode.ServiceUnavailable,
+      ],
+    ] as const)(
+      'surfaces %s under its own reason with its declared recovery',
+      async (_case, answer, reason, code) => {
+        initRouteCache([{ id: 'steo', name: 'STEO', incomplete: true }], []);
+        const fetchMock = vi.fn(async () => answer());
+        vi.stubGlobal('fetch', fetchMock);
+        const pending = runToolContract(browseRoutesTool, { path: 'steo' });
+        await vi.runAllTimersAsync();
+        const result = await pending;
+
+        // The repair spent the retry budget on a transient failure.
+        expect(fetchMock).toHaveBeenCalledTimes(4);
+        expect(getNode('steo')?.incomplete).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code,
+            data: { reason, retryable: true, recovery: { hint: contractHint(reason) } },
+          },
+        });
+        const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+        expect(text).toContain(contractHint(reason));
+        expect(JSON.stringify(result)).not.toContain('upstream_invalid_response');
+        expect(JSON.stringify(result)).not.toContain('did not return metadata');
+      },
+    );
+
+    it('surfaces a repair EIA never answered as upstream_timeout inside the deadline', async () => {
+      initRouteCache([{ id: 'steo', name: 'STEO', incomplete: true }], []);
+      const fetchMock = vi.fn(
+        (_input: string | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal as AbortSignal;
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          }),
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      const pending = runToolContract(browseRoutesTool, { path: 'steo' });
+      await vi.advanceTimersByTimeAsync(57_000);
+      const result = await pending;
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.Timeout,
+          data: {
+            reason: 'upstream_timeout',
+            retryable: true,
+            recovery: { hint: contractHint('upstream_timeout') },
+          },
+        },
+      });
+      expect(getNode('steo')?.incomplete).toBe(true);
+    });
+
+    it('surfaces a route EIA no longer has as route_not_found', async () => {
+      initRouteCache([{ id: 'steo', name: 'STEO', incomplete: true }], []);
+      const fetchMock = vi.fn(async () => Response.json({ error: 'not found' }, { status: 404 }));
+      vi.stubGlobal('fetch', fetchMock);
+      const pending = runToolContract(browseRoutesTool, { path: 'steo' });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'route_not_found' } },
+      });
+    });
+
+    it('keeps a caller abort during the repair a cancellation', async () => {
+      initRouteCache([{ id: 'steo', name: 'STEO', incomplete: true }], []);
+      const controller = new AbortController();
+      const fetchMock = vi.fn(async () => {
+        controller.abort();
+        throw new DOMException('The operation was aborted.', 'AbortError');
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const pending = runToolContract(
+        browseRoutesTool,
+        { path: 'steo' },
+        { context: { signal: controller.signal } },
+      );
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.RequestCancelled },
+      });
+      const wire = JSON.stringify(result);
+      expect(wire).not.toContain('upstream_invalid_response');
+      expect(wire).not.toContain('did not return metadata');
+    });
+  });
+
   it.each([
     [browseRoutesTool, {}],
     [searchRoutesTool, { query: 'coal' }],

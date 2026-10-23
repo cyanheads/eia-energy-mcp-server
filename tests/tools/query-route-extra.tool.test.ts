@@ -212,8 +212,31 @@ describe('queryRouteTool — additional coverage', () => {
   // Pre-flight: inverted date range
   // ------------------------------------------------------------------
 
-  describe('inverted date range pre-flight', () => {
-    it('throws no_data when start > end (monthly format)', async () => {
+  /**
+   * #88 — the inverted-range check runs after the query, only on a zero-row
+   * answer, comparing the period each bound selects at the frequency EIA
+   * reports. It replaces #15's pre-flight string comparison; #15's decision —
+   * a plainly inverted range is an explicit no_data error, never a bare empty
+   * result — stands.
+   */
+  describe('inverted date range (#88)', () => {
+    const empty = (frequency: string, dateFormat = '') => ({
+      ...BASE_RESPONSE,
+      frequency,
+      dateFormat,
+      total: 0,
+      data: [],
+    });
+    const row = (frequency: string, period: string, dateFormat = '') => ({
+      ...BASE_RESPONSE,
+      frequency,
+      dateFormat,
+      total: 1,
+      data: [{ period, value: '1', 'value-units': 'units' }],
+    });
+
+    it('throws no_data when start > end (monthly format), after one query', async () => {
+      mockQuery.mockResolvedValue(empty('monthly', 'YYYY-MM'));
       const ctx = createMockContext({ errors: queryRouteTool.errors });
       const input = queryRouteTool.input.parse({
         route: 'electricity/retail-sales',
@@ -223,14 +246,16 @@ describe('queryRouteTool — additional coverage', () => {
 
       await expect(queryRouteTool.handler(input, ctx)).rejects.toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
-        data: { reason: 'no_data' },
+        data: { reason: 'no_data', start: '2024-06', end: '2024-01', frequency: 'monthly' },
       });
 
-      // Service should NOT have been called
-      expect(mockQuery).not.toHaveBeenCalled();
+      // The query itself is the only upstream call, with the bounds as submitted.
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery.mock.calls[0]?.[1]).toMatchObject({ start: '2024-06', end: '2024-01' });
     });
 
     it('throws no_data when start > end (annual format)', async () => {
+      mockQuery.mockResolvedValue(empty('annual', 'YYYY'));
       const ctx = createMockContext({ errors: queryRouteTool.errors });
       const input = queryRouteTool.input.parse({
         route: 'steo',
@@ -241,6 +266,207 @@ describe('queryRouteTool — additional coverage', () => {
       await expect(queryRouteTool.handler(input, ctx)).rejects.toMatchObject({
         data: { reason: 'no_data' },
       });
+    });
+
+    it('never refuses a call EIA answered with rows, even when it reports total 0', async () => {
+      mockQuery.mockResolvedValue({ ...row('monthly', '2023-06', 'YYYY-MM'), total: 0 });
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        frequency: 'monthly',
+        start: '2023-06',
+        end: '2023-01',
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        returned_count: 1,
+        data: [{ period: '2023-06' }],
+      });
+    });
+
+    it('returns the reproduction row with the coarse-end notice', async () => {
+      mockQuery.mockResolvedValue(row('monthly', '2023-01', 'YYYY-MM'));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        frequency: 'monthly',
+        start: '2023-01',
+        end: '2023',
+        filters: { stateid: 'TX', sectorid: 'RES' },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        returned_count: 1,
+        appliedStart: '2023-01',
+        appliedEnd: '2023',
+        notice: expect.stringContaining('Use 2023-12 as end'),
+      });
+      expect(JSON.stringify(result.content)).toContain('Use 2023-12 as end');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    // Every row-returning pair EIA answered in the #88 measurements.
+    it.each([
+      ['monthly', '2023-01', '2023', '2023-01'],
+      ['monthly', '2023-Q1', '2023-02', '2023-01'],
+      ['quarterly', '2023-Q4', '2023-12', '2023-Q4'],
+      ['annual', '2023-06', '2023-05', '2023'],
+      ['daily', '2024-02-01', '2024-02', '2024-02-01'],
+      ['hourly', '2024-02-01T05', '2024-02-01', '2024-02-01T05'],
+      ['local-hourly', '2024-02-01T08-00', '2024-02-01T03-06', '2024-02-01T02-06'],
+    ])(
+      'never refuses a %s range EIA answers with rows (%s / %s)',
+      async (frequency, start, end, period) => {
+        mockQuery.mockResolvedValue(row(frequency, period));
+        const result = await runToolContract(queryRouteTool, {
+          route: 'electricity/retail-sales',
+          frequency,
+          start,
+          end,
+        });
+        expect(result.isError).not.toBe(true);
+        expect(result.structuredContent).toMatchObject({ returned_count: 1, data: [{ period }] });
+      },
+    );
+
+    it.each([
+      [
+        'monthly',
+        '2023-12',
+        '2020-01',
+        'selects 2023-12',
+        'which selects 2020-01',
+        'Swap start and end.',
+      ],
+      [
+        'monthly',
+        '2023-02',
+        '2023',
+        'selects 2023-02',
+        'which selects 2023-01',
+        'pass end "2023-12"',
+      ],
+      [
+        'monthly',
+        '2023-10',
+        '2023-Q3',
+        'selects 2023-10',
+        'which selects 2023-07',
+        'Swap start and end.',
+      ],
+      [
+        'quarterly',
+        '2023-10',
+        '2023-Q3',
+        'selects 2023-Q4',
+        'which selects 2023-Q3',
+        'Swap start and end.',
+      ],
+      [
+        'daily',
+        '2024-02-02',
+        '2024-02',
+        'selects 2024-02-02',
+        'which selects 2024-02-01',
+        'pass end "2024-02-29"',
+      ],
+      [
+        'weekly',
+        '2024-02-06',
+        '2024-02-05',
+        'selects 2024-02-06',
+        'which selects 2024-02-05',
+        'Swap start and end.',
+      ],
+      [
+        'hourly',
+        '2024-02-02T05',
+        '2024-02-01',
+        'selects 2024-02-02T05 UTC',
+        'which selects 2024-02-01T23 UTC',
+        'Swap start and end.',
+      ],
+      [
+        'local-hourly',
+        '2024-02-01T02-06',
+        '2024-02-01T07-00',
+        'selects 2024-02-01T08 UTC',
+        'which selects 2024-02-01T07 UTC',
+        'Swap start and end.',
+      ],
+    ])(
+      'fails a zero-row %s range %s / %s as no_data naming both selected periods',
+      async (frequency, start, end, startSelects, endSelects, fix) => {
+        mockQuery.mockResolvedValue(empty(frequency));
+        const contract = queryRouteTool.errors!.find((entry) => entry.reason === 'no_data')!;
+        const result = await runToolContract(queryRouteTool, {
+          route: 'electricity/retail-sales',
+          frequency,
+          start,
+          end,
+        });
+        expect(result.isError).toBe(true);
+        const error = (result.structuredContent as { error: { message: string } }).error;
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'no_data', recovery: { hint: contract.recovery } },
+        });
+        const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+        for (const fragment of [
+          `effective ${frequency} frequency`,
+          startSelects,
+          endSelects,
+          fix,
+        ]) {
+          expect(error.message).toContain(fragment);
+          expect(text).toContain(fragment);
+        }
+        expect(contract.recovery).toContain('2023-12');
+        expect(contract.recovery).not.toMatch(/^Swap/);
+      },
+    );
+
+    it.each([
+      ['ordered bounds', 'monthly', '2023-01', '2023-06'],
+      ['an unparseable start', 'monthly', 'June 2023', '2023-01'],
+      ['an unparseable end', 'monthly', '2023-06', '2023/01'],
+      ['an out-of-range month', 'monthly', '2023-13', '2023-01'],
+      ['one offset-bearing bound', 'hourly', '2024-02-02T05-06', '2024-02-01T03'],
+      ['an unmodeled frequency', 'four-week', '2024-02-06', '2024-02-05'],
+      ['a missing reported frequency', '', '2024-06', '2024-01'],
+    ])('keeps the empty-result notice for %s', async (_case, frequency, start, end) => {
+      mockQuery.mockResolvedValue(empty(frequency));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        start,
+        end,
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        total: 0,
+        notice: expect.stringContaining('No rows matched'),
+      });
+    });
+
+    /**
+     * The inverted-range check and registration gate on opposite row counts,
+     * so which runs first is not observable on its own: registration's own
+     * zero-row gate is pinned by "stages nothing and says nothing of it on an
+     * offset past the last row". This case fails when that gate admits an
+     * empty fetch and the check runs after registration.
+     */
+    it('fails an inverted stage: true range without registering a table', async () => {
+      const register = registeringBridge('df_NEVER', 0);
+      mockQuery.mockResolvedValue(empty('monthly', 'YYYY-MM'));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        start: '2023-10',
+        end: '2023-Q3',
+        stage: true,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({ error: { data: { reason: 'no_data' } } });
+      expect(register).not.toHaveBeenCalled();
+      expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
     it('does not throw when start equals end', async () => {
@@ -640,6 +866,36 @@ describe('queryRouteTool — additional coverage', () => {
     expect(result.canvas_preview_note).toContain('offset 5,100');
     // The cap did not bind — the note must not claim it did.
     expect(result.canvas_preview_note).not.toContain('EIA_CANVAS_MAX_ROWS');
+  });
+
+  it('says time ran out, on both surfaces, when the call deadline ended staging', async () => {
+    const accumulatedRows = Array.from({ length: 5100 }, (_, i) => ({
+      period: `2024-${String((i % 12) + 1).padStart(2, '0')}`,
+      value: String(i),
+    }));
+    registeringBridge('df_LATE', 5100);
+    mockQuery.mockResolvedValue({
+      ...BASE_RESPONSE,
+      total: 20000,
+      accumulated: { rows: accumulatedRows, capped: false, cap: 25000, timedOut: true },
+    });
+
+    const result = await runToolContract(queryRouteTool, {
+      route: 'electricity/retail-sales',
+      stage: true,
+    });
+    const note = (result.structuredContent as { canvas_preview_note?: string }).canvas_preview_note;
+    const text = (result.content ?? []).map((b) => (b as { text?: string }).text ?? '').join('');
+
+    expect(result.isError).toBeFalsy();
+    expect(note).toContain('5,100 rows staged as df_LATE');
+    expect(note).toContain("Staging stopped when the call's time limit ran out");
+    expect(note).toContain('1–5,100 of 20,000');
+    expect(note).toContain('Re-query with offset 5,100 and stage: true');
+    // Neither a failed page nor the row cap.
+    expect(note).not.toContain('Staging stopped before the end');
+    expect(note).not.toContain('EIA_CANVAS_MAX_ROWS');
+    expect(text).toContain(note as string);
   });
 
   // ------------------------------------------------------------------

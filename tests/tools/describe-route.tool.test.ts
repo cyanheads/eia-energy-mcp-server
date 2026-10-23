@@ -3,6 +3,7 @@
  * @module tests/tools/describe-route.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -783,4 +784,455 @@ describe('describeRouteTool', () => {
       });
     });
   });
+
+  describe('values_query', () => {
+    const META = {
+      ...FULL_META,
+      description: 'Retail',
+      facets: [wideFacet('stateid', 10), wideFacet('sectorid', 2)],
+      dataColumns: [],
+      frequencies: [],
+    };
+
+    it('leaves a call without values_query byte-identical on both surfaces', async () => {
+      vi.stubEnv('EIA_FACET_VALUE_CAP', '3');
+      _resetServerConfig();
+      mockDescribe.mockResolvedValue(META);
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/retail-sales',
+        values_offset: 2,
+      });
+
+      const notice =
+        "date_range reports route metadata for the default frequency (monthly); another frequency may extend outside this range. values_offset 2 is past the last value of sectorid (2 values, last valid offset 1). Reduce values_offset to at most that facet's last valid offset, or pass facet to page one facet at a time so a shared offset stops emptying the narrower ones.";
+      // Key order is part of the bytes a client receives, so the comparison is
+      // on the serialized object, not a deep-equal that ignores order.
+      expect(JSON.stringify(result.structuredContent)).toBe(
+        JSON.stringify({
+          route: 'electricity/retail-sales',
+          description: 'Retail',
+          facets: [
+            {
+              id: 'stateid',
+              description: 'State',
+              values: [
+                { id: 'S2', name: 'State 2' },
+                { id: 'S3', name: 'State 3' },
+                { id: 'S4', name: 'State 4' },
+              ],
+              value_count: 10,
+              values_truncated: true,
+            },
+            {
+              id: 'sectorid',
+              description: 'State',
+              values: [],
+              value_count: 2,
+              values_truncated: false,
+            },
+          ],
+          values_offset: 2,
+          data_columns: [],
+          frequencies: [],
+          date_range: { start: '2001-01', end: '2024-11' },
+          default_frequency: 'monthly',
+          default_date_format: 'YYYY-MM',
+          notice,
+        }),
+      );
+      expect(result.content).toEqual([
+        {
+          type: 'text',
+          text: '## electricity/retail-sales\n\nRetail\n\n**Date range (default frequency monthly):** 2001-01 → 2024-11\n**Default frequency:** monthly (format: YYYY-MM)\n\n### Facets (filter dimensions)\n- **stateid** (3 of 10 values from offset 2): State — S2=State 2, S3=State 3, S4=State 4 (+5 more — eia_describe_route(route="electricity/retail-sales", facet="stateid", values_offset=5))\n- **sectorid** (0 of 2 values from offset 2): State',
+        },
+        { type: 'text', text: `\n\n> ${notice}` },
+      ]);
+    });
+
+    /**
+     * A plant facet shaped like `electricity/facility-fuel`'s `plantCode`: the
+     * two Palo Verde entries sit past the first 50-value window, so a match
+     * found here was read from the full cached list, not from a window.
+     */
+    function plantFacet() {
+      const filler = Array.from({ length: 120 }, (_, i) => ({
+        id: String(1000 + i),
+        name: `Plant ${i}`,
+      }));
+      return {
+        id: 'plantCode',
+        description: 'Plant',
+        values: [
+          ...filler.slice(0, 58),
+          { id: '6008', name: 'Palo Verde' },
+          ...filler.slice(58, 101),
+          { id: '57773', name: 'Palo Verde College' },
+          ...filler.slice(101),
+        ],
+      };
+    }
+
+    const textOf = (content: readonly unknown[]): string =>
+      content.map((block) => (block as { text?: string }).text ?? '').join('\n');
+
+    it('narrows a facet to the values containing the query, keeping value_count as the facet total', async () => {
+      const plants = plantFacet();
+      mockDescribe.mockResolvedValue({ ...META, facets: [plants] });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        facet: 'plantCode',
+        values_query: 'palo verde',
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        values_offset: 0,
+        values_query: 'palo verde',
+        facets: [
+          {
+            id: 'plantCode',
+            values: [
+              { id: '6008', name: 'Palo Verde' },
+              { id: '57773', name: 'Palo Verde College' },
+            ],
+            value_count: 122,
+            values_matched: 2,
+            values_truncated: false,
+          },
+        ],
+      });
+      const text = textOf(result.content);
+      expect(text).toContain('**Values query:** "palo verde"');
+      expect(text).toContain(
+        '- **plantCode** (2 of 2 matching values from offset 0; 122 values in all): Plant — 6008=Palo Verde, 57773=Palo Verde College',
+      );
+      expect(text).not.toContain('more —');
+      // The match reads the cached list; it neither asks the service for more
+      // nor filters what the cache holds.
+      expect(mockDescribe).toHaveBeenCalledTimes(1);
+      expect(mockDescribe.mock.calls[0]?.[2]).toEqual({ facet: 'plantCode' });
+      expect(plants.values).toHaveLength(122);
+    });
+
+    it('echoes the query as trimmed', async () => {
+      mockDescribe.mockResolvedValue({ ...META, facets: [plantFacet()] });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        values_query: '  Palo Verde College ',
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        values_query: 'Palo Verde College',
+        facets: [{ values: [{ id: '57773' }], values_matched: 1 }],
+      });
+      expect(textOf(result.content)).toContain('**Values query:** "Palo Verde College"');
+    });
+
+    it.each([
+      ['a name, ignoring case', 'PALO verde', ['6008', '57773']],
+      ['an id', '6008', ['6008']],
+      ['an alias the id and name do not contain', 'region:', ['MAT']],
+    ])('matches %s', async (_label, values_query, ids) => {
+      mockDescribe.mockResolvedValue({
+        ...META,
+        facets: [
+          {
+            ...plantFacet(),
+            values: [
+              ...plantFacet().values,
+              { id: 'MAT', name: 'Middle Atlantic', alias: 'Region: (MAT) Middle Atlantic' },
+            ],
+          },
+        ],
+      });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        values_query,
+      });
+
+      const [facet] = (result.structuredContent as { facets: Array<{ values: { id: string }[] }> })
+        .facets;
+      expect(facet?.values.map((v) => v.id)).toEqual(ids);
+      expect(result.structuredContent).toMatchObject({ facets: [{ values_matched: ids.length }] });
+    });
+
+    it('keeps every entry of an ID EIA lists under more than one historical name', async () => {
+      mockDescribe.mockResolvedValue({
+        ...META,
+        facets: [
+          {
+            id: 'plantCode',
+            description: 'Plant',
+            values: [
+              { id: '6008', name: 'Palo Verde' },
+              { id: '7', name: 'Gadsden' },
+              { id: '6008', name: 'Arizona Nuclear Power Project' },
+            ],
+          },
+        ],
+      });
+
+      const byId = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        values_query: '6008',
+      });
+      expect(byId.structuredContent).toMatchObject({
+        facets: [
+          {
+            values: [
+              { id: '6008', name: 'Palo Verde' },
+              { id: '6008', name: 'Arizona Nuclear Power Project' },
+            ],
+            value_count: 3,
+            values_matched: 2,
+          },
+        ],
+      });
+
+      // A former name finds the plant on its own.
+      const byFormerName = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        values_query: 'arizona nuclear',
+      });
+      expect(byFormerName.structuredContent).toMatchObject({
+        facets: [{ values: [{ id: '6008', name: 'Arizona Nuclear Power Project' }] }],
+      });
+    });
+
+    it('indexes values_offset into the matches', async () => {
+      mockDescribe.mockResolvedValue({ ...META, facets: [plantFacet()] });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        facet: 'plantCode',
+        values_query: 'palo verde',
+        values_offset: 1,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        values_offset: 1,
+        facets: [
+          {
+            values: [{ id: '57773', name: 'Palo Verde College' }],
+            value_count: 122,
+            values_matched: 2,
+            values_truncated: false,
+          },
+        ],
+      });
+      expect(textOf(result.content)).toContain(
+        '(1 of 2 matching values from offset 1; 122 values in all)',
+      );
+    });
+
+    it('pages more matches than the cap, carrying values_query into each next-call hint', async () => {
+      vi.stubEnv('EIA_FACET_VALUE_CAP', '3');
+      _resetServerConfig();
+      mockDescribe.mockResolvedValue({ ...META, facets: [wideFacetNamed('plantCode', 120)] });
+
+      const page = async (values_offset: number) =>
+        runToolContract(describeRouteTool, {
+          route: 'electricity/facility-fuel',
+          facet: 'plantCode',
+          values_query: 'plant 1',
+          values_offset,
+        });
+
+      const ids = (r: Awaited<ReturnType<typeof page>>) =>
+        (
+          r.structuredContent as { facets: Array<{ values: { id: string }[] }> }
+        ).facets[0]?.values.map((v) => v.id);
+
+      // "Plant 1", "Plant 10"–"Plant 19", "Plant 100"–"Plant 119": 31 matches.
+      const first = await page(0);
+      expect(ids(first)).toEqual(['P1', 'P10', 'P11']);
+      expect(first.structuredContent).toMatchObject({
+        facets: [{ value_count: 120, values_matched: 31, values_truncated: true }],
+      });
+      expect(textOf(first.content)).toContain(
+        '(+28 more — eia_describe_route(route="electricity/retail-sales", facet="plantCode", values_query="plant 1", values_offset=3))',
+      );
+
+      const second = await page(3);
+      expect(ids(second)).toEqual(['P12', 'P13', 'P14']);
+      expect(textOf(second.content)).toContain('values_query="plant 1", values_offset=6))');
+
+      const last = await page(30);
+      expect(ids(last)).toEqual(['P119']);
+      expect(last.structuredContent).toMatchObject({
+        facets: [{ values_matched: 31, values_truncated: false }],
+      });
+      expect(textOf(last.content)).toContain(
+        '(1 of 31 matching values from offset 30; 120 values in all)',
+      );
+      expect(textOf(last.content)).not.toContain('more —');
+    });
+
+    it('empties the window past the last match and names values_matched in the notice', async () => {
+      mockDescribe.mockResolvedValue({ ...META, facets: [plantFacet()] });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        facet: 'plantCode',
+        values_query: 'palo verde',
+        values_offset: 5,
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        facets: [{ values: [], value_count: 122, values_matched: 2, values_truncated: false }],
+      });
+      const overshoot =
+        'values_offset 5 is past the last value matching values_query "palo verde" of plantCode (values_matched 2, last valid offset 1).';
+      expect((result.structuredContent as { notice: string }).notice).toContain(overshoot);
+      expect(textOf(result.content)).toContain(overshoot);
+      expect(textOf(result.content)).toContain(
+        '(0 of 2 matching values from offset 5; 122 values in all)',
+      );
+    });
+
+    it('answers zero matches with a successful empty window and a notice naming the query', async () => {
+      mockDescribe.mockResolvedValue({ ...META, facets: [plantFacet()] });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        facet: 'plantCode',
+        values_query: 'no such plant',
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        values_query: 'no such plant',
+        facets: [{ values: [], value_count: 122, values_matched: 0, values_truncated: false }],
+      });
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain(
+        'No value of plantCode has an id, name, or alias containing values_query "no such plant"',
+      );
+      // A miss is not an overshoot: there is no offset that would bring values back.
+      expect(notice).not.toContain('past the last');
+      const text = textOf(result.content);
+      expect(text).toContain('values_query "no such plant"');
+      expect(text).toContain(
+        '- **plantCode** (0 of 0 matching values from offset 0; 122 values in all): Plant',
+      );
+    });
+
+    it('without facet, narrows every facet and counts each one’s matches', async () => {
+      mockDescribe.mockResolvedValue({
+        ...META,
+        facets: [
+          plantFacet(),
+          {
+            id: 'state',
+            description: 'State',
+            values: [
+              { id: 'AZ', name: 'Arizona' },
+              { id: 'CA', name: 'California' },
+            ],
+          },
+          {
+            id: 'fuel2002',
+            description: 'Fuel',
+            values: [{ id: 'WND', name: 'Wind' }],
+          },
+        ],
+      });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        values_query: 'ar',
+      });
+
+      const facets = (
+        result.structuredContent as {
+          facets: Array<{ id: string; values: { id: string }[]; values_matched?: number }>;
+        }
+      ).facets;
+      expect(facets.map((f) => [f.id, f.values_matched, f.values.map((v) => v.id)])).toEqual([
+        ['plantCode', 0, []],
+        ['state', 1, ['AZ']],
+        ['fuel2002', 0, []],
+      ]);
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain('No value of plantCode, fuel2002 has');
+      const text = textOf(result.content);
+      expect(text).toContain('- **state** (1 of 1 matching values from offset 0; 2 values in all)');
+      expect(text).toContain(
+        '- **fuel2002** (0 of 0 matching values from offset 0; 1 values in all)',
+      );
+    });
+
+    it('quotes a query holding a double quote so the next call copies intact', async () => {
+      vi.stubEnv('EIA_FACET_VALUE_CAP', '1');
+      _resetServerConfig();
+      mockDescribe.mockResolvedValue({
+        ...META,
+        facets: [
+          {
+            id: 'plantCode',
+            description: 'Plant',
+            values: [
+              { id: '1', name: 'The "Big" One' },
+              { id: '2', name: 'The "Big" Two' },
+            ],
+          },
+        ],
+      });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        values_query: '"big"',
+      });
+
+      expect(result.structuredContent).toMatchObject({ values_query: '"big"' });
+      expect(textOf(result.content)).toContain('values_query="\\"big\\"", values_offset=1))');
+    });
+
+    it('adds values_query and values_matched as optional output fields only', () => {
+      const schema = z.toJSONSchema(describeRouteTool.output, { io: 'output' });
+      expect(schema.properties).toHaveProperty('values_query');
+      expect(schema.properties).toHaveProperty('facets.items.properties.values_matched');
+      expect(schema.required).not.toContain('values_query');
+      expect(schema).toMatchObject({
+        properties: {
+          facets: {
+            items: {
+              required: expect.not.arrayContaining(['values_matched']),
+            },
+          },
+        },
+      });
+      // Every field a pre-existing reader depends on is still required.
+      expect(schema).toMatchObject({
+        required: expect.arrayContaining(['route', 'facets', 'values_offset']),
+        properties: {
+          facets: {
+            items: {
+              required: expect.arrayContaining([
+                'id',
+                'description',
+                'values',
+                'value_count',
+                'values_truncated',
+              ]),
+            },
+          },
+        },
+      });
+    });
+  });
 });
+
+/** A facet whose value at index `i` is `P{i}` named `Plant {i}`, for substring paging. */
+function wideFacetNamed(id: string, count: number) {
+  return {
+    id,
+    description: 'Plant',
+    values: Array.from({ length: count }, (_, i) => ({ id: `P${i}`, name: `Plant ${i}` })),
+  };
+}

@@ -15,6 +15,11 @@
  * against, since an empty window is otherwise shaped like an exhausted one.
  * Within that window, `format()` prints a value's alias only when it says
  * something the `id=name` pair does not; the `alias` output field is untouched.
+ *
+ * `values_query` narrows each facet to the values whose `id`, `name`, or
+ * `alias` contains it, read from the same cached list, before the window is
+ * cut — so a plant or entity ID among tens of thousands of values is one call
+ * away instead of hundreds of pages. The offset then indexes the matches.
  * @module mcp-server/tools/definitions/describe-route.tool
  */
 
@@ -56,10 +61,21 @@ const restatesPair = (alias: string, id: string, name: string): boolean => {
  */
 const showBlank = (s: string): string => (s.trim() === '' ? `"${s}"` : s);
 
+/**
+ * True when a facet value's `id`, `name`, or `alias` contains `needle`, which
+ * the caller has already lower-cased. A plain substring test rather than a
+ * pattern: the query is caller text matched against EIA labels, and nothing
+ * in it should read as syntax.
+ */
+const matchesQuery = (v: { id: string; name: string; alias?: string }, needle: string): boolean =>
+  v.id.toLowerCase().includes(needle) ||
+  v.name.toLowerCase().includes(needle) ||
+  v.alias?.toLowerCase().includes(needle) === true;
+
 export const describeRouteTool = tool('eia_describe_route', {
   title: 'Describe EIA Route',
   description:
-    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints, merged, and cached per route; a facet whose values EIA did not return is left out of facets, named in unavailable_facets, and fetched again by the next call.',
+    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. To find a value by name in a large facet (plant, entity, and mine IDs run to thousands), pass values_query: each facet keeps only the values whose id, name, or alias contains it, values_matched counts them, and values_offset pages the matches. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints, merged, and cached per route; a facet whose values EIA did not return is left out of facets, named in unavailable_facets, and fetched again by the next call.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   inputAliases: { path: 'route' },
 
@@ -75,7 +91,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .min(1)
       .optional()
       .describe(
-        'Restrict the response to one facet by ID (e.g. "stateid"). Use with values_offset to page a facet whose values were truncated. Omit to get every facet.',
+        'Restrict the response to one facet by ID (e.g. "stateid"). Use with values_offset to page a facet whose values were truncated, or with values_query to find a value in it. Omit to get every facet.',
       ),
     values_offset: z
       .number()
@@ -83,7 +99,15 @@ export const describeRouteTool = tool('eia_describe_route', {
       .min(0)
       .default(0)
       .describe(
-        'Index of the first facet value to return, applied to every facet in the response. Use the value named in a truncation hint to continue past the cap.',
+        'Index of the first facet value to return, applied to every facet in the response. Use the value named in a truncation hint to continue past the cap. With values_query, indexes the matching values.',
+      ),
+    values_query: z
+      .string()
+      .trim()
+      .min(1, 'values_query must contain at least one non-whitespace character')
+      .optional()
+      .describe(
+        'Keep only the facet values whose id, name, or alias contains this text, ignoring case (e.g. "palo verde" on plantCode). A plain substring match, not a pattern or a ranked search. Applied to every facet in the response, before values_offset and the cap. Leading and trailing whitespace is ignored. Omit to list every value.',
       ),
   }),
 
@@ -115,17 +139,23 @@ export const describeRouteTool = tool('eia_describe_route', {
                   .describe('A valid facet value.'),
               )
               .describe(
-                'Valid values for this facet dimension, starting at values_offset and capped at EIA_FACET_VALUE_CAP.',
+                'Valid values for this facet dimension, starting at values_offset and capped at EIA_FACET_VALUE_CAP. With values_query, only the matching values, in upstream order.',
               ),
             value_count: z
               .number()
               .describe(
-                'Total values this facet has upstream, independent of the returned window.',
+                'Total values this facet has upstream, independent of the returned window and of values_query.',
+              ),
+            values_matched: z
+              .number()
+              .optional()
+              .describe(
+                'Values of this facet whose id, name, or alias contains values_query — what values_offset indexes and values_truncated is measured against. One ID listed under two historical names counts twice. Present only when values_query is set.',
               ),
             values_truncated: z
               .boolean()
               .describe(
-                'True when values stops short of value_count. Call eia_describe_route again with this facet ID and values_offset set to values_offset + values.length for the next page.',
+                'True when values stops short of values_matched when values_query is set, otherwise of value_count. Call eia_describe_route again with this facet ID, the same values_query, and values_offset set to values_offset + values.length for the next page.',
               ),
           })
           .describe('A filterable dimension for this route.'),
@@ -142,6 +172,12 @@ export const describeRouteTool = tool('eia_describe_route', {
     values_offset: z
       .number()
       .describe('Index of the first facet value returned, echoing the requested offset.'),
+    values_query: z
+      .string()
+      .optional()
+      .describe(
+        'The values_query each facet was narrowed by, as matched after trimming. Absent when no values_query was sent.',
+      ),
     data_columns: z
       .array(
         z
@@ -192,7 +228,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .optional()
       .describe(
-        'Default-frequency date-range context, composed with guidance for exhausted facet windows or unavailable facet values.',
+        'Default-frequency date-range context, composed with guidance for exhausted facet windows, a values_query no value matched, or unavailable facet values.',
       ),
   },
 
@@ -212,6 +248,15 @@ export const describeRouteTool = tool('eia_describe_route', {
       retryable: true,
       when: 'EIA answered with a retryable HTTP service failure.',
       recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
+    },
+    {
+      reason: 'upstream_timeout',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      when: 'EIA did not answer the route metadata request or the route-tree build in time: one attempt passed 45 s, or the call passed its 56 s deadline across retries. A value list that times out is named in unavailable_facets instead.',
+      recovery:
+        'Retry after a short wait — EIA is answering slowly; if it keeps timing out, check api.eia.gov availability.',
     },
     {
       reason: 'route_not_found',
@@ -268,6 +313,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       route: input.route,
       facet: input.facet,
       valuesOffset: input.values_offset,
+      valuesQuery: input.values_query,
     });
     const service = getEiaApiService();
     // Naming the facet lets the service fail the call when that one list is
@@ -294,9 +340,15 @@ export const describeRouteTool = tool('eia_describe_route', {
 
     const cap = getServerConfig().facetValueCap;
     const offset = input.values_offset;
+    const query = input.values_query;
+    const needle = query?.toLowerCase();
 
     const windows = facets.map((f) => {
-      const window = f.values.slice(offset, offset + cap);
+      // The match runs over the full cached list, never over a window, so
+      // values_matched is exact and the offset pages the matches themselves.
+      const pool =
+        needle === undefined ? f.values : f.values.filter((v) => matchesQuery(v, needle));
+      const window = pool.slice(offset, offset + cap);
       return {
         id: f.id,
         description: f.description,
@@ -306,7 +358,8 @@ export const describeRouteTool = tool('eia_describe_route', {
           ...(v.alias !== undefined && { alias: v.alias }),
         })),
         value_count: f.values.length,
-        values_truncated: offset + window.length < f.values.length,
+        ...(needle !== undefined && { values_matched: pool.length }),
+        values_truncated: offset + window.length < pool.length,
       };
     });
 
@@ -316,20 +369,40 @@ export const describeRouteTool = tool('eia_describe_route', {
      * applies to every facet, so one large enough to page a wide facet empties
      * every narrower one beside it. Name those facets and their counts so the
      * two cases read apart and the caller has an offset to come back with.
+     * With values_query the offset indexes the matches, so the count named is
+     * values_matched; a facet nothing matched is reported once, as a miss.
      */
     const notices: string[] = [
       `date_range reports route metadata for the default frequency (${meta.defaultFrequency || 'unspecified'}); another frequency may extend outside this range.`,
     ];
-    const overshot = windows.filter((f) => f.values.length === 0 && f.value_count > 0);
+    const pageable = (f: (typeof windows)[number]) => f.values_matched ?? f.value_count;
+    const overshot = windows.filter((f) => f.values.length === 0 && pageable(f) > 0);
     if (overshot.length > 0) {
       const named = overshot
-        .map(
-          (f) =>
-            `${f.id} (${f.value_count.toLocaleString()} values, last valid offset ${(f.value_count - 1).toLocaleString()})`,
-        )
+        .map((f) => {
+          const count = pageable(f);
+          const counted =
+            f.values_matched === undefined
+              ? `${count.toLocaleString()} values`
+              : `values_matched ${count.toLocaleString()}`;
+          return `${f.id} (${counted}, last valid offset ${(count - 1).toLocaleString()})`;
+        })
         .join(', ');
+      const past =
+        query === undefined ? 'value' : `value matching values_query ${JSON.stringify(query)}`;
       notices.push(
-        `values_offset ${offset.toLocaleString()} is past the last value of ${named}. Reduce values_offset to at most that facet's last valid offset, or pass facet to page one facet at a time so a shared offset stops emptying the narrower ones.`,
+        `values_offset ${offset.toLocaleString()} is past the last ${past} of ${named}. Reduce values_offset to at most that facet's last valid offset, or pass facet to page one facet at a time so a shared offset stops emptying the narrower ones.`,
+      );
+    }
+    /**
+     * Zero matches is a successful empty window, not an error: the route and
+     * facet exist and the query is well-formed. Without a notice it would read
+     * like a facet with no values at all.
+     */
+    const missed = windows.filter((f) => f.values_matched === 0);
+    if (missed.length > 0) {
+      notices.push(
+        `No value of ${missed.map((f) => f.id).join(', ')} has an id, name, or alias containing values_query ${JSON.stringify(query)} (case-insensitive). Try a shorter or differently spelled substring, or omit values_query to page every value.`,
       );
     }
     /**
@@ -349,6 +422,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       route: meta.route,
       description: meta.description,
       values_offset: offset,
+      ...(query !== undefined && { values_query: query }),
       facets: windows,
       ...(unavailableFacets.length > 0 && { unavailable_facets: unavailableFacets }),
       data_columns: meta.dataColumns.map((c) => ({
@@ -401,23 +475,38 @@ export const describeRouteTool = tool('eia_describe_route', {
       lines.push('');
     }
 
+    // Quoted as a JSON string so the query reads back exactly as matched, and
+    // copies into the next call intact even when it holds a quote.
+    const query =
+      result.values_query === undefined ? undefined : JSON.stringify(result.values_query);
+    if (query !== undefined) {
+      lines.push(
+        `**Values query:** ${query} — each facet lists only the values whose id, name, or alias contains it, ignoring case.\n`,
+      );
+    }
+
     if (result.facets.length) {
       lines.push('### Facets (filter dimensions)');
       for (const facet of result.facets) {
         // Both surfaces render the same window, so the next call named here is
-        // the one the structured fields describe.
+        // the one the structured fields describe. With a query, the window and
+        // the offset run over the matches, not the whole facet.
+        const pageable = facet.values_matched ?? facet.value_count;
         const nextOffset = result.values_offset + facet.values.length;
         const more = facet.values_truncated
-          ? ` (+${facet.value_count - nextOffset} more — eia_describe_route(route="${result.route}", facet="${facet.id}", values_offset=${nextOffset}))`
+          ? ` (+${pageable - nextOffset} more — eia_describe_route(route="${result.route}", facet="${facet.id}"${query === undefined ? '' : `, values_query=${query}`}, values_offset=${nextOffset}))`
           : '';
         // A window is anything short of the whole set — capped at the end, or
         // started past the beginning. The last page of a paged facet is not
         // truncated but is still a window, and reporting it as the full count
-        // would contradict the values printed beside it.
+        // would contradict the values printed beside it. A narrowed facet is
+        // always a window on the whole, so it always names both counts.
         const scope =
-          facet.values_truncated || result.values_offset > 0
-            ? `${facet.values.length} of ${facet.value_count} values from offset ${result.values_offset}`
-            : `${facet.value_count} values`;
+          facet.values_matched !== undefined
+            ? `${facet.values.length} of ${facet.values_matched} matching values from offset ${result.values_offset}; ${facet.value_count} values in all`
+            : facet.values_truncated || result.values_offset > 0
+              ? `${facet.values.length} of ${facet.value_count} values from offset ${result.values_offset}`
+              : `${facet.value_count} values`;
         // An emptied window has nothing to trail the em dash with. An alias
         // that only restates the pair is dropped from the line and kept on the
         // output field, where a reader can still read it directly.

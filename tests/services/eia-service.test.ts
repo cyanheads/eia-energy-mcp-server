@@ -16,7 +16,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
 import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
 import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
-import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
+import {
+  searchRoutesTool,
+  WEAK_MATCH_SCORE,
+} from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import {
   _resetEiaApiService,
   getEiaApiService,
@@ -67,6 +70,44 @@ function httpResponse(fixture: PageFixture) {
     typeof fixture.body === 'string' ? fixture.body : JSON.stringify(fixture.body),
     { status },
   );
+}
+
+/**
+ * Assert a tool result is the caller's own cancellation. Once the caller's
+ * signal fires the framework relabels whatever the handler throws as
+ * `RequestCancelled`, so the message — the caller's abort reason, carried
+ * through — is what shows the service rethrew the abort instead of reporting
+ * it as EIA failing or running out of time.
+ */
+function expectCancelledBy(result: Awaited<ReturnType<typeof runToolContract>>, reason: Error) {
+  expect(result.isError).toBe(true);
+  expect(result.structuredContent).toMatchObject({
+    error: { code: JsonRpcErrorCode.RequestCancelled, message: reason.message },
+  });
+  expect(JSON.stringify(result)).not.toMatch(
+    /upstream_|did not answer|could not reach|returned HTTP/i,
+  );
+}
+
+/**
+ * Fire `abort` and return what `call` settled to, failing if it had not settled
+ * before the fake clock moved: the abort itself must end the call, not a
+ * timeout or backoff behind it.
+ */
+async function settleOnAbort<T>(call: Promise<T>, abort: () => void): Promise<T> {
+  let settled = false;
+  call.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  abort();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(settled, 'settled on the abort, before the clock moved').toBe(true);
+  return call;
 }
 
 /**
@@ -749,6 +790,311 @@ describe('EiaApiService.query', () => {
           reason: 'invalid_period',
           recovery: { hint: expect.stringContaining('frequencies[].format') },
         },
+      });
+    });
+
+    /**
+     * #89 — at local-hourly EIA answers a bound without its UTC offset with
+     * HTTP 500, never rows; it is refused before the request rather than
+     * retried as an outage.
+     */
+    describe('local-hourly bounds without a UTC offset (#89)', () => {
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it.each<['start' | 'end', { start?: string; end?: string }]>([
+        ['start', { start: '2024-02-01T02', end: '2024-02-01T07-06' }],
+        ['end', { start: '2024-02-01T02-06', end: '2024-02-01' }],
+        ['start', { start: '2024-02' }],
+        ['end', { end: '2024' }],
+      ])('fails %s as invalid_period with no request or timer', async (side, bounds) => {
+        vi.useFakeTimers();
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+        const value = bounds[side];
+
+        await expect(
+          getEiaApiService().query(
+            LEAF,
+            { columns: ['price'], frequency: 'local-hourly', ...bounds },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining(`${side} ${JSON.stringify(value)} has no UTC offset`),
+          data: {
+            reason: 'invalid_period',
+            recovery: { hint: expect.stringContaining('"2024-02-01T02-06" is 02:00 at UTC−6') },
+          },
+        });
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it('sends offset-bearing bounds to EIA unchanged', async () => {
+        const urls: URL[] = [];
+        const { fetchMock } = stubDataEndpoint({ total: 1, onCall: () => undefined });
+        fetchMock.mockImplementation(async (input: string | URL) => {
+          urls.push(new URL(String(input)));
+          return httpResponse({
+            body: { response: { total: '1', frequency: 'local-hourly', data: [row(0)] } },
+          });
+        });
+
+        const result = await getEiaApiService().query(
+          LEAF,
+          {
+            columns: ['price'],
+            frequency: 'local-hourly',
+            start: '2024-02-01T14+06',
+            end: '2024-02-01T07-06',
+          },
+          createMockContext(),
+        );
+        expect(result.total).toBe(1);
+        expect(urls).toHaveLength(1);
+        expect(urls[0]?.searchParams.get('start')).toBe('2024-02-01T14+06');
+        expect(urls[0]?.searchParams.get('end')).toBe('2024-02-01T07-06');
+        expect(urls[0]?.search).toContain('start=2024-02-01T14%2B06');
+      });
+
+      it.each(['hourly', 'daily', undefined])(
+        'leaves the same bounds alone at frequency %s',
+        async (frequency) => {
+          const { calls } = stubDataEndpoint({ total: 1 });
+          await getEiaApiService().query(
+            LEAF,
+            {
+              columns: ['price'],
+              start: '2024-02-01T02',
+              end: '2024-02-01',
+              ...(frequency && { frequency }),
+            },
+            createMockContext(),
+          );
+          expect(calls).toHaveLength(1);
+        },
+      );
+
+      it("refuses an omitted frequency when the warmed node's default is local-hourly", async () => {
+        const route = 'electricity/rto/local-region';
+        initRouteCache(
+          [
+            {
+              id: 'electricity',
+              name: 'Electricity',
+              routes: [
+                {
+                  id: 'rto',
+                  name: 'RTO',
+                  routes: [
+                    {
+                      id: 'local-region',
+                      name: 'Local region',
+                      defaultFrequency: 'local-hourly',
+                      frequency: [
+                        {
+                          id: 'local-hourly',
+                          description: 'Hourly (Local Time Zone)',
+                          query: 'LH',
+                          format: 'YYYY-MM-DD"T"HH24TZH',
+                        },
+                      ],
+                      facets: [],
+                      data: { value: { alias: 'Value', units: 'MWh' } },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          [],
+        );
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+
+        await expect(
+          getEiaApiService().query(route, { start: '2024-02-01T02' }, createMockContext()),
+        ).rejects.toMatchObject({ data: { reason: 'invalid_period' } });
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('fails through eia_query_route with the offset form on both surfaces', async () => {
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+        const result = await runToolContract(queryRouteTool, {
+          route: LEAF,
+          columns: ['price'],
+          frequency: 'local-hourly',
+          start: '2024-02-01T02',
+          end: '2024-02-01T07',
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'invalid_period',
+              recovery: { hint: expect.stringContaining('UTC−6') },
+            },
+          },
+        });
+        const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+        expect(text).toContain('"2024-02-01T02-06" is 02:00 at UTC−6');
+        expect(text).toContain('start "2024-02-01T02" has no UTC offset');
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('bounds naming a month, day, or hour that does not exist (#93)', () => {
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      // The four bounds EIA answered with HTTP 500, plus the end side of two of them.
+      it.each<[string, 'start' | 'end', { start?: string; end?: string }, string]>([
+        ['hourly', 'start', { start: '2024-02-01T24', end: '2024-02-02T02' }, 'hour 24'],
+        ['hourly', 'start', { start: '2024-02-01T25', end: '2024-02-02T02' }, 'hour 25'],
+        ['local-hourly', 'start', { start: '2024-02-01T24-06' }, 'hour 24'],
+        ['daily', 'start', { start: '2024-02-30' }, 'day 30, but 2024-02 has 29 days'],
+        ['hourly', 'end', { start: '2024-02-01T20', end: '2024-02-01T24' }, 'hour 24'],
+        ['daily', 'end', { start: '2024-02-25', end: '2024-02-30' }, 'day 30'],
+        ['weekly', 'start', { start: '2023-02-29' }, 'day 29, but 2023-02 has 28 days'],
+      ])(
+        'fails %s %s as invalid_period with no request or timer',
+        async (frequency, side, bounds, problem) => {
+          vi.useFakeTimers();
+          const { fetchMock } = stubDataEndpoint({ total: 1 });
+
+          await expect(
+            getEiaApiService().query(
+              LEAF,
+              { columns: ['price'], frequency, ...bounds },
+              createMockContext(),
+            ),
+          ).rejects.toMatchObject({
+            code: JsonRpcErrorCode.ValidationError,
+            message: expect.stringContaining(
+              `At ${frequency} frequency EIA cannot read ${side} ${JSON.stringify(bounds[side])}: it has ${problem}`,
+            ),
+            data: {
+              reason: 'invalid_period',
+              recovery: { hint: expect.stringContaining('February 29 only in leap years') },
+            },
+          });
+          expect(fetchMock).not.toHaveBeenCalled();
+          expect(vi.getTimerCount()).toBe(0);
+        },
+      );
+
+      it.each([
+        ['daily', '2024-02-29', '2024-03-05'],
+        ['hourly', '2024-02-01T23', '2024-02-02T02'],
+        ['local-hourly', '2024-02-01T05-99', '2024-02-02T02-06'],
+        // Shapes EIA reads leniently at these frequencies, answering with rows.
+        ['monthly', '2024-13', '2025-06'],
+        ['hourly', '2024-02-30', '2024-03-02T02'],
+        ['daily', '2024-02-01T24', '2024-03-05'],
+      ])('sends a %s start of %s to EIA unchanged', async (frequency, start, end) => {
+        const urls: URL[] = [];
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+        const answer = fetchMock.getMockImplementation()!;
+        fetchMock.mockImplementation(async (input: string | URL) => {
+          urls.push(new URL(String(input)));
+          return answer(input);
+        });
+
+        await getEiaApiService().query(
+          LEAF,
+          { columns: ['price'], frequency, start, end },
+          createMockContext(),
+        );
+        expect(urls).toHaveLength(1);
+        expect(urls[0]?.searchParams.get('start')).toBe(start);
+        expect(urls[0]?.searchParams.get('end')).toBe(end);
+      });
+
+      it('still classifies a real EIA 500 on a valid bound as upstream_unavailable', async () => {
+        vi.useFakeTimers();
+        const fetchMock = vi.fn(async () =>
+          httpResponse({ status: 500, body: '"Something unexpected happened."' }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const call = getEiaApiService()
+          .query(
+            LEAF,
+            { columns: ['price'], frequency: 'daily', start: '2024-02-29' },
+            createMockContext(),
+          )
+          .catch((error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        expect(await call).toMatchObject({
+          data: { reason: 'upstream_unavailable', retryable: true },
+        });
+        expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+      });
+
+      it("refuses an omitted frequency against the warmed node's daily default", async () => {
+        const route = 'electricity/rto/daily-region';
+        initRouteCache(
+          [
+            {
+              id: 'electricity',
+              name: 'Electricity',
+              routes: [
+                {
+                  id: 'rto',
+                  name: 'RTO',
+                  routes: [
+                    {
+                      id: 'daily-region',
+                      name: 'Daily region',
+                      defaultFrequency: 'daily',
+                      frequency: [
+                        { id: 'daily', description: 'Daily', query: 'D', format: 'YYYY-MM-DD' },
+                      ],
+                      facets: [],
+                      data: { value: { alias: 'Value', units: 'MWh' } },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          [],
+        );
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+
+        await expect(
+          getEiaApiService().query(route, { end: '2024-04-31' }, createMockContext()),
+        ).rejects.toMatchObject({ data: { reason: 'invalid_period' } });
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('fails through eia_query_route naming the bound and the valid range on both surfaces', async () => {
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+        const result = await runToolContract(queryRouteTool, {
+          route: LEAF,
+          frequency: 'hourly',
+          start: '2024-02-01T24',
+          end: '2024-02-02T02',
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'invalid_period',
+              recovery: { hint: expect.stringContaining('00–23') },
+            },
+          },
+        });
+        const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+        expect(text).toContain(
+          'At hourly frequency EIA cannot read start "2024-02-01T24": it has hour 24, but the hour is two digits, 00–23.',
+        );
+        expect(text).toContain('February 29 only in leap years');
+        expect(fetchMock).not.toHaveBeenCalled();
       });
     });
 
@@ -2435,13 +2781,58 @@ describe('EiaApiService — a route the warm could not fetch', () => {
   });
 
   it('fails the browse when the re-fetch fails too, rather than answering from the stub', async () => {
+    const bodies = fixture();
+    stubApiPaths(bodies);
+    const ctx = createMockContext();
+    await getEiaApiService().search('coal', 5, ctx);
+
+    // The re-fetch is answered, but not with route metadata.
+    bodies.coal = { notRouteMetadata: true };
+    await expect(getEiaApiService().browse('coal', ctx)).rejects.toThrow(
+      /did not return metadata for route "coal"/,
+    );
+    expect(getNode('coal')?.incomplete).toBe(true);
+  });
+
+  it('fails the browse as route_not_found when EIA no longer has the route', async () => {
     stubApiPaths(fixture());
     const ctx = createMockContext();
     await getEiaApiService().search('coal', 5, ctx);
 
-    await expect(getEiaApiService().browse('coal', ctx)).rejects.toThrow(
-      /did not return metadata for route "coal"/,
-    );
+    // `coal` still answers 404, as it did during the warm.
+    await expect(getEiaApiService().browse('coal', ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'route_not_found' },
+    });
+  });
+
+  it('repairs the node and resolves its children, keeping a failed child incomplete', async () => {
+    const bodies = fixture();
+    const { paths } = stubApiPaths(bodies);
+    const ctx = createMockContext();
+    await getEiaApiService().search('coal', 5, ctx);
+
+    // The repaired node lists one child already classified and one bare stub
+    // that still fails — the warm's own rule applies to it.
+    bodies.coal = {
+      response: {
+        id: 'coal',
+        name: 'Coal',
+        routes: [
+          { id: 'mine-production', name: 'Mine Production', facets: [], frequency: [], data: {} },
+          { id: 'exports', name: 'Exports' },
+        ],
+      },
+    };
+    const result = await getEiaApiService().browse('coal', ctx);
+
+    expect(result.children.map((c) => [c.route, c.isLeaf])).toEqual([
+      ['coal/mine-production', true],
+      ['coal/exports', false],
+    ]);
+    expect(paths.filter((p) => p === 'coal/exports')).toHaveLength(1);
+    expect(getNode('coal/exports')?.incomplete).toBe(true);
+    expect(getNode('coal')?.incomplete).toBeUndefined();
   });
 
   it('leaves an incomplete node to the live fetch instead of rejecting it as a category', async () => {
@@ -2658,6 +3049,432 @@ describe('EiaApiService — the search wait is bounded', () => {
 });
 
 // ------------------------------------------------------------------
+// #90 — every EIA request is bounded: each attempt by a timeout, and every
+// attempt, backoff, and chained request of a call by one deadline that
+// settles inside the MCP SDK's 60 s client request timeout.
+// ------------------------------------------------------------------
+
+/**
+ * A fetch that accepts the request and never finishes it — before headers, or
+ * after headers with the body left open. Either way it ends only when the
+ * signal it was handed aborts, as real `fetch` does. `answerFrom` lets calls
+ * from that 1-based number onward answer with `body` instead.
+ */
+function stallingFetch(stall: 'headers' | 'body', answerFrom?: { call: number; body: unknown }) {
+  const signals: AbortSignal[] = [];
+  const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+    const signal = init?.signal as AbortSignal;
+    signals.push(signal);
+    if (answerFrom && signals.length >= answerFrom.call)
+      return httpResponse({ body: answerFrom.body });
+    if (stall === 'headers') {
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"response":{"total":"1","data":['));
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+      { status: 200 },
+    );
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { fetchMock, signals };
+}
+
+describe('EiaApiService — requests are bounded in time (#90)', () => {
+  const ONE_ROW = { response: { total: '1', frequency: 'monthly', data: [row(0)] } };
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+    seedRouteCache();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  /** Run `call` to settlement under the fake clock; resolves with its outcome and elapsed ms. */
+  async function settle<T>(call: Promise<T>) {
+    const startedAt = Date.now();
+    let settledAt: number | undefined;
+    const outcome = call.then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    void outcome.then(() => {
+      settledAt = Date.now();
+    });
+    for (let i = 0; i < 70 && settledAt === undefined; i++)
+      await vi.advanceTimersByTimeAsync(1_000);
+    return { ...(await outcome), elapsedMs: (settledAt ?? Number.NaN) - startedAt };
+  }
+
+  it.each(['headers', 'body'] as const)(
+    'fails a query stalled at %s as retryable upstream_timeout inside the 60 s client timeout',
+    async (stall) => {
+      const { fetchMock } = stallingFetch(stall);
+      const contract = queryRouteTool.errors!.find((entry) => entry.reason === 'upstream_timeout')!;
+
+      const result = await settle(
+        runToolContract(queryRouteTool, { route: LEAF, columns: ['price'] }),
+      );
+
+      expect(result.ok).toBe(true);
+      const response = result.ok ? result.value : undefined;
+      expect(response?.isError).toBe(true);
+      expect(response?.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.Timeout,
+          message: expect.stringContaining('EIA did not answer in time'),
+          data: {
+            reason: 'upstream_timeout',
+            retryable: true,
+            recovery: { hint: contract.recovery },
+          },
+        },
+      });
+      // A 45 s attempt, a backoff, then a second attempt cut by the 56 s deadline.
+      expect(result.elapsedMs).toBeLessThanOrEqual(56_000);
+      expect(result.elapsedMs).toBeGreaterThanOrEqual(55_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it('names the call deadline, not the leftover budget, when a late request runs out', async () => {
+    // The route metadata answers after 25 s; the data page that follows stalls.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const signal = init?.signal as AbortSignal;
+        if (new URL(String(input)).pathname.endsWith('/data/')) {
+          return new Promise<Response>((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25_000));
+        return httpResponse({
+          body: { response: { id: 'other', frequency: [], facets: [], data: { price: {} } } },
+        });
+      }),
+    );
+
+    const result = await settle(
+      getEiaApiService().query('electricity/other', {}, createMockContext()),
+    );
+
+    expect(result.ok).toBe(false);
+    const message = result.ok ? '' : (result.error as Error).message;
+    expect(message).toContain('the 56 s deadline ran out during this request');
+    // 31 s of the deadline was left when the data request started.
+    expect(message).not.toMatch(/\b31 s\b/);
+    expect(result).toMatchObject({ error: { data: { reason: 'upstream_timeout' } } });
+  });
+
+  it('retries a timed-out attempt within the deadline', async () => {
+    const { fetchMock } = stallingFetch('headers', { call: 2, body: ONE_ROW });
+
+    const result = await settle(
+      getEiaApiService().query(LEAF, { columns: ['price'] }, createMockContext()),
+    );
+
+    expect(result.ok && result.value.total).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The first attempt was cut at 45 s, the second answered after its backoff.
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(45_000);
+    expect(result.elapsedMs).toBeLessThan(47_000);
+  });
+
+  /**
+   * A data endpoint whose pages each answer after `pageMs` (`pageMs(offset)`
+   * when a function), honouring the attempt's signal, over a matching set of
+   * `total` rows. Records the offset of every request.
+   */
+  function timedPages(pageMs: number | ((offset: number) => number), total: number) {
+    const offsets: number[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const params = new URL(String(input)).searchParams;
+        const offset = Number(params.get('offset'));
+        const length = Number(params.get('length'));
+        offsets.push(offset);
+        const signal = init?.signal as AbortSignal;
+        const delayMs = typeof pageMs === 'number' ? pageMs : pageMs(offset);
+        await new Promise<void>((resolve, reject) => {
+          if (!Number.isFinite(delayMs)) {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+            return;
+          }
+          const timer = setTimeout(resolve, delayMs);
+          signal.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        });
+        return httpResponse({
+          body: {
+            response: {
+              total: String(total),
+              frequency: 'monthly',
+              data: Array.from({ length: Math.min(length, total - offset) }, (_, i) =>
+                row(offset + i),
+              ),
+            },
+          },
+        });
+      }),
+    );
+    return { offsets };
+  }
+
+  it('waits out a slow healthy answer instead of cutting it: EIA answers deep offsets in 34–37 s', async () => {
+    // Measured live: fuel-type-data at offset 6,000,000 answered 200 in 35.5 s,
+    // facility-fuel at offset 8,000,000 in 34.5 s.
+    const { offsets } = timedPages(37_000, 1);
+
+    const result = await settle(
+      getEiaApiService().query(LEAF, { columns: ['price'] }, createMockContext()),
+    );
+
+    expect(result.ok && result.value.total).toBe(1);
+    expect(offsets).toEqual([0]);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(37_000);
+    expect(result.elapsedMs).toBeLessThan(38_000);
+  });
+
+  it('stages every row of a healthy chain that ends inside the client timeout', async () => {
+    // Six requests at 9 s each, the wide-route timing measured live
+    // (electricity/operating-generator-capacity stages 25,000 rows in about 54 s).
+    const { offsets } = timedPages(9_000, 30_000);
+
+    const result = await settle(
+      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.accumulated).toMatchObject({ capped: true });
+    expect(result.value.accumulated?.timedOut).toBeUndefined();
+    expect(result.value.accumulated?.rows).toHaveLength(25_000);
+    expect(offsets).toEqual([0, 100, 5_100, 10_100, 15_100, 20_100]);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(54_000);
+    expect(result.elapsedMs).toBeLessThan(56_000);
+  });
+
+  it('never starts a staging page that could not land before the deadline', async () => {
+    // 13 s pages: the fourth lands at 52 s, leaving 4 s — shorter than any page so far.
+    const { offsets } = timedPages(13_000, 30_000);
+
+    const result = await settle(
+      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(offsets).toEqual([0, 100, 5_100, 10_100]);
+    expect(result.value.accumulated).toMatchObject({ capped: false, timedOut: true });
+    expect(result.value.accumulated?.rows).toHaveLength(15_100);
+    // Answered as the last page landed, not at the deadline a fifth page would have hit.
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(52_000);
+    expect(result.elapsedMs).toBeLessThan(53_000);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('measures the preview too: a slow preview leaves no room for a staging page', async () => {
+    vi.stubEnv('EIA_CANVAS_MAX_ROWS', '300');
+    _resetServerConfig();
+    // The preview answers after 29 s of the call's 56 s, leaving 27 s — too little for a page as slow.
+    const { offsets } = timedPages((offset) => (offset === 0 ? 29_000 : 1_000), 300);
+
+    const result = await settle(
+      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.data).toHaveLength(100);
+    expect(result.value.accumulated).toMatchObject({ capped: false, timedOut: true });
+    expect(result.value.accumulated?.rows).toHaveLength(100);
+    expect(offsets).toEqual([0]);
+    expect(result.elapsedMs).toBeLessThan(30_000);
+  });
+
+  it('bounds the chain, not each request: a staging page that stalls past the deadline ends staging', async () => {
+    vi.stubEnv('EIA_CANVAS_MAX_ROWS', '300');
+    _resetServerConfig();
+    // The preview answers in 1 s; every later page stalls until its attempt is cut.
+    const { offsets } = timedPages(
+      (offset) => (offset === 0 ? 1_000 : Number.POSITIVE_INFINITY),
+      300,
+    );
+
+    const result = await settle(
+      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.data).toHaveLength(100);
+    expect(result.value.accumulated).toMatchObject({ capped: false, timedOut: true });
+    expect(result.value.accumulated?.rows).toHaveLength(100);
+    expect(offsets[0]).toBe(0);
+    expect(offsets.slice(1).every((offset) => offset === 100)).toBe(true);
+    expect(offsets.length).toBeGreaterThanOrEqual(2);
+    expect(result.elapsedMs).toBeLessThanOrEqual(56_000);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(55_000);
+  });
+
+  it('does not report a failed staging page as running out of time', async () => {
+    vi.stubEnv('EIA_CANVAS_MAX_ROWS', '300');
+    _resetServerConfig();
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        calls++;
+        if (calls === 1) {
+          return httpResponse({
+            body: {
+              response: {
+                total: '300',
+                frequency: 'monthly',
+                data: Array.from({ length: 100 }, (_, i) => row(i)),
+              },
+            },
+          });
+        }
+        return httpResponse({ status: 503, body: 'down' });
+      }),
+    );
+
+    const result = await settle(
+      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.accumulated?.rows).toHaveLength(100);
+    expect(result.value.accumulated?.timedOut).toBeUndefined();
+    expect(result.value.accumulated?.capped).toBe(false);
+  });
+
+  it('keeps a caller abort during a stalled attempt a cancellation', async () => {
+    const { fetchMock } = stallingFetch('headers');
+    const caller = new AbortController();
+    const reason = new Error('client cancelled');
+    const call = runToolContract(
+      queryRouteTool,
+      { route: LEAF, columns: ['price'] },
+      { context: { signal: caller.signal } },
+    );
+
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expectCancelledBy(await settleOnAbort(call, () => caller.abort(reason)), reason);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps a caller abort during a backoff a cancellation', async () => {
+    const fetchMock = vi.fn(async () => httpResponse({ status: 503, body: 'down' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const caller = new AbortController();
+    const reason = new Error('client cancelled');
+    const call = runToolContract(
+      queryRouteTool,
+      { route: LEAF, columns: ['price'] },
+      { context: { signal: caller.signal } },
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    expectCancelledBy(await settleOnAbort(call, () => caller.abort(reason)), reason);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('leaves a fast call unchanged and arms no timer past it', async () => {
+    const { fetchMock } = stallingFetch('headers', { call: 1, body: ONE_ROW });
+
+    const result = await getEiaApiService().query(
+      LEAF,
+      { columns: ['price'] },
+      createMockContext(),
+    );
+
+    expect(result).toMatchObject({ total: 1, data: [row(0)] });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('lands a stalled warm facet fetch in the index gaps instead of holding the pass open', async () => {
+    _resetRouteCache();
+    const api = stubHeldApiPaths(warmBodies());
+    const sectorPath = 'electricity/retail-sales/facet/sectorid';
+    const release = api.hold(sectorPath);
+    const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
+      result.content.map((block) => block.text ?? '').join('\n');
+
+    // The search answers at its 45 s budget with the facet that landed and the gap named.
+    const first = await settle(runToolContract(searchRoutesTool, { query: 'wind', limit: 5 }));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.elapsedMs).toBeLessThanOrEqual(45_000);
+    expect(first.value.isError).not.toBe(true);
+    expect(first.value.structuredContent).toMatchObject({
+      indexComplete: false,
+      indexGaps: ['facet_values'],
+      results: [{ filter_hint: { energy_source_code: 'WND' } }],
+    });
+    expect(textOf(first.value)).toContain('**indexGaps:** facet_values');
+
+    // The warm's own 56 s deadline ends the stalled fetch: the pass closes, nothing stays armed.
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(getIndexStatus().pendingPasses).toEqual(['facet_values']);
+
+    // A closed pass is re-run by the next search for the one facet it missed — an open one
+    // would be joined instead, with no request. EIA answers this time and the gap closes.
+    release();
+    const requestsBefore = api.paths.length;
+    const second = await settle(
+      runToolContract(searchRoutesTool, { query: 'residential', limit: 5 }),
+    );
+    expect(api.paths.slice(requestsBefore)).toEqual([sectorPath]);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.value.structuredContent).toMatchObject({
+      indexComplete: true,
+      results: [{ filter_hint: { sectorid: 'RES' } }],
+    });
+    expect(second.value.structuredContent).not.toHaveProperty('indexGaps');
+    expect(textOf(second.value)).not.toContain('indexGaps');
+  });
+});
+
+// ------------------------------------------------------------------
 // #67 — the warm is shared by every caller, so it cannot run under the signal
 // of the request that happened to start it. Stateless HTTP aborts each
 // request's signal as its response is sent; a cold browse used to take the
@@ -2822,22 +3639,31 @@ describe('EiaApiService — the warm outlives the request that started it (#67)'
 
   it('runs every warm fetch under a signal no request owns', async () => {
     const api = stubHeldApiPaths(warmBodies());
-    const ctx = createMockContext({ signal: new AbortController().signal });
+    const caller = new AbortController();
+    const ctx = createMockContext({ signal: caller.signal });
 
     await getEiaApiService().search('wind', 5, ctx);
 
-    // One signal, the service's own, carries the whole warm.
-    const warmSignal = api.signals.get('');
-    expect(warmSignal).toBeInstanceOf(AbortSignal);
-    expect(warmSignal).not.toBe(ctx.signal);
-    expect(warmSignal?.aborted).toBe(false);
-    for (const path of [
+    /**
+     * Each fetch carries its own attempt timeout, so each gets a signal of its
+     * own — derived from the service's lifetime, never the caller's: the
+     * caller aborting reaches none of them, and shutdown reaches every one.
+     */
+    const warmPaths = [
+      '',
       'steo/facet/seriesId',
       'seds/facet/seriesId',
       'electricity/retail-sales/facet/sectorid',
-    ]) {
-      expect(api.signals.get(path), path).toBe(warmSignal);
+    ];
+    caller.abort(new Error('Connection closed'));
+    for (const path of warmPaths) {
+      const signal = api.signals.get(path);
+      expect(signal, path).toBeInstanceOf(AbortSignal);
+      expect(signal, path).not.toBe(ctx.signal);
+      expect(signal?.aborted, path).toBe(false);
     }
+    shutdownEiaApiService();
+    for (const path of warmPaths) expect(api.signals.get(path)?.aborted, path).toBe(true);
   });
 
   it('rejects only the caller that cancelled while the tree was building', async () => {
@@ -3207,6 +4033,373 @@ describe('EiaApiService — named-series facets indexed whole (#57)', () => {
 });
 
 // ------------------------------------------------------------------
+// #78 — the benchmarks analysts ask for first (Henry Hub, WTI, Cushing, ERCOT)
+// live in `series`, `product`, and RTO `respondent` values, which reached the
+// index only once someone described the owning route. The warm-time facet pass
+// now fetches them: `series` and `product` on leaves publishing a daily or
+// weekly series, `series` indexed whole, and `respondent` on the hourly and
+// daily RTO leaves — never on an annual survey route, whose respondents are plants.
+// ------------------------------------------------------------------
+
+describe('EiaApiService — benchmark series, products, and respondents at warm time (#78)', () => {
+  const SPT = 'petroleum/pri/spt';
+  const WSTK = 'petroleum/stoc/wstk';
+  const MONTHLY = 'petroleum/pri/dfp1';
+  const FUT = 'natural-gas/pri/fut';
+  const RTO = 'electricity/rto/region-data';
+  const PELLETS = 'densified-biomass/wood-pellet-plants';
+
+  const freq = (id: string) => ({ id, description: id, query: id, format: 'YYYY-MM-DD' });
+  const volumeFacets = ['duoarea', 'product', 'process', 'series'].map((id) => ({
+    id,
+    description: id,
+  }));
+  const many = (prefix: string, count: number) =>
+    Array.from({ length: count }, (_, i) => ({ id: `${prefix}${i}`, name: `${prefix} item ${i}` }));
+
+  /** Daily and weekly leaves in both shapes EIA serves `frequency` in, a monthly leaf, and an RTO leaf. */
+  function benchmarkBodies(): Record<string, unknown> {
+    return {
+      '': {
+        response: {
+          routes: [
+            {
+              id: 'petroleum',
+              name: 'Petroleum',
+              routes: [
+                {
+                  id: 'pri',
+                  name: 'Prices',
+                  routes: [
+                    {
+                      id: 'spt',
+                      name: 'Spot Prices',
+                      frequency: [freq('monthly'), freq('weekly'), freq('daily')],
+                      facets: volumeFacets,
+                      data: {},
+                    },
+                    {
+                      id: 'dfp1',
+                      name: 'Domestic Crude Oil First Purchase Prices',
+                      frequency: [freq('monthly'), freq('annual')],
+                      facets: volumeFacets,
+                      data: {},
+                    },
+                  ],
+                },
+                {
+                  id: 'stoc',
+                  name: 'Stocks',
+                  routes: [
+                    {
+                      id: 'wstk',
+                      name: 'Weekly Stocks',
+                      // The object-map shape — keyed by frequency id.
+                      frequency: { weekly: freq('weekly') },
+                      facets: volumeFacets,
+                      data: {},
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              id: 'natural-gas',
+              name: 'Natural Gas',
+              routes: [
+                {
+                  id: 'pri',
+                  name: 'Prices',
+                  routes: [
+                    {
+                      id: 'fut',
+                      name: 'Spot and Futures Prices',
+                      frequency: [freq('daily')],
+                      facets: volumeFacets,
+                      data: {},
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              id: 'electricity',
+              name: 'Electricity',
+              routes: [
+                {
+                  id: 'rto',
+                  name: 'Electric Power Operations (Daily and Hourly)',
+                  routes: [
+                    {
+                      id: 'region-data',
+                      name: 'Hourly Demand By Region',
+                      frequency: [freq('hourly'), freq('local-hourly')],
+                      facets: [
+                        { id: 'respondent', description: 'Balancing Authority / Region' },
+                        { id: 'type', description: 'Type of Data' },
+                      ],
+                      data: {},
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              id: 'densified-biomass',
+              name: 'Densified Biomass',
+              routes: [
+                {
+                  // An annual survey route whose respondents are reporting plants.
+                  id: 'wood-pellet-plants',
+                  name: 'Wood Pellet Plant Capacity',
+                  frequency: [freq('annual')],
+                  facets: [
+                    { id: 'region', description: 'Region' },
+                    { id: 'respondent', description: 'Respondent' },
+                  ],
+                  data: {},
+                },
+              ],
+            },
+          ],
+        },
+      },
+      'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      [`${SPT}/facet/series`]: {
+        response: {
+          totalFacets: 2,
+          facets: [
+            { id: 'RWTC', name: 'Cushing, OK WTI Spot Price FOB' },
+            { id: 'RBRTE', name: 'Europe Brent Spot Price FOB' },
+          ],
+        },
+      },
+      [`${SPT}/facet/product`]: {
+        response: {
+          totalFacets: 2,
+          facets: [
+            { id: 'EPCWTI', name: 'WTI Crude Oil' },
+            { id: 'EPCBRENT', name: 'UK Brent Crude Oil' },
+          ],
+        },
+      },
+      // Past the 200-value bound: `series` is indexed whole, `product` is not.
+      [`${WSTK}/facet/series`]: {
+        response: {
+          totalFacets: 205,
+          facets: [
+            {
+              id: 'W_EPC0_SAX_YCUOK_MBBL',
+              name: 'Cushing, OK Ending Stocks excluding SPR of Crude Oil (Thousand Barrels)',
+            },
+            ...many('WSTK', 204),
+          ],
+        },
+      },
+      [`${WSTK}/facet/product`]: { response: { totalFacets: 201, facets: many('PROD', 201) } },
+      [`${FUT}/facet/series`]: {
+        response: {
+          totalFacets: 1,
+          facets: [
+            { id: 'RNGWHHD', name: 'Henry Hub Natural Gas Spot Price (Dollars per Million Btu)' },
+          ],
+        },
+      },
+      [`${FUT}/facet/product`]: {
+        response: { totalFacets: 1, facets: [{ id: 'EPG0', name: 'Natural Gas' }] },
+      },
+      [`${RTO}/facet/respondent`]: {
+        response: {
+          totalFacets: 2,
+          facets: [
+            { id: 'ERCO', name: 'Electric Reliability Council of Texas, Inc.' },
+            { id: 'CISO', name: 'California Independent System Operator' },
+          ],
+        },
+      },
+    };
+  }
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  /** Indexed entries filtering on `facetId`, as `route facetId=value`. */
+  function hintsOn(facetId: string): string[] {
+    return getIndexEntries().flatMap((e) => {
+      const value = e.filter_hint?.[facetId];
+      return value === undefined ? [] : [`${e.route} ${facetId}=${value}`];
+    });
+  }
+
+  it('fetches series and product on daily and weekly leaves only, and respondent on hourly ones', async () => {
+    const api = stubHeldApiPaths(benchmarkBodies());
+
+    const { status } = await getEiaApiService().search('Cushing', 5, createMockContext());
+
+    expect(status.complete).toBe(true);
+    const facetPaths = api.paths.filter((path) => path.includes('/facet/')).sort();
+    expect(facetPaths).toEqual(
+      [
+        `${FUT}/facet/product`,
+        `${FUT}/facet/series`,
+        `${RTO}/facet/respondent`,
+        `${SPT}/facet/product`,
+        `${SPT}/facet/series`,
+        `${WSTK}/facet/product`,
+        `${WSTK}/facet/series`,
+        'seds/facet/seriesId',
+        'steo/facet/seriesId',
+      ].sort(),
+    );
+    // Never fetched: the monthly leaf's series and product, any duoarea or process,
+    // the RTO type, and the annual pellet-plant route's respondents.
+    for (const path of [
+      `${MONTHLY}/facet/series`,
+      `${MONTHLY}/facet/product`,
+      `${RTO}/facet/type`,
+      `${PELLETS}/facet/respondent`,
+    ])
+      expect(api.paths).not.toContain(path);
+    expect(api.paths.some((path) => /\/facet\/(duoarea|process)$/.test(path))).toBe(false);
+    expect(hintsOn('duoarea')).toEqual([]);
+    expect(hintsOn('process')).toEqual([]);
+  });
+
+  it('indexes a series facet whole past the 200-value bound and holds product and respondent to it', async () => {
+    const bodies = benchmarkBodies();
+    bodies[`${RTO}/facet/respondent`] = { response: { totalFacets: 201, facets: many('BA', 201) } };
+    stubHeldApiPaths(bodies);
+
+    const { status } = await getEiaApiService().search('Cushing', 5, createMockContext());
+
+    expect(status.complete).toBe(true);
+    // 2 on spt + 205 on wstk (whole) + 1 on fut.
+    expect(hintsOn('series')).toHaveLength(2 + 205 + 1);
+    expect(hintsOn('series')).toContain(`${WSTK} series=W_EPC0_SAX_YCUOK_MBBL`);
+    // wstk's 201 products and the 201 respondents stay out.
+    expect(hintsOn('product').sort()).toEqual(
+      [`${FUT} product=EPG0`, `${SPT} product=EPCBRENT`, `${SPT} product=EPCWTI`].sort(),
+    );
+    expect(hintsOn('respondent')).toEqual([]);
+  });
+
+  it('resolves the benchmarks on the first search, before any describe', async () => {
+    stubHeldApiPaths(benchmarkBodies());
+    const ctx = createMockContext();
+
+    const henry = await getEiaApiService().search('Henry Hub', 5, ctx);
+    expect(henry.results[0]?.entry).toMatchObject({
+      route: FUT,
+      filter_hint: { series: 'RNGWHHD' },
+    });
+    expect(henry.results[0]?.score).toBeLessThan(WEAK_MATCH_SCORE);
+
+    const wti = await getEiaApiService().search('WTI crude oil', 5, ctx);
+    expect(wti.results[0]?.entry).toMatchObject({ route: SPT, filter_hint: { product: 'EPCWTI' } });
+
+    // Two series name Cushing — the WTI spot price and the stocks there — and lead in either order.
+    const cushing = await getEiaApiService().search('Cushing', 5, ctx);
+    expect(
+      cushing.results
+        .slice(0, 2)
+        .map((r) => `${r.entry.route} series=${r.entry.filter_hint?.series}`)
+        .sort(),
+    ).toEqual([`${SPT} series=RWTC`, `${WSTK} series=W_EPC0_SAX_YCUOK_MBBL`]);
+
+    const ercot = await getEiaApiService().search('Electric Reliability Council of Texas', 5, ctx);
+    expect(ercot.results[0]?.entry).toMatchObject({
+      route: RTO,
+      filter_hint: { respondent: 'ERCO' },
+    });
+    expect(ercot.results[0]?.score).toBeLessThan(WEAK_MATCH_SCORE);
+  });
+
+  it('answers a benchmark query on both surfaces of the tool', async () => {
+    stubHeldApiPaths(benchmarkBodies());
+
+    const result = await runToolContract(searchRoutesTool, { query: 'Henry Hub' });
+    const structured = result.structuredContent as {
+      results: Array<{ route: string; filter_hint?: Record<string, string> }>;
+      indexComplete: boolean;
+    };
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+
+    expect(structured.indexComplete).toBe(true);
+    expect(structured.results[0]).toMatchObject({ route: FUT, filter_hint: { series: 'RNGWHHD' } });
+    expect(text).toContain(`eia_query_route(route="${FUT}", filters={"series": "RNGWHHD"})`);
+  });
+
+  it('reports a failed benchmark target as a facet_values gap and re-fetches only it', async () => {
+    const bodies = benchmarkBodies();
+    const seriesPath = `${SPT}/facet/series`;
+    const series = bodies[seriesPath];
+    delete bodies[seriesPath];
+    const api = stubHeldApiPaths(bodies);
+
+    const first = await getEiaApiService().search('Cushing', 5, createMockContext());
+    expect(first.status.complete).toBe(false);
+    expect(first.status.pendingPasses).toEqual(['facet_values']);
+    expect(hintsOn('series')).not.toContain(`${SPT} series=RWTC`);
+
+    bodies[seriesPath] = series;
+    const fetchedBefore = api.paths.length;
+    const second = await getEiaApiService().search('Cushing', 5, createMockContext());
+
+    expect(api.paths.slice(fetchedBefore)).toEqual([seriesPath]);
+    expect(second.status.complete).toBe(true);
+    expect(hintsOn('series')).toContain(`${SPT} series=RWTC`);
+  });
+
+  it('leaves describe-time folding bounded: a described monthly route keeps a large series facet out', async () => {
+    const bodies = benchmarkBodies();
+    bodies[MONTHLY] = {
+      response: {
+        id: 'dfp1',
+        name: 'Domestic Crude Oil First Purchase Prices',
+        frequency: [freq('monthly')],
+        facets: [
+          { id: 'series', description: 'Series' },
+          { id: 'product', description: 'Product' },
+        ],
+        data: {},
+      },
+    };
+    bodies[`${MONTHLY}/facet/series`] = {
+      response: { totalFacets: 201, facets: many('DFP', 201) },
+    };
+    bodies[`${MONTHLY}/facet/product`] = {
+      response: { totalFacets: 1, facets: [{ id: 'EPC0', name: 'Crude Oil' }] },
+    };
+    stubHeldApiPaths(bodies);
+    await getEiaApiService().search('Cushing', 5, createMockContext());
+
+    await getEiaApiService().describe(MONTHLY, createMockContext());
+
+    expect(hintsOn('series').filter((hint) => hint.startsWith(MONTHLY))).toEqual([]);
+    expect(hintsOn('product').filter((hint) => hint.startsWith(MONTHLY))).toEqual([
+      `${MONTHLY} product=EPC0`,
+    ]);
+  });
+});
+
+// ------------------------------------------------------------------
 // #56, #70, #55 — eia_search_routes over a real index, through the tool's
 // public contract so both surfaces are asserted. `truncated` means a match
 // exists past what was returned (#56); a `limit` past the 30-per-call cap is
@@ -3490,5 +4683,476 @@ describe('eia_search_routes — a query spelling a route path (#73)', () => {
     expect(structured.results.slice(1).some((r) => r.route === 'steo')).toBe(true);
     const firstHit = text.split('\n').find((line) => line.startsWith('['));
     expect(firstHit).toBe('[leaf] **electricity/retail-sales** (score: 0.000)');
+  });
+});
+
+// ------------------------------------------------------------------
+// #79 — a query shaped like a legacy APIv1 series ID is resolved through
+// /v2/seriesid before the search waits on the warm. A hit answers alone, cold
+// or warm; a 404 is the miss; any other failure degrades to the text search.
+// ------------------------------------------------------------------
+
+/** `/v2/seriesid` answers as EIA sent them on 2026-10-22, trimmed to one row's worth. */
+const SERIES_ID_ANSWERS: Record<string, unknown> = {
+  'PET.RWTC.W': {
+    response: {
+      total: 2129,
+      frequency: 'weekly',
+      data: [{ period: '2026-10-16', series: 'RWTC', value: 99.93 }],
+      description: 'EIA petroleum gas survey data',
+      id: 'petroleum',
+    },
+    request: {
+      command: '/v2/seriesid/PET.RWTC.W',
+      params: {
+        frequency: 'weekly',
+        data: ['value'],
+        facets: { series: ['RWTC'] },
+        start: null,
+        end: null,
+        sort: [{ column: 'period', direction: 'desc' }],
+        offset: 0,
+        length: 1,
+      },
+      route: 'petroleum/pri/spt',
+    },
+    apiVersion: '2.1.14',
+  },
+  'ELEC.GEN.ALL-US-99.Q': {
+    response: {
+      total: 100,
+      frequency: 'quarterly',
+      data: [],
+      id: 'electric-power-operational-data',
+    },
+    request: {
+      params: {
+        frequency: 'quarterly',
+        data: ['generation'],
+        facets: { fueltypeid: ['ALL'], location: ['US'], sectorid: [99] },
+      },
+      route: 'electricity/electric-power-operational-data',
+    },
+  },
+  // EIA maps this ID to a seriesId its aeo/2023 facet does not list, and its own
+  // lookup reports the mapping matches no rows.
+  'AEO.2023.REF2023.CNSM_NA_RESD_NA_ELC_NA_NA_QBTU.A': {
+    response: { total: 0, dateFormat: 'YYYY', frequency: 'annual', data: [], id: '2023' },
+    request: {
+      command: '/v2/seriesid/AEO.2023.REF2023.CNSM_NA_RESD_NA_ELC_NA_NA_QBTU.A',
+      params: {
+        frequency: 'annual',
+        data: ['value'],
+        facets: { scenario: ['ref2023'], seriesId: ['cnsm_NA_resd_NA_elc_NA_NA_qbtu'] },
+      },
+      route: 'aeo/2023',
+    },
+  },
+  'SEDS.TETCB.TX.A': {
+    response: { total: 63, frequency: 'annual', data: [], id: 'seds' },
+    request: {
+      params: {
+        frequency: 'annual',
+        data: ['value'],
+        facets: { seriesId: ['TETCB'], stateId: ['TX'] },
+      },
+      route: 'seds',
+    },
+  },
+};
+
+type LookupAnswer = 'stall' | 'unreachable' | PageFixture;
+
+/**
+ * The warm's endpoints from `bodies`, plus `/v2/seriesid/{id}` answered by
+ * `answer` — called with the 1-based lookup number. A stalled lookup ends only
+ * when its signal aborts. Any path can be held open; any host but EIA's throws.
+ */
+function stubSeriesLookup(
+  answer: (id: string, call: number) => LookupAnswer,
+  bodies: Record<string, unknown> = warmBodies(),
+) {
+  const paths: string[] = [];
+  const urls: URL[] = [];
+  const holds = new Map<string, Promise<void>>();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.hostname !== 'api.eia.gov') throw new Error(`Unmocked fetch to ${url.hostname}`);
+      const path = url.pathname.replace(/^\/v2\/?/, '').replace(/\/$/, '');
+      paths.push(path);
+      urls.push(url);
+      const signal = init?.signal as AbortSignal;
+      const aborted = () =>
+        new Promise<never>((_resolve, reject) => {
+          if (signal.aborted) return reject(signal.reason);
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+
+      if (path.startsWith('seriesid/')) {
+        const id = path.slice('seriesid/'.length);
+        const reply = answer(id, paths.filter((p) => p.startsWith('seriesid/')).length);
+        if (reply === 'stall') return aborted();
+        if (reply === 'unreachable')
+          throw Object.assign(new TypeError('fetch failed'), { code: 'ECONNREFUSED' });
+        return httpResponse(reply);
+      }
+
+      const hold = holds.get(path);
+      if (hold) await Promise.race([hold, aborted()]);
+      signal.throwIfAborted();
+      const body = bodies[path];
+      if (body === undefined) return httpResponse({ status: 404, body: { error: 'not found' } });
+      return httpResponse({ body });
+    }),
+  );
+  return {
+    paths,
+    urls,
+    lookups: () => paths.filter((path) => path.startsWith('seriesid/')),
+    /** Hold `path` open until the warm's signal aborts. */
+    hold: (path: string) => holds.set(path, new Promise<void>(() => {})),
+  };
+}
+
+/** A lookup answered from `SERIES_ID_ANSWERS`, and EIA's 404 for any other ID. */
+function knownIds(id: string): LookupAnswer {
+  const body = SERIES_ID_ANSWERS[id];
+  return body === undefined
+    ? { status: 404, body: { error: `Series ID '${id}' is not valid.`, code: 404 } }
+    : { body };
+}
+
+describe('EiaApiService.search — legacy APIv1 series IDs (#79)', () => {
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', API_KEY);
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  /** Run `call` to settlement under the fake clock; resolves with its outcome and elapsed ms. */
+  async function settle<T>(call: Promise<T>) {
+    const startedAt = Date.now();
+    let settledAt: number | undefined;
+    const outcome = call.then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    void outcome.then(() => {
+      settledAt = Date.now();
+    });
+    for (let i = 0; i < 70 && settledAt === undefined; i++)
+      await vi.advanceTimersByTimeAsync(1_000);
+    return { ...(await outcome), elapsedMs: (settledAt ?? Number.NaN) - startedAt };
+  }
+
+  it('answers a cold server with the one resolved result and starts no warm', async () => {
+    const api = stubSeriesLookup(knownIds);
+
+    const { results, hasMore, seriesId, status } = await getEiaApiService().search(
+      'PET.RWTC.W',
+      10,
+      createMockContext(),
+    );
+
+    expect(api.paths).toEqual(['seriesid/PET.RWTC.W']);
+    expect(api.urls[0]?.searchParams.get('length')).toBe('1');
+    expect(results).toEqual([
+      {
+        entry: {
+          route: 'petroleum/pri/spt',
+          name: 'PET.RWTC.W',
+          description: 'EIA petroleum gas survey data',
+          category: undefined,
+          isLeaf: true,
+          filter_hint: { series: 'RWTC' },
+          frequency: 'weekly',
+          columns: ['value'],
+        },
+        score: 0,
+      },
+    ]);
+    expect(hasMore).toBe(false);
+    expect(seriesId).toMatchObject({ outcome: 'resolved', seriesId: 'PET.RWTC.W' });
+    expect(status.size).toBe(0);
+  });
+
+  it('resolves a lowercase ID as its uppercase spelling, on both surfaces of the tool', async () => {
+    const api = stubSeriesLookup(knownIds);
+
+    const result = await runToolContract(searchRoutesTool, { query: 'pet.rwtc.w' });
+
+    expect(api.lookups()).toEqual(['seriesid/PET.RWTC.W']);
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      results: [
+        {
+          route: 'petroleum/pri/spt',
+          filter_hint: { series: 'RWTC' },
+          frequency: 'weekly',
+          columns: ['value'],
+          score: 0,
+        },
+      ],
+      shown: 1,
+      effectiveQuery: 'pet.rwtc.w',
+      notice: expect.stringContaining('Resolved APIv1 series ID PET.RWTC.W'),
+    });
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain(
+      'eia_query_route(route="petroleum/pri/spt", filters={"series": "RWTC"}, frequency="weekly", columns=["value"])',
+    );
+  });
+
+  it.each([
+    [
+      'ELEC.GEN.ALL-US-99.Q',
+      'electricity/electric-power-operational-data',
+      { fueltypeid: 'ALL', location: 'US', sectorid: '99' },
+    ],
+    ['SEDS.TETCB.TX.A', 'seds', { seriesId: 'TETCB', stateId: 'TX' }],
+  ])('maps %s to %s with every facet as a string', async (id, route, filters) => {
+    stubSeriesLookup(knownIds);
+
+    const { results } = await getEiaApiService().search(id, 10, createMockContext());
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.entry).toMatchObject({ route, filter_hint: filters });
+  });
+
+  it('marks a resolved ID whose lookup reports no rows, and only that one', async () => {
+    stubSeriesLookup(knownIds);
+    const aeo = 'AEO.2023.REF2023.CNSM_NA_RESD_NA_ELC_NA_NA_QBTU.A';
+
+    const empty = await getEiaApiService().search(aeo, 10, createMockContext());
+    expect(empty.seriesId).toMatchObject({ outcome: 'resolved', seriesId: aeo, empty: true });
+    expect(empty.results[0]?.entry).toMatchObject({
+      route: 'aeo/2023',
+      filter_hint: { scenario: 'ref2023', seriesId: 'cnsm_NA_resd_NA_elc_NA_NA_qbtu' },
+    });
+
+    for (const id of ['PET.RWTC.W', 'SEDS.TETCB.TX.A']) {
+      const { seriesId } = await getEiaApiService().search(id, 10, createMockContext());
+      expect(seriesId?.outcome, id).toBe('resolved');
+      expect(seriesId, id).not.toHaveProperty('empty');
+    }
+  });
+
+  it.each([
+    ['a string zero', '0', true],
+    ['a string count', '307', false],
+    ['no total', undefined, false],
+  ])('reads %s as the row total', async (_name, total, empty) => {
+    const body = structuredClone(SERIES_ID_ANSWERS['PET.RWTC.W']) as {
+      response: Record<string, unknown>;
+    };
+    if (total === undefined) delete body.response.total;
+    else body.response.total = total;
+    stubSeriesLookup(() => ({ body }));
+
+    const { seriesId } = await getEiaApiService().search('PET.RWTC.W', 10, createMockContext());
+
+    expect(seriesId?.outcome).toBe('resolved');
+    expect(seriesId && 'empty' in seriesId).toBe(empty);
+  });
+
+  it('tells the caller, on both surfaces, that a mapping with no rows returns none', async () => {
+    stubSeriesLookup(knownIds);
+    const aeo = 'AEO.2023.REF2023.CNSM_NA_RESD_NA_ELC_NA_NA_QBTU.A';
+
+    const result = await runToolContract(searchRoutesTool, { query: aeo });
+
+    const notice = `Resolved APIv1 series ID ${aeo} to route aeo/2023 through EIA's series lookup, but EIA reports no rows for that mapping, so eia_query_route with it returns none; search for the series by name, or use eia_describe_route with values_query to find its current ID.`;
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ shown: 1, notice });
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain(notice);
+  });
+
+  it('answers a warm server with the resolved result alone, ahead of any text match', async () => {
+    const api = stubSeriesLookup(knownIds);
+    await getEiaApiService().search('wind', 5, createMockContext());
+    const warmRequests = api.paths.length;
+
+    const { results, status } = await getEiaApiService().search(
+      'PET.RWTC.W',
+      10,
+      createMockContext(),
+    );
+
+    expect(api.paths.slice(warmRequests)).toEqual(['seriesid/PET.RWTC.W']);
+    expect(results.map((r) => r.entry.route)).toEqual(['petroleum/pri/spt']);
+    expect(status.complete).toBe(true);
+  });
+
+  it.each([
+    [
+      'a 404',
+      { status: 404, body: { error: "Series ID 'RETAIL.SALES.M' is not valid.", code: 404 } },
+    ],
+    ['a 400', { status: 400, body: { error: 'Invalid series ID', code: 400 } }],
+    ['a 414', { status: 414, body: '<html><body>Request-URI Too Long</body></html>' }],
+  ])('falls back to the text search on %s, asking once', async (_name, reply) => {
+    const api = stubSeriesLookup(() => reply);
+
+    // Shaped like an ID, and a text match for a route in the warmed corpus.
+    const { results, seriesId, status } = await getEiaApiService().search(
+      'Retail.Sales.M',
+      10,
+      createMockContext(),
+    );
+
+    expect(api.lookups()).toEqual(['seriesid/RETAIL.SALES.M']);
+    expect(seriesId).toEqual({ outcome: 'unrecognized', seriesId: 'RETAIL.SALES.M' });
+    // The warm ran after the lookup, and the text search answered from it.
+    expect(api.paths.indexOf('')).toBeGreaterThan(0);
+    expect(status.complete).toBe(true);
+    expect(results[0]?.entry.route).toBe('electricity/retail-sales');
+    expect(results[0]?.entry).not.toHaveProperty('frequency');
+    expect(results[0]?.score).toBeGreaterThan(0);
+  });
+
+  it('looks up a non-ID that fits the grammar, then answers with the text search', async () => {
+    const api = stubSeriesLookup(knownIds);
+
+    const result = await runToolContract(searchRoutesTool, { query: 'U.S.A' });
+
+    expect(api.lookups()).toEqual(['seriesid/U.S.A']);
+    expect(result.isError).not.toBe(true);
+    expect((result.structuredContent as { notice: string }).notice).toContain(
+      'U.S.A has the shape of an APIv1 series ID, but EIA does not recognize it',
+    );
+  });
+
+  it.each(['Henry Hub', 'petroleum/pri/spt', 'U.S. crude oil stocks', 'retail sales'])(
+    'makes no lookup for %s',
+    async (query) => {
+      const api = stubSeriesLookup(knownIds);
+
+      const { seriesId } = await getEiaApiService().search(query, 10, createMockContext());
+
+      expect(api.lookups()).toEqual([]);
+      expect(seriesId).toBeUndefined();
+    },
+  );
+
+  it.each([
+    ['5xx', { status: 503, body: 'Service Unavailable' }, 'upstream_unavailable'],
+    ['rate limit', { status: 429, body: 'OVER_RATE_LIMIT' }, 'rate_limited'],
+    ['unreachable host', 'unreachable' as const, 'upstream_unreachable'],
+  ])(
+    'falls back with a retryable failure once a persistent %s spends its retries',
+    async (_name, reply, reason) => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const api = stubSeriesLookup(() => reply);
+
+      const result = await settle(getEiaApiService().search('PET.RWTC.W', 10, createMockContext()));
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.value.seriesId).toEqual({
+        outcome: 'failed',
+        seriesId: 'PET.RWTC.W',
+        retryable: true,
+        reason,
+      });
+      // One request and three retries, all inside the 10 s lookup budget.
+      expect(api.lookups()).toHaveLength(4);
+      expect(api.paths).toContain('');
+      expect(result.value.status.complete).toBe(true);
+      expect(result.elapsedMs).toBeLessThanOrEqual(10_000);
+    },
+  );
+
+  it('cuts a stalled lookup at its 10 s budget as upstream_timeout, then answers from text', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const api = stubSeriesLookup(() => 'stall');
+
+    const result = await settle(runToolContract(searchRoutesTool, { query: 'PET.RWTC.W' }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.isError).not.toBe(true);
+    expect((result.value.structuredContent as { notice: string }).notice).toContain(
+      'PET.RWTC.W has the shape of an APIv1 series ID, but looking it up failed (upstream_timeout); these are text-search results — retry to resolve the ID.',
+    );
+    expect(api.lookups()).toEqual(['seriesid/PET.RWTC.W']);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(result.elapsedMs).toBeLessThan(11_000);
+  });
+
+  it('holds a stalled lookup and a stalled warm together inside the 45 s search ceiling', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const api = stubSeriesLookup(() => 'stall');
+    api.hold('');
+
+    const result = await settle(getEiaApiService().search('PET.RWTC.W', 10, createMockContext()));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.seriesId).toMatchObject({ outcome: 'failed', reason: 'upstream_timeout' });
+    expect(result.value.status.size).toBe(0);
+    // 10 s of lookup, then what is left of the 45 s warm budget — not 10 + 45.
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(44_000);
+    expect(result.elapsedMs).toBeLessThanOrEqual(45_000);
+    shutdownEiaApiService();
+  });
+
+  it('reports an answer missing its route or facets as a failed lookup, asking once', async () => {
+    const api = stubSeriesLookup(() => ({ body: { response: { total: 0, data: [] } } }));
+
+    const { seriesId } = await getEiaApiService().search('PET.RWTC.W', 10, createMockContext());
+
+    expect(seriesId).toEqual({
+      outcome: 'failed',
+      seriesId: 'PET.RWTC.W',
+      retryable: true,
+      reason: 'upstream_invalid_response',
+    });
+    expect(api.lookups()).toHaveLength(1);
+  });
+
+  it('reports a non-retryable failure without retrying it', async () => {
+    const api = stubSeriesLookup(() => ({ status: 501, body: 'Not Implemented' }));
+
+    const { seriesId } = await getEiaApiService().search('PET.RWTC.W', 10, createMockContext());
+
+    expect(seriesId).toMatchObject({ outcome: 'failed', retryable: false });
+    expect(api.lookups()).toHaveLength(1);
+  });
+
+  it('keeps a caller abort during the lookup a cancellation and starts no warm', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const api = stubSeriesLookup(() => 'stall');
+    const caller = new AbortController();
+    const reason = new Error('client cancelled');
+    const call = runToolContract(
+      searchRoutesTool,
+      { query: 'PET.RWTC.W' },
+      { context: { signal: caller.signal } },
+    );
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expectCancelledBy(await settleOnAbort(call, () => caller.abort(reason)), reason);
+    expect(api.paths).toEqual(['seriesid/PET.RWTC.W']);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

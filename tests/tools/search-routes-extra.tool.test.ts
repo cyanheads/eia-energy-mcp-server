@@ -23,6 +23,20 @@ function settled(size: number): IndexStatus {
 
 const mockSearch = vi.fn();
 
+/** `count` distinct leaf results, shaped as the service returns them. */
+function ranked(count: number) {
+  return Array.from({ length: count }, (_, i) => ({
+    entry: {
+      route: `electricity/r${i}`,
+      name: `Route ${i}`,
+      description: 'desc',
+      isLeaf: true,
+      category: 'electricity',
+    },
+    score: 0.1,
+  }));
+}
+
 describe('searchRoutesTool — additional coverage', () => {
   beforeEach(() => {
     vi.mocked(eiaService.getEiaApiService).mockReturnValue({
@@ -238,6 +252,285 @@ describe('searchRoutesTool — additional coverage', () => {
       const blocks = searchRoutesTool.format!(result);
       const text = (blocks[0] as { text: string }).text;
       expect(text).toContain('[cat]');
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // #79 — legacy APIv1 series IDs resolved through /v2/seriesid
+  // ------------------------------------------------------------------
+
+  describe('legacy APIv1 series IDs (#79)', () => {
+    /** A series-ID hit, shaped as the service returns it. */
+    function resolved(
+      seriesId: string,
+      entry: {
+        route: string;
+        filter_hint?: Record<string, string>;
+        frequency: string;
+        columns?: string[];
+      },
+    ) {
+      const full = {
+        name: seriesId,
+        description: 'EIA dataset description',
+        isLeaf: true,
+        category: undefined,
+        ...entry,
+      };
+      return {
+        results: [{ entry: full, score: 0 }],
+        hasMore: false,
+        seriesId: { outcome: 'resolved', seriesId, entry: full },
+        status: settled(0),
+      };
+    }
+
+    /** The text of every content block, joined. */
+    function contentText(result: { content: Array<{ type: string; text?: string }> }): string {
+      return result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
+    }
+
+    it.each([
+      {
+        id: 'PET.RWTC.W',
+        entry: {
+          route: 'petroleum/pri/spt',
+          filter_hint: { series: 'RWTC' },
+          frequency: 'weekly',
+          columns: ['value'],
+        },
+        call: 'eia_query_route(route="petroleum/pri/spt", filters={"series": "RWTC"}, frequency="weekly", columns=["value"])',
+      },
+      {
+        id: 'NG.RNGWHHD.D',
+        entry: {
+          route: 'natural-gas/pri/fut',
+          filter_hint: { series: 'RNGWHHD' },
+          frequency: 'daily',
+          columns: ['value'],
+        },
+        call: 'eia_query_route(route="natural-gas/pri/fut", filters={"series": "RNGWHHD"}, frequency="daily", columns=["value"])',
+      },
+      {
+        id: 'ELEC.PRICE.TX-RES.M',
+        entry: {
+          route: 'electricity/retail-sales',
+          filter_hint: { sectorid: 'RES', stateid: 'TX' },
+          frequency: 'monthly',
+          columns: ['price'],
+        },
+        call: 'eia_query_route(route="electricity/retail-sales", filters={"sectorid": "RES", "stateid": "TX"}, frequency="monthly", columns=["price"])',
+      },
+    ])('answers $id with one result on both surfaces', async ({ id, entry, call }) => {
+      mockSearch.mockResolvedValue(resolved(id, entry));
+
+      const result = await runToolContract(searchRoutesTool, { query: id });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        results: [{ ...entry, name: id, score: 0, isLeaf: true }],
+        shown: 1,
+        truncated: false,
+        notice: `Resolved APIv1 series ID ${id} to route ${entry.route} through EIA's series lookup; pass filter_hint, frequency, and columns to eia_query_route.`,
+      });
+      const results = (result.structuredContent as { results: unknown[] }).results;
+      expect(results).toHaveLength(1);
+      const text = contentText(result);
+      expect(text).toContain(`Query with: \`${call}\``);
+      expect(text).toContain(`Resolved APIv1 series ID ${id} to route ${entry.route}`);
+    });
+
+    it('says on both surfaces when EIA reports no rows for the mapping', async () => {
+      const id = 'AEO.2023.REF2023.CNSM_NA_RESD_NA_ELC_NA_NA_QBTU.A';
+      const hit = resolved(id, {
+        route: 'aeo/2023',
+        filter_hint: { scenario: 'ref2023', seriesId: 'cnsm_NA_resd_NA_elc_NA_NA_qbtu' },
+        frequency: 'annual',
+        columns: ['value'],
+      });
+      mockSearch.mockResolvedValue({ ...hit, seriesId: { ...hit.seriesId, empty: true } });
+
+      const result = await runToolContract(searchRoutesTool, { query: id });
+
+      const notice = `Resolved APIv1 series ID ${id} to route aeo/2023 through EIA's series lookup, but EIA reports no rows for that mapping, so eia_query_route with it returns none; search for the series by name, or use eia_describe_route with values_query to find its current ID.`;
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({ shown: 1, notice });
+      expect(contentText(result)).toContain(notice);
+      // The mapping itself is still shown, so the caller can see what EIA answered.
+      expect(contentText(result)).toContain('filters={"scenario": "ref2023"');
+    });
+
+    it('renders frequency and columns on a result without a filter_hint', () => {
+      const text = (
+        searchRoutesTool.format!({
+          results: [
+            {
+              route: 'total-energy',
+              name: 'TOTAL.X.M',
+              description: '',
+              score: 0,
+              isLeaf: true,
+              frequency: 'monthly',
+              columns: ['value'],
+            },
+          ],
+        })[0] as { text: string }
+      ).text;
+      expect(text).toContain(
+        'Query with: `eia_query_route(route="total-energy", frequency="monthly", columns=["value"])`',
+      );
+    });
+
+    it('falls back to the text search with a not-recognized notice on a 404', async () => {
+      mockSearch.mockResolvedValue({
+        results: ranked(2),
+        hasMore: false,
+        seriesId: { outcome: 'unrecognized', seriesId: 'U.S.A' },
+        status: settled(5459),
+      });
+
+      const result = await runToolContract(searchRoutesTool, { query: 'u.s.a' });
+
+      expect(result.structuredContent).toMatchObject({
+        shown: 2,
+        notice:
+          'U.S.A has the shape of an APIv1 series ID, but EIA does not recognize it; these are text-search results for "u.s.a".',
+      });
+      expect(contentText(result)).toContain('but EIA does not recognize it');
+      expect(contentText(result)).not.toContain('frequency=');
+    });
+
+    it.each([
+      {
+        reason: 'upstream_timeout',
+        retryable: true,
+        notice:
+          'PET.RWTC.W has the shape of an APIv1 series ID, but looking it up failed (upstream_timeout); these are text-search results — retry to resolve the ID.',
+      },
+      {
+        reason: undefined,
+        retryable: true,
+        notice:
+          'PET.RWTC.W has the shape of an APIv1 series ID, but looking it up failed; these are text-search results — retry to resolve the ID.',
+      },
+      {
+        reason: undefined,
+        retryable: false,
+        notice:
+          'PET.RWTC.W has the shape of an APIv1 series ID, but looking it up failed; these are text-search results.',
+      },
+    ])(
+      'falls back with a lookup-failed notice (reason $reason, retryable $retryable)',
+      async ({ reason, retryable, notice }) => {
+        mockSearch.mockResolvedValue({
+          results: ranked(1),
+          hasMore: false,
+          seriesId: {
+            outcome: 'failed',
+            seriesId: 'PET.RWTC.W',
+            retryable,
+            ...(reason && { reason }),
+          },
+          status: settled(5459),
+        });
+
+        const result = await runToolContract(searchRoutesTool, { query: 'PET.RWTC.W' });
+
+        expect(result.isError).not.toBe(true);
+        expect(result.structuredContent).toMatchObject({ shown: 1, notice });
+      },
+    );
+
+    it('combines the ID notice with the clamped-limit and no-match notices', async () => {
+      mockSearch.mockResolvedValue({
+        results: [],
+        hasMore: false,
+        seriesId: { outcome: 'unrecognized', seriesId: 'PET.ZZZZZZ.W' },
+        status: settled(5459),
+      });
+
+      const result = await runToolContract(searchRoutesTool, { query: 'PET.ZZZZZZ.W', limit: 50 });
+
+      expect((result.structuredContent as { notice: string }).notice).toBe(
+        'Requested limit 50 was clamped to 30. PET.ZZZZZZ.W has the shape of an APIv1 series ID, but EIA does not recognize it; these are text-search results for "PET.ZZZZZZ.W". No routes matched "PET.ZZZZZZ.W". Try different search terms or use eia_browse_routes to explore the taxonomy.',
+      );
+    });
+
+    it('combines a hit notice with the clamped-limit notice', async () => {
+      mockSearch.mockResolvedValue(
+        resolved('PET.RWTC.W', {
+          route: 'petroleum/pri/spt',
+          filter_hint: { series: 'RWTC' },
+          frequency: 'weekly',
+          columns: ['value'],
+        }),
+      );
+
+      const result = await runToolContract(searchRoutesTool, { query: 'PET.RWTC.W', limit: 40 });
+
+      expect((result.structuredContent as { notice: string }).notice).toMatch(
+        /^Requested limit 40 was clamped to 30\. Resolved APIv1 series ID PET\.RWTC\.W to route petroleum\/pri\/spt/,
+      );
+    });
+
+    it('adds no ID notice, frequency, or columns to an ordinary search', async () => {
+      mockSearch.mockResolvedValue({ results: ranked(1), hasMore: false, status: settled(5459) });
+
+      const result = await runToolContract(searchRoutesTool, { query: 'Henry Hub' });
+
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      const [first] = (result.structuredContent as { results: object[] }).results;
+      expect(first).not.toHaveProperty('frequency');
+      expect(first).not.toHaveProperty('columns');
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Only the first 256 characters of a query are searched
+  // ------------------------------------------------------------------
+
+  describe('searched query length', () => {
+    const NOTICE = 'Only the first 256 characters of the query were searched.';
+
+    it('searches and echoes the first 256 characters and says so on both surfaces', async () => {
+      mockSearch.mockResolvedValue({ results: ranked(1), hasMore: false, status: settled(5459) });
+      const query = `${'coal generation '.repeat(16)}wind`;
+      const head = query.slice(0, 256);
+
+      const result = await runToolContract(searchRoutesTool, { query });
+
+      expect(result.isError).not.toBe(true);
+      // The service gets the whole query; route-cache reads the first 256 characters.
+      expect(mockSearch.mock.calls[0]?.[0]).toBe(query);
+      expect(result.structuredContent).toMatchObject({ effectiveQuery: head, notice: NOTICE });
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain(NOTICE);
+      expect(text).not.toContain('wind');
+    });
+
+    it('quotes the searched text in the no-match notice', async () => {
+      mockSearch.mockResolvedValue({ results: [], hasMore: false, status: settled(5459) });
+      const head = 'x'.repeat(256);
+
+      const result = await runToolContract(searchRoutesTool, { query: `${head}tail` });
+
+      expect((result.structuredContent as { notice: string }).notice).toBe(
+        `${NOTICE} No routes matched "${head}". Try different search terms or use eia_browse_routes to explore the taxonomy.`,
+      );
+    });
+
+    it('adds no notice to a query of exactly 256 characters', async () => {
+      mockSearch.mockResolvedValue({ results: ranked(1), hasMore: false, status: settled(5459) });
+      const query = `${'coal generation '.repeat(16).slice(0, 255)}x`;
+      expect(query).toHaveLength(256);
+
+      // Surrounding whitespace is trimmed before the length counts.
+      const result = await runToolContract(searchRoutesTool, { query: `  ${query}  ` });
+
+      expect(result.structuredContent).toMatchObject({ effectiveQuery: query });
+      expect(result.structuredContent).not.toHaveProperty('notice');
     });
   });
 

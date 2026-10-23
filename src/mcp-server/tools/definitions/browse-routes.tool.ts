@@ -70,6 +70,15 @@ export const browseRoutesTool = tool('eia_browse_routes', {
       recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
     },
     {
+      reason: 'upstream_timeout',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      when: 'EIA did not answer in time: one attempt passed 45 s, or the call passed its 56 s deadline across retries.',
+      recovery:
+        'Retry after a short wait — EIA is answering slowly; if it keeps timing out, check api.eia.gov availability.',
+    },
+    {
       reason: 'route_not_found',
       thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
@@ -81,7 +90,7 @@ export const browseRoutesTool = tool('eia_browse_routes', {
       thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
       retryable: true,
-      when: 'EIA rate limit hit (OVER_RATE_LIMIT) while building the route tree on the first call after server start, or on the live fetch of the browsed path a cold call falls back to.',
+      when: 'EIA rate limit hit (OVER_RATE_LIMIT) while building the route tree on the first call after server start, on the live fetch of the browsed path a cold call falls back to, or while re-fetching a path the warm could not fetch.',
       recovery: 'Back off and retry; use a production EIA API key for higher rate limits.',
     },
     {
@@ -89,7 +98,7 @@ export const browseRoutesTool = tool('eia_browse_routes', {
       thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
       retryable: true,
-      when: 'EIA could not be reached (connection refused or reset, DNS failure) while building the route tree on the first call after server start, or on the live fetch of the browsed path a cold call falls back to.',
+      when: 'EIA could not be reached (connection refused or reset, DNS failure) while building the route tree on the first call after server start, on the live fetch of the browsed path a cold call falls back to, or while re-fetching a path the warm could not fetch.',
       recovery:
         'Retry after a short wait — EIA could not be reached; if it keeps failing, check api.eia.gov availability.',
     },

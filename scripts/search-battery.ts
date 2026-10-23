@@ -34,7 +34,10 @@ export interface BatteryQuery {
  * measured directly; the middle group is multi-term questions against routes
  * that expose the matching facets; the last group is the single-concept
  * behavior #36 and the tool's own description promise, plus the named STEO and
- * SEDS series, which a candidate-gate change must leave standing.
+ * SEDS series, which a candidate-gate change must leave standing. Then come the
+ * four benchmarks the warm-time `series`, `product`, and `respondent` targets
+ * index, and a route named by the title words those targets' entries repeat
+ * (#78).
  */
 export const ON_TARGET: readonly BatteryQuery[] = [
   {
@@ -111,6 +114,31 @@ export const ON_TARGET: readonly BatteryQuery[] = [
     query: 'recoverable reserves',
     route: 'coal/reserves-capacity',
     note: "Verbatim phrase from the route's own description, buried deep enough in it to score badly.",
+  },
+  {
+    query: 'Henry Hub',
+    route: 'natural-gas/pri/fut',
+    note: 'A benchmark series name (RNGWHHD), indexed before any describe only by the warm-time series targets (#78); STEO forecasts of the same price compete for it.',
+  },
+  {
+    query: 'WTI crude spot price',
+    route: 'petroleum/pri/spt',
+    note: 'A benchmark product (EPCWTI) on the daily spot-price route (#78); STEO Brent ranked first without it.',
+  },
+  {
+    query: 'Cushing',
+    route: 'petroleum/pri/spt',
+    note: 'A place named only in series names (RWTC, "Cushing, OK WTI Spot Price FOB") — one term, so the phrase path alone scores it (#78).',
+  },
+  {
+    query: 'Electric Reliability Council of Texas',
+    route: 'electricity/rto/region-data',
+    note: 'An RTO respondent (ERCO) named in full (#78). Every RTO leaf carries the same entry at the same score, and tied results order by route path, so the expected route ranks fourth of four tied hits.',
+  },
+  {
+    query: 'weekly crude oil stocks',
+    route: 'petroleum/stoc/wstk',
+    note: 'A route named by its title words ("Weekly Stocks"). Every series and product of a weekly route repeats its title, so `weekly` reads as common unless that inherited text counts once per route (#78).',
   },
 ];
 

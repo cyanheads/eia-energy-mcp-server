@@ -2,7 +2,7 @@
 /**
  * @fileoverview Runs the `scripts/search-battery.ts` query battery against a
  * live, fully warmed EIA search corpus and reports what `eia_search_routes`
- * would answer with. Needs `EIA_API_KEY`; the warm costs 24–30 s and ~300
+ * would answer with. Needs `EIA_API_KEY`; the warm costs 20–40 s and ~380
  * upstream requests, so this is a deliberate measurement, not a devcheck step.
  *
  * It reports both search modes side by side — `phrase` is Fuse scoring the whole
@@ -82,9 +82,8 @@ function parseArgs(argv: string[]): {
 
 /**
  * Populate the index, either from the live API or from a snapshot of an earlier
- * warm. A replayed corpus carries every entry the warm produced; only the split
- * between route entries and appended ones is lost, which moves nothing but the
- * order of an exact score tie.
+ * warm. A replayed corpus carries every entry the warm produced and ranks as
+ * the warm did — no result order depends on where an entry sits in the index.
  */
 async function loadCorpus(corpus: string | undefined, snapshot: string | undefined): Promise<void> {
   if (corpus) {
@@ -95,7 +94,7 @@ async function loadCorpus(corpus: string | undefined, snapshot: string | undefin
   }
 
   initEiaApiService();
-  console.log('Warming the EIA search corpus — 24–30 s on a healthy upstream…');
+  console.log('Warming the EIA search corpus — 20–40 s on a healthy upstream…');
   const startedAt = Date.now();
   await getEiaApiService().search('warm', 1, createMockContext());
   const status = getIndexStatus();

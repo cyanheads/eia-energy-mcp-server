@@ -8,7 +8,10 @@
  * `offset` pages past the inline preview when the caller asks for a
  * canvas-bound row set, bounded by EIA_CANVAS_MAX_ROWS.
  * Facet values reach the search index from three directions: a bounded pass
- * over the vocabulary facets named in the route tree, one whole-facet pass per
+ * over the vocabulary facets named in the route tree (fuel and sector facets
+ * everywhere, plus `series`, `product`, and `respondent` on the routes that
+ * publish sub-monthly data — the daily and weekly petroleum and natural-gas
+ * routes and the hourly and daily RTO routes), one whole-facet pass per
  * `NAMED_SERIES_FACETS` entry (STEO and SEDS series), and every route the
  * caller describes. Only describe writes facet values to the per-route
  * metadata cache, which holds the full uncapped value set — the cap in
@@ -18,7 +21,14 @@
  * a caller-input failure, `uri_too_long`, never retried. A fetch that throws
  * before EIA answers — connection refused or reset, DNS failure — is
  * `upstream_unreachable` (ServiceUnavailable, retryable); a caller's abort
- * still propagates as cancellation.
+ * still propagates as cancellation. Every request is bounded in time: each
+ * attempt by `ATTEMPT_TIMEOUT_MS`, and every attempt, backoff, and chained
+ * request of a tool call by one `CALL_DEADLINE_MS` deadline set when browse,
+ * describe, or query is entered; EIA not answering in time is
+ * `upstream_timeout` (Timeout, retryable). A bound EIA answers with HTTP 500 —
+ * a `local-hourly` bound without its UTC offset, or one in the frequency's own
+ * period shape naming a month, day, or hour that does not exist — is refused
+ * as `invalid_period` before the request.
  *
  * The warm has two milestones. `ensureTreeWarmed` resolves once the route tree
  * is built — all browse, describe, and query need — or once
@@ -40,6 +50,12 @@
  * shared promise against its own signal, so a cancellation — or stateless
  * HTTP closing the transport once the response is sent — ends only that
  * caller's wait.
+ *
+ * A search query shaped like a legacy APIv1 series ID is looked up through
+ * `/v2/seriesid/{id}` before the search waits on the warm, under
+ * `SERIES_ID_LOOKUP_BUDGET_MS`: a hit answers without the index, so a cold
+ * server resolves it without warming. A 404 is the miss, never retried; any
+ * other classified failure degrades to the text search, disclosed.
  * @module services/eia/eia-service
  */
 
@@ -50,10 +66,12 @@ import {
   notFound,
   requestCancelled,
   serviceUnavailable,
+  timeout,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import {
   createPacer,
+  defaultIsTransient,
   httpErrorFromResponse,
   logger,
   type Pacer,
@@ -63,7 +81,9 @@ import {
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { impossiblePeriod, lacksUtcOffset } from './period-bounds.js';
 import {
+  frequenciesOf,
   getChildren,
   getIndexSize,
   getIndexStatus,
@@ -72,6 +92,7 @@ import {
   type IndexStatus,
   indexFacetValues,
   indexNamedSeries,
+  indexVocabularyFacet,
   initRouteCache,
   isLeafNode,
   isRouteCacheReady,
@@ -83,6 +104,12 @@ import {
   replaceNode,
   searchRoutes,
 } from './route-cache.js';
+import {
+  parseSeriesId,
+  type SeriesIdLookup,
+  SeriesIdResponseSchema,
+  seriesIdEntry,
+} from './series-id.js';
 import type {
   AccumulatedRows,
   DataColumn,
@@ -93,11 +120,10 @@ import type {
   RawFacetMeta,
   RawFacetResponse,
   RawFacetValue,
-  RawFrequency,
   RawRouteNode,
   RouteEntry,
   RouteMetadata,
-  SearchIndexEntry,
+  SearchResultEntry,
 } from './types.js';
 
 /**
@@ -109,7 +135,10 @@ const EIA_MAX_ROWS_PER_REQUEST = 5000;
 /**
  * Parallel `/facet/{id}` fetches allowed during the vocabulary pass. EIA
  * answers `OVER_RATE_LIMIT` to an unbounded burst, so the pass is deliberately
- * paced rather than fanned out with a single `Promise.all`.
+ * paced rather than fanned out with a single `Promise.all`. At this pace the
+ * pass (76 fetches against the live taxonomy) drew 4 rate-limit answers on one
+ * measured cold warm, all cleared by retry, against the tree build's 41 at
+ * `TREE_BUILD_CONCURRENCY`.
  */
 const FACET_INDEX_CONCURRENCY = 4;
 
@@ -126,8 +155,11 @@ export const TREE_BUILD_CONCURRENCY = 8;
 
 /**
  * Ceiling on how long `search` waits for the corpus. The whole warm lands in
- * 24–30 s measured over seven cold runs against the live API, so this never
- * fires on a healthy run. It bounds the degraded one: the serial sweep spends
+ * 24–30 s measured over seven cold runs against the live API. Growing the facet
+ * pass from 40 fetches to 76 adds a few seconds: one cold run on each side
+ * landed in 33 s before and 20 s after, the pass spending 8 s and 6 s of it,
+ * and the slower run's per-request latency puts the widened pass near 15 s.
+ * This never fires on a healthy run. It bounds the degraded one: the serial sweep spends
  * up to four attempts and ~7 s of backoff on each node it still cannot reach,
  * so the warm that loses nodes is also the warm that takes longest, and a call
  * held past the client's request timeout (60 s in the MCP SDK) fails as a
@@ -138,6 +170,18 @@ export const TREE_BUILD_CONCURRENCY = 8;
 const SEARCH_WARM_BUDGET_MS = 45_000;
 
 /**
+ * Ceiling on a search's series-ID lookup, every attempt and backoff included,
+ * counted from search entry. Healthy `/v2/seriesid` answers took 0.09–1.2 s
+ * over 15 live probes, so this cuts only a stalled lookup, while leaving room
+ * for all three of `withRetry`'s retries of a rate-limited or 5xx one (about
+ * 7 s of backoff). The warm wait that follows a miss is counted from the same
+ * entry against `SEARCH_WARM_BUDGET_MS`, so a lookup that spends all of this
+ * still leaves the fallback search 35 s and the whole call inside the same
+ * 45 s ceiling.
+ */
+const SERIES_ID_LOOKUP_BUDGET_MS = 10_000;
+
+/**
  * Ceiling on how long browse, describe, and query wait for the route tree,
  * counted from the start of the build, before answering from a live fetch of
  * the one route they need. Unlike search, each has that fallback, and it is
@@ -145,11 +189,39 @@ const SEARCH_WARM_BUDGET_MS = 45_000;
  * metadata request, and browse fetches the path plus each child it has to
  * classify. The wait is held well inside the MCP SDK's
  * 60 s client request timeout so the fallback has room to answer on a degraded
- * upstream. A healthy warm (17–30 s measured) can outlast it; the caller then
+ * upstream. A healthy warm (20–40 s measured) can outlast it; the caller then
  * pays those few requests instead of the rest of the warm, which keeps running
  * for every later call.
  */
 export const ROUTE_WARM_BUDGET_MS = 20_000;
+
+/**
+ * Ceiling on one request attempt, headers and body together. Healthy EIA
+ * answers on a cold (uncached) 5,000-row data page took 5–9 s measured, but a
+ * deep offset is slow at any length: `electricity/rto/fuel-type-data` at offset
+ * 6,000,000 answered 200 in 35.5 s and `electricity/facility-fuel` at 8,000,000
+ * in 34.5 s, while EIA's own gateway gave up on others with HTTP 503 after
+ * 33–41 s. The cut sits past that gateway, so an attempt is cut only when EIA
+ * would not have answered at all, and the 503 path still leaves a retry room
+ * to land within the deadline. A timed-out attempt is transient and retried
+ * within the deadline.
+ */
+const ATTEMPT_TIMEOUT_MS = 45_000;
+
+/**
+ * One deadline across every attempt, backoff, and chained request of a tool
+ * call — the route-tree wait, a metadata request, the data page, staging pages,
+ * describe's facet fetches — counted from the moment the service method is
+ * entered. Held 4 s inside the MCP SDK's 60 s client request timeout, so the
+ * caller gets the server's classified `upstream_timeout` and its recovery hint
+ * rather than a transport error. The margin covers response shaping and canvas
+ * registration, measured under 1 s for a 25,000-row stage, and no more: a
+ * healthy wide-route stage runs close to the client timeout
+ * (`electricity/operating-generator-capacity` stages 25,000 rows in six 8–10 s
+ * requests, about 54 s), and every second of margin cuts one. Each warm
+ * request, which belongs to no call, gets a deadline of the same length of its own.
+ */
+const CALL_DEADLINE_MS = 56_000;
 
 /** The error a caller's wait on the shared warm rejects with when its own signal aborts. */
 function cancelledWait(signal: AbortSignal): McpError {
@@ -344,17 +416,7 @@ function routeMetadataOf(
   facets: Facet[],
   unfetchedFacets: string[] = [],
 ): RouteMetadata {
-  // EIA returns `frequency` as an array on every route in the standard
-  // taxonomy, but the field is not contractually an array — the same
-  // shape-variance `dataColumnsOf` absorbs. An object map is flattened to its
-  // values; anything else degrades to an empty list rather than reaching
-  // `frequencies.map` downstream as a non-array.
-  const rawFrequency = raw.frequency;
-  const frequencies: RawFrequency[] = Array.isArray(rawFrequency)
-    ? rawFrequency
-    : rawFrequency && typeof rawFrequency === 'object'
-      ? Object.values(rawFrequency)
-      : [];
+  const frequencies = frequenciesOf(raw);
 
   return {
     route,
@@ -419,6 +481,60 @@ function unreachable(cause: unknown): McpError {
     { reason: 'upstream_unreachable', retryable: true },
     { cause },
   );
+}
+
+/**
+ * The failure for EIA not answering in the time a request is allowed: one
+ * attempt past `ATTEMPT_TIMEOUT_MS`, or a call past its deadline. Transient, so
+ * `withRetry` retries an attempt timeout while the deadline lasts, and
+ * retryable to the caller once it runs out.
+ */
+function upstreamTimeout(message: string, cause?: unknown): McpError {
+  return timeout(
+    message,
+    { reason: 'upstream_timeout', retryable: true },
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/**
+ * Refuse a query whose start or end EIA answers with HTTP 500 — never with
+ * rows — at `frequency`: a `local-hourly` bound without its UTC offset, or a
+ * bound in the frequency's own period shape naming a month, day, or hour that
+ * does not exist (see `impossiblePeriod`). Sent, either would read as an outage
+ * and be retried, so it fails as `invalid_period` before the request.
+ */
+function assertPeriodBounds(
+  frequency: string | undefined,
+  bounds: { start?: string | undefined; end?: string | undefined },
+): void {
+  if (frequency === undefined) return;
+  for (const side of ['start', 'end'] as const) {
+    const value = bounds[side];
+    if (value === undefined) continue;
+    if (frequency === 'local-hourly' && lacksUtcOffset(value)) {
+      throw validationError(
+        `At local-hourly frequency EIA needs each bound as YYYY-MM-DDTHH±HH; ${side} ${JSON.stringify(value)} has no UTC offset.`,
+        {
+          reason: 'invalid_period',
+          recovery: {
+            hint: 'Write each local-hourly bound with its hour and UTC offset — "2024-02-01T02-06" is 02:00 at UTC−6, "2024-02-01T08+00" is 08:00 UTC — or query frequency "hourly", whose bounds are UTC hours such as "2024-02-01T08".',
+          },
+        },
+      );
+    }
+    const problem = impossiblePeriod(value, frequency);
+    if (problem === undefined) continue;
+    throw validationError(
+      `At ${frequency} frequency EIA cannot read ${side} ${JSON.stringify(value)}: it has ${problem}.`,
+      {
+        reason: 'invalid_period',
+        recovery: {
+          hint: 'Write each bound as a period that exists — a month 01–12, a day the month has (February 29 only in leap years), and an hour of two digits, 00–23 — e.g. "2024-02-29" or "2024-02-01T23".',
+        },
+      },
+    );
+  }
 }
 
 /**
@@ -503,106 +619,160 @@ class EiaApiService {
     return url.toString();
   }
 
-  private fetchJson<T>(
+  /**
+   * GET one EIA endpoint and parse it, retried on transient failures. Each
+   * attempt — headers and body — is cut at `ATTEMPT_TIMEOUT_MS`, and every
+   * attempt and backoff shares the deadline `deadlineAt` (epoch ms): a tool
+   * call passes the one it set on entry, so its chained requests share it, and
+   * a warm request gets `CALL_DEADLINE_MS` of its own. Throws `upstream_timeout`
+   * when EIA does not answer in time; a caller's abort stays a cancellation.
+   */
+  private async fetchJson<T>(
     path: string,
-    params: Record<string, string | string[]> = {},
+    params: Record<string, string | string[]>,
     scope: CallScope,
+    deadlineAt = Date.now() + CALL_DEADLINE_MS,
   ): Promise<T> {
     const url = this.buildUrl(path, params);
-    return withRetry(
-      async () => {
-        let response: Response;
-        let text: string;
-        try {
-          response = await fetch(url, { signal: scope.signal });
-          text = await response.text();
-        } catch (err) {
-          // A caller's abort stays a cancellation; anything else thrown before
-          // EIA answered is a transport failure, retried like any outage.
-          if (scope.signal.aborted) throw err;
-          throw unreachable(err);
-        }
+    const budgetMs = deadlineAt - Date.now();
+    if (budgetMs <= 0) {
+      throw upstreamTimeout(
+        `EIA did not answer in time — this call's ${CALL_DEADLINE_MS / 1000} s deadline passed before this request could start.`,
+      );
+    }
+    try {
+      return await withRetry(
+        ({ signal, remainingMs }) => this.attemptJson<T>(url, signal, remainingMs),
+        {
+          operation: 'EiaApiService.fetchJson',
+          baseDelayMs: 1000,
+          context: scope,
+          signal: scope.signal,
+          deadlineMs: budgetMs,
+        },
+      );
+    } catch (err) {
+      // The deadline expiring mid-attempt or mid-backoff is EIA not answering in
+      // time, carried under the reason the tools declare.
+      if (
+        !scope.signal.aborted &&
+        err instanceof McpError &&
+        err.data?.reason === 'retry_deadline_exceeded'
+      ) {
+        const attempts = Number(err.data.retryAttempts);
+        throw upstreamTimeout(
+          `EIA did not answer in time — the ${CALL_DEADLINE_MS / 1000} s deadline ran out during this request, after ${attempts} attempt${attempts === 1 ? '' : 's'}.`,
+          err,
+        );
+      }
+      throw err;
+    }
+  }
 
-        // EIA refuses a request line past about 8 KB with an HTML 414 page. The
-        // same URI fails the same way on every attempt, so it is never retried.
-        // Status decides every non-OK answer; only a 200 body that fails to
-        // parse as JSON is classified from its contents.
-        if (response.status === 414) {
-          throw validationError(
-            `EIA rejected the request as too long (HTTP 414): its URI ran to ${url.length.toLocaleString('en-US')} characters, past EIA's limit of about 8 KB.`,
-            { reason: 'uri_too_long', retryable: false },
-          );
-        }
+  /**
+   * One attempt of `fetchJson`: fetch, read, classify, parse. `retrySignal`
+   * carries the caller's signal and the retry deadline; the attempt adds its
+   * own `ATTEMPT_TIMEOUT_MS` cut, held to what the deadline has left.
+   */
+  private async attemptJson<T>(
+    url: string,
+    retrySignal: AbortSignal,
+    remainingMs: number,
+  ): Promise<T> {
+    const attemptMs = Math.min(ATTEMPT_TIMEOUT_MS, remainingMs);
+    const attempt = new AbortController();
+    const timer = setTimeout(() => attempt.abort(), attemptMs);
+    let response: Response;
+    let text: string;
+    try {
+      const signal = AbortSignal.any([retrySignal, attempt.signal]);
+      response = await fetch(url, { signal });
+      text = await response.text();
+    } catch (err) {
+      // A caller's abort stays a cancellation, and an expired deadline is
+      // classified by withRetry; the attempt's own cut is a timeout, and
+      // anything else thrown before EIA answered is a transport failure, each
+      // retried like any outage.
+      if (retrySignal.aborted) throw err;
+      if (attempt.signal.aborted) {
+        throw upstreamTimeout(`EIA did not answer within ${Math.round(attemptMs / 1000)} s.`, err);
+      }
+      throw unreachable(err);
+    } finally {
+      clearTimeout(timer);
+    }
 
-        if (!response.ok) {
-          if (response.status === 429 || text.includes('OVER_RATE_LIMIT')) {
-            throw serviceUnavailable('EIA rate limit exceeded.', {
-              reason: 'rate_limited',
-              retryable: true,
-            });
-          }
+    // EIA refuses a request line past about 8 KB with an HTML 414 page. The
+    // same URI fails the same way on every attempt, so it is never retried.
+    // Status decides every non-OK answer; only a 200 body that fails to
+    // parse as JSON is classified from its contents.
+    if (response.status === 414) {
+      throw validationError(
+        `EIA rejected the request as too long (HTTP 414): its URI ran to ${url.length.toLocaleString('en-US')} characters, past EIA's limit of about 8 KB.`,
+        { reason: 'uri_too_long', retryable: false },
+      );
+    }
 
-          // Parse EIA's error body — it often includes an actionable message.
-          // Shape: { error: string, code: number } or plain text.
-          let upstreamMessage: string | undefined;
-          try {
-            const errBody = JSON.parse(text) as Record<string, unknown>;
-            if (typeof errBody.error === 'string') upstreamMessage = errBody.error;
-          } catch {
-            // non-JSON body — ignore
-          }
+    if (!response.ok) {
+      if (response.status === 429 || text.includes('OVER_RATE_LIMIT')) {
+        throw serviceUnavailable('EIA rate limit exceeded.', {
+          reason: 'rate_limited',
+          retryable: true,
+        });
+      }
 
-          const detail = upstreamMessage
-            ? `EIA API error: ${upstreamMessage}`
-            : `EIA API returned HTTP ${response.status}.`;
+      // Parse EIA's error body — it often includes an actionable message.
+      // Shape: { error: string, code: number } or plain text.
+      let upstreamMessage: string | undefined;
+      try {
+        const errBody = JSON.parse(text) as Record<string, unknown>;
+        if (typeof errBody.error === 'string') upstreamMessage = errBody.error;
+      } catch {
+        // non-JSON body — ignore
+      }
 
-          const error = await httpErrorFromResponse(response, {
-            service: 'EIA',
-            captureBody: false,
-            codeOverride: (status) =>
-              status === 400 ? JsonRpcErrorCode.ValidationError : undefined,
-          });
-          error.message = detail;
-          if (error.code === JsonRpcErrorCode.ServiceUnavailable && response.status !== 501) {
-            throw serviceUnavailable(
-              detail,
-              { ...error.data, reason: 'upstream_unavailable', retryable: true },
-              { cause: error },
-            );
-          }
-          throw error;
-        }
+      const detail = upstreamMessage
+        ? `EIA API error: ${upstreamMessage}`
+        : `EIA API returned HTTP ${response.status}.`;
 
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          throw serviceUnavailable('EIA API returned non-JSON response.', {
-            reason: 'upstream_invalid_response',
-            retryable: true,
-          });
-        }
+      const error = await httpErrorFromResponse(response, {
+        service: 'EIA',
+        captureBody: false,
+        codeOverride: (status) => (status === 400 ? JsonRpcErrorCode.ValidationError : undefined),
+      });
+      error.message = detail;
+      if (error.code === JsonRpcErrorCode.ServiceUnavailable && response.status !== 501) {
+        throw serviceUnavailable(
+          detail,
+          { ...error.data, reason: 'upstream_unavailable', retryable: true },
+          { cause: error },
+        );
+      }
+      throw error;
+    }
 
-        const parsedResponse =
-          typeof parsed === 'object' && parsed !== null && 'response' in parsed
-            ? (parsed as { response: unknown }).response
-            : undefined;
-        if (typeof parsedResponse === 'string' && parsedResponse.includes('OVER_RATE_LIMIT')) {
-          throw serviceUnavailable('EIA rate limit exceeded (OVER_RATE_LIMIT).', {
-            reason: 'rate_limited',
-            retryable: true,
-          });
-        }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw serviceUnavailable('EIA API returned non-JSON response.', {
+        reason: 'upstream_invalid_response',
+        retryable: true,
+      });
+    }
 
-        return parsed as T;
-      },
-      {
-        operation: 'EiaApiService.fetchJson',
-        baseDelayMs: 1000,
-        context: scope,
-        signal: scope.signal,
-      },
-    );
+    const parsedResponse =
+      typeof parsed === 'object' && parsed !== null && 'response' in parsed
+        ? (parsed as { response: unknown }).response
+        : undefined;
+    if (typeof parsedResponse === 'string' && parsedResponse.includes('OVER_RATE_LIMIT')) {
+      throw serviceUnavailable('EIA rate limit exceeded (OVER_RATE_LIMIT).', {
+        reason: 'rate_limited',
+        retryable: true,
+      });
+    }
+
+    return parsed as T;
   }
 
   /**
@@ -783,12 +953,18 @@ class EiaApiService {
     scope.log.info('EIA search corpus warmed', { passes, ...getIndexStatus() });
   }
 
+  /**
+   * Resolve `nodes` and their descendants. `deadlineAt` is the deadline of the
+   * tool call repairing a node; the warm passes none, so each of its requests
+   * gets one of its own.
+   */
   private buildRouteTree(
     nodes: RawRouteNode[],
     gate: Pacer,
     scope: CallScope,
     depth = 0,
     parentPath = '',
+    deadlineAt?: number,
   ): Promise<RawRouteNode[]> {
     // Limit recursion depth to avoid excessive API calls
     if (depth > 5) return Promise.resolve(nodes);
@@ -796,7 +972,7 @@ class EiaApiService {
     return Promise.all(
       nodes.map(async (node): Promise<RawRouteNode> => {
         const nodePath = parentPath ? `${parentPath}/${node.id}` : node.id;
-        const resolved = await this.resolveNode(node, nodePath, gate, scope);
+        const resolved = await this.resolveNode(node, nodePath, gate, scope, deadlineAt);
         if (!resolved.routes?.length) return resolved;
         const children = await this.buildRouteTree(
           resolved.routes,
@@ -804,6 +980,7 @@ class EiaApiService {
           scope,
           depth + 1,
           nodePath,
+          deadlineAt,
         );
         return { ...resolved, routes: children };
       }),
@@ -820,6 +997,7 @@ class EiaApiService {
     nodePath: string,
     gate: Pacer,
     scope: CallScope,
+    deadlineAt?: number,
   ): Promise<RawRouteNode> {
     if (node.routes?.length || node.frequency || node.facets || node.data) return node;
 
@@ -827,13 +1005,8 @@ class EiaApiService {
     // node is marked incomplete rather than kept as a bare stub — a stub
     // carries none of routes/facets/data and would read as a queryable leaf,
     // hiding both the real children and the fact that anything went wrong.
-    let fetched: RawRouteNode | undefined;
     try {
-      const resp = await gate.run(
-        () => this.fetchJson<{ response: RawRouteNode }>(nodePath, {}, scope),
-        { signal: scope.signal },
-      );
-      fetched = resp?.response;
+      return await this.fetchNode(node, nodePath, gate, scope, deadlineAt);
     } catch (err) {
       // A caller's abort is a cancellation, never a node EIA failed to answer.
       if (scope.signal.aborted) throw err;
@@ -843,9 +1016,32 @@ class EiaApiService {
       });
       return { ...node, incomplete: true };
     }
+  }
+
+  /**
+   * One paced metadata request for a bare stub, merged with it. Throws the
+   * request's own classified failure, and `upstream_invalid_response` when EIA
+   * answers without a route envelope.
+   */
+  private async fetchNode(
+    node: RawRouteNode,
+    nodePath: string,
+    gate: Pacer,
+    scope: CallScope,
+    deadlineAt?: number,
+  ): Promise<RawRouteNode> {
+    const resp = await gate.run(
+      () => this.fetchJson<{ response?: RawRouteNode }>(nodePath, {}, scope, deadlineAt),
+      { signal: scope.signal },
+    );
+    const fetched = resp?.response;
     if (!fetched) {
-      scope.log.warning('EIA route metadata was empty — subtree unknown', { route: nodePath });
-      return { ...node, incomplete: true };
+      throw serviceUnavailable(`EIA did not return metadata for route "${nodePath}".`, {
+        reason: 'upstream_invalid_response',
+        retryable: true,
+        route: nodePath,
+        recovery: { hint: 'Retry the call; if it persists, check api.eia.gov availability.' },
+      });
     }
 
     // Preserve id and name from the stub — EIA leaf responses use the domain
@@ -858,32 +1054,41 @@ class EiaApiService {
   /**
    * Re-fetch a node whose warm-time metadata fetch failed and splice the result
    * into the cached tree. The miss is not held for the process lifetime — the
-   * first call that needs the node pays one request to repair it. Throws when
-   * the re-fetch fails too, rather than answering from the stub.
+   * first call that needs the node pays one request to repair it. When the
+   * re-fetch fails too, its own failure is thrown rather than answering from
+   * the stub — `rate_limited`, `upstream_unreachable`, `upstream_unavailable`,
+   * `upstream_timeout`, or `upstream_invalid_response` for an answer that is
+   * not route metadata — and a 404 is `route_not_found`. The node's children
+   * resolve as the warm resolves them: one that fails is kept incomplete.
    */
-  private async repairNode(path: string, ctx: Context): Promise<RawRouteNode> {
+  private async repairNode(path: string, ctx: Context, deadlineAt: number): Promise<RawRouteNode> {
     const stub = getNode(path);
     if (!stub) throw routeNotFound(path);
 
     ctx.log.info('Re-fetching a route left incomplete by the warm', { route: path });
-    const parentPath = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
     using gate = createPacer({ name: 'eia-node-repair', maxConcurrent: TREE_BUILD_CONCURRENCY });
-    const [repaired] = await this.buildRouteTree(
-      [stub],
-      gate,
-      ctx,
-      path.split('/').length - 1,
-      parentPath,
-    );
-
-    if (!repaired || repaired.incomplete) {
-      throw serviceUnavailable(`EIA did not return metadata for route "${path}".`, {
-        reason: 'upstream_invalid_response',
-        retryable: true,
-        route: path,
-        recovery: { hint: 'Retry the call; if it persists, check api.eia.gov availability.' },
-      });
+    let node: RawRouteNode;
+    try {
+      node = await this.fetchNode(stub, path, gate, ctx, deadlineAt);
+    } catch (err) {
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        throw routeNotFound(path);
+      }
+      throw err;
     }
+    const repaired: RawRouteNode = node.routes?.length
+      ? {
+          ...node,
+          routes: await this.buildRouteTree(
+            node.routes,
+            gate,
+            ctx,
+            path.split('/').length,
+            path,
+            deadlineAt,
+          ),
+        }
+      : node;
 
     replaceNode(path, repaired);
     return repaired;
@@ -920,11 +1125,17 @@ class EiaApiService {
    * omits `name`, so the facet read as having none. The fallback is also what
    * keeps the non-null `id`/`name` contract the describe output schema declares.
    */
-  private async fetchFacet(route: string, meta: RawFacetMeta, scope: CallScope): Promise<Facet> {
+  private async fetchFacet(
+    route: string,
+    meta: RawFacetMeta,
+    scope: CallScope,
+    deadlineAt?: number,
+  ): Promise<Facet> {
     const resp = await this.fetchJson<{ response: RawFacetResponse }>(
       `${route}/facet/${meta.id}`,
       {},
       scope,
+      deadlineAt,
     );
     return {
       id: meta.id,
@@ -947,10 +1158,14 @@ class EiaApiService {
 
   /**
    * Fetch and index the values of the vocabulary facets named in the route
-   * tree — fuel types, sectors, coal ranks — so a query naming one resolves to
-   * the route that exposes it. Bounded on both sides: `listVocabularyFacets()`
-   * selects a fraction of the taxonomy's facets, and each fetch is paced by
-   * `FACET_INDEX_CONCURRENCY`. A facet that fails is skipped, as `describe()`
+   * tree — fuel types, sectors, coal ranks, and the `series`, `product`, and
+   * `respondent` values of the routes publishing sub-monthly data (daily and
+   * weekly petroleum and natural gas, hourly and daily RTO) — so a query naming
+   * one resolves to the route that exposes it.
+   * Bounded on both sides: `listVocabularyFacets()` selects a fraction of the
+   * taxonomy's facets, and each fetch is paced by `FACET_INDEX_CONCURRENCY`.
+   * `indexVocabularyFacet` holds each to the 200-value bound but `series`,
+   * which is indexed whole. A facet that fails is skipped, as `describe()`
    * records a failed facet leg rather than failing the route — and it
    * is returned, because a skipped facet leaves vocabulary out of the corpus:
    * the caller is entitled to know the pass fell short, and a retry re-fetches
@@ -973,7 +1188,7 @@ class EiaApiService {
             () => this.fetchFacet(route, { id: facetId, description }, scope),
             { signal: scope.signal },
           );
-          indexed += indexFacetValues(route, [facet]);
+          indexed += indexVocabularyFacet(route, facet);
         } catch (err) {
           failed.push(target);
           scope.log.warning('EIA facet fetch failed — vocabulary missing from the index', {
@@ -1010,14 +1225,17 @@ class EiaApiService {
     children: RouteEntry[];
     isLeaf: boolean;
   }> {
+    const deadlineAt = Date.now() + CALL_DEADLINE_MS;
     const normalizedPath = normalizeRoutePath(path ?? '');
-    if (!(await this.ensureTreeWarmed(ctx))) return this.browseLive(normalizedPath, ctx);
+    if (!(await this.ensureTreeWarmed(ctx))) {
+      return this.browseLive(normalizedPath, ctx, deadlineAt);
+    }
 
     // Check if the path itself is a leaf
     if (normalizedPath) {
       let node = getNode(normalizedPath);
       if (!node) throw routeNotFound(normalizedPath);
-      if (node.incomplete) node = await this.repairNode(normalizedPath, ctx);
+      if (node.incomplete) node = await this.repairNode(normalizedPath, ctx, deadlineAt);
       if (isLeafNode(node)) return { path: normalizedPath, children: [], isLeaf: true };
     }
 
@@ -1041,10 +1259,12 @@ class EiaApiService {
   private async browseLive(
     path: string,
     ctx: Context,
+    deadlineAt: number,
   ): Promise<{ path: string; children: RouteEntry[]; isLeaf: boolean }> {
     let node: RawRouteNode | undefined;
     try {
-      node = (await this.fetchJson<{ response?: RawRouteNode }>(path, {}, ctx))?.response;
+      node = (await this.fetchJson<{ response?: RawRouteNode }>(path, {}, ctx, deadlineAt))
+        ?.response;
     } catch (err) {
       if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
         throw routeNotFound(path);
@@ -1065,7 +1285,7 @@ class EiaApiService {
     const children = await Promise.all(
       (node.routes ?? []).map(async (stub): Promise<RouteEntry> => {
         const route = path ? `${path}/${stub.id}` : stub.id;
-        const child = await this.resolveNode(stub, route, gate, ctx);
+        const child = await this.resolveNode(stub, route, gate, ctx, deadlineAt);
         return {
           id: stub.id,
           name: child.name,
@@ -1097,6 +1317,7 @@ class EiaApiService {
     ctx: Context,
     opts: { facet?: string } = {},
   ): Promise<RouteMetadata> {
+    const deadlineAt = Date.now() + CALL_DEADLINE_MS;
     const normalizedRoute = normalizeRoutePath(route);
 
     const cached = _routeMetaCache.get(normalizedRoute);
@@ -1117,8 +1338,9 @@ class EiaApiService {
     }
 
     const { meta, failures } = await this.fetchFacetValues(
-      cached ?? (await this.fetchRouteMetadata(normalizedRoute, ctx)),
+      cached ?? (await this.fetchRouteMetadata(normalizedRoute, ctx, deadlineAt)),
       ctx,
+      deadlineAt,
     );
     if (opts.facet !== undefined && failures.has(opts.facet)) {
       throw facetUnavailable(meta.route, opts.facet, failures.get(opts.facet));
@@ -1132,10 +1354,14 @@ class EiaApiService {
    * facet named in `unfetchedFacets`. A 404 becomes `route_not_found` and a
    * category `route_not_queryable`. Nothing is cached here.
    */
-  private async fetchRouteMetadata(route: string, ctx: Context): Promise<RouteMetadata> {
+  private async fetchRouteMetadata(
+    route: string,
+    ctx: Context,
+    deadlineAt: number,
+  ): Promise<RouteMetadata> {
     let metaRespRaw: { response: RawRouteNode } | undefined;
     try {
-      metaRespRaw = await this.fetchJson<{ response: RawRouteNode }>(route, {}, ctx);
+      metaRespRaw = await this.fetchJson<{ response: RawRouteNode }>(route, {}, ctx, deadlineAt);
     } catch (err) {
       if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
         throw routeNotFound(
@@ -1174,8 +1400,12 @@ class EiaApiService {
    * route's data columns. Every facet stays in `unfetchedFacets`, so the entry
    * never reads as a described route and the next describe fetches the lists.
    */
-  private async cacheRouteMetadata(route: string, ctx: Context): Promise<RouteMetadata> {
-    const meta = await this.fetchRouteMetadata(route, ctx);
+  private async cacheRouteMetadata(
+    route: string,
+    ctx: Context,
+    deadlineAt: number,
+  ): Promise<RouteMetadata> {
+    const meta = await this.fetchRouteMetadata(route, ctx, deadlineAt);
     // A describe that landed while this request was in flight holds more — keep it.
     const landed = _routeMetaCache.get(route);
     if (landed) return landed;
@@ -1193,6 +1423,7 @@ class EiaApiService {
   private async fetchFacetValues(
     meta: RouteMetadata,
     ctx: Context,
+    deadlineAt: number,
   ): Promise<{ meta: RouteMetadata; failures: Map<string, unknown> }> {
     const pending = new Set(meta.unfetchedFacets);
     const failures = new Map<string, unknown>();
@@ -1200,7 +1431,7 @@ class EiaApiService {
       meta.facets.map(async (facet): Promise<Facet> => {
         if (!pending.has(facet.id)) return facet;
         try {
-          return await this.fetchFacet(meta.route, facet, ctx);
+          return await this.fetchFacet(meta.route, facet, ctx, deadlineAt);
         } catch (err) {
           if (ctx.signal.aborted) throw err;
           failures.set(facet.id, err);
@@ -1282,7 +1513,10 @@ class EiaApiService {
     },
     ctx: Context,
   ): Promise<DataResponse> {
+    const deadlineAt = Date.now() + CALL_DEADLINE_MS;
     const normalizedRoute = normalizeRoutePath(route);
+    // An explicit frequency is checked before any request, the warm included.
+    assertPeriodBounds(opts.frequency, opts);
 
     // Pre-flight: if the route is in the cache as a category node, fail early
     // with a typed error rather than letting the EIA API return a generic 404.
@@ -1312,7 +1546,9 @@ class EiaApiService {
     // failing a category as route_not_queryable and supplying the columns.
     const known =
       this.knownColumnIds(normalizedRoute, cachedNode) ??
-      (treeReady ? undefined : columnIdsOf(await this.cacheRouteMetadata(normalizedRoute, ctx)));
+      (treeReady
+        ? undefined
+        : columnIdsOf(await this.cacheRouteMetadata(normalizedRoute, ctx, deadlineAt)));
     const projection =
       known && opts.columns
         ? opts.columns.filter(
@@ -1329,7 +1565,8 @@ class EiaApiService {
     // query does not use and which cost one request per facet.
     const columnsToRequest =
       appliedColumns ??
-      (known ?? columnIdsOf(await this.cacheRouteMetadata(normalizedRoute, ctx))).dataColumnIds;
+      (known ?? columnIdsOf(await this.cacheRouteMetadata(normalizedRoute, ctx, deadlineAt)))
+        .dataColumnIds;
     if (columnsToRequest.length) {
       params['data[]'] = columnsToRequest;
     }
@@ -1349,7 +1586,25 @@ class EiaApiService {
     const offset = opts.offset ?? 0;
     const length = opts.length ?? 100;
 
-    const first = await this.fetchDataPage(normalizedRoute, params, offset, length, ctx);
+    // An omitted frequency is the route's default, read from what this process
+    // already holds; with neither the node nor its metadata, EIA judges the bounds.
+    if (opts.frequency === undefined) {
+      assertPeriodBounds(
+        cachedNode?.defaultFrequency ?? _routeMetaCache.get(normalizedRoute)?.defaultFrequency,
+        opts,
+      );
+    }
+
+    const firstStartedAt = Date.now();
+    const first = await this.fetchDataPage(
+      normalizedRoute,
+      params,
+      offset,
+      length,
+      ctx,
+      deadlineAt,
+    );
+    const firstPageMs = Date.now() - firstStartedAt;
     const total = parseInt(first.response.total ?? '0', 10);
     const data: DataRow[] = first.response.data ?? [];
 
@@ -1399,8 +1654,9 @@ class EiaApiService {
       result.accumulated = await this.accumulatePages(
         normalizedRoute,
         params,
-        { offset, total, first: data },
+        { offset, total, first: data, firstPageMs },
         ctx,
+        deadlineAt,
       );
     }
 
@@ -1419,11 +1675,12 @@ class EiaApiService {
     offset: number,
     length: number,
     ctx: Context,
+    deadlineAt: number,
   ): Promise<DataPage> {
     const pageParams = { ...params, offset: String(offset), length: String(length) };
     let resp: Partial<DataPage>;
     try {
-      resp = await this.fetchJson<Partial<DataPage>>(`${route}/data/`, pageParams, ctx);
+      resp = await this.fetchJson<Partial<DataPage>>(`${route}/data/`, pageParams, ctx, deadlineAt);
     } catch (err) {
       if (err instanceof McpError) {
         if (err.code === JsonRpcErrorCode.NotFound) {
@@ -1468,31 +1725,52 @@ class EiaApiService {
    * Accumulation only widens what reaches the canvas, so a page that fails
    * after retries keeps the rows already gathered rather than discarding a
    * preview the caller has in hand — the tool's note reports the real staged
-   * count and the offset to resume from. A caller-side abort still propagates.
+   * count and the offset to resume from. The pages share the call's deadline,
+   * and a page is never started when less of it remains than the slowest page
+   * this call has fetched (the preview included) took, so staging stops with
+   * the rows in hand instead of spending the rest of the call on a page the
+   * deadline would abort. That stop, and a page that stalls past the deadline
+   * anyway, set `timedOut`. A caller-side abort still propagates.
    */
   private async accumulatePages(
     route: string,
     params: Record<string, string | string[]>,
-    seed: { offset: number; total: number; first: DataRow[] },
+    seed: { offset: number; total: number; first: DataRow[]; firstPageMs: number },
     ctx: Context,
+    deadlineAt: number,
   ): Promise<AccumulatedRows> {
     const cap = getServerConfig().canvasMaxRows;
     const rows = [...seed.first];
     let nextOffset = seed.offset + seed.first.length;
     let capped = false;
+    let timedOut = false;
+    let slowestPageMs = seed.firstPageMs;
 
     while (nextOffset < seed.total) {
       if (rows.length >= cap) {
         capped = true;
         break;
       }
+      const startedAt = Date.now();
+      if (deadlineAt - startedAt < slowestPageMs) {
+        timedOut = true;
+        ctx.log.warning('EIA canvas accumulation stopped before the call deadline', {
+          route,
+          nextOffset,
+          staged: rows.length,
+          remainingMs: deadlineAt - startedAt,
+          slowestPageMs,
+        });
+        break;
+      }
       const pageSize = Math.min(EIA_MAX_ROWS_PER_REQUEST, cap - rows.length);
       let pageRows: DataRow[];
       try {
-        const page = await this.fetchDataPage(route, params, nextOffset, pageSize, ctx);
+        const page = await this.fetchDataPage(route, params, nextOffset, pageSize, ctx, deadlineAt);
         pageRows = page.response.data ?? [];
       } catch (err) {
         if (ctx.signal.aborted) throw err;
+        timedOut = err instanceof McpError && err.data?.reason === 'upstream_timeout';
         ctx.log.warning('EIA canvas accumulation stopped early', {
           route,
           nextOffset,
@@ -1501,6 +1779,7 @@ class EiaApiService {
         });
         break;
       }
+      slowestPageMs = Math.max(slowestPageMs, Date.now() - startedAt);
       rows.push(...pageRows);
       nextOffset += pageRows.length;
       // A short page — including an empty one — means the data ran out.
@@ -1512,9 +1791,67 @@ class EiaApiService {
       staged: rows.length,
       total: seed.total,
       capped,
+      timedOut,
     });
 
-    return { cap, capped, rows };
+    return { cap, capped, rows, ...(timedOut && { timedOut: true as const }) };
+  }
+
+  /**
+   * Resolve a legacy APIv1 series ID through `/v2/seriesid/{id}`, every
+   * attempt held to `deadlineAt`. A 404 — or a 400 or 414, EIA refusing the ID
+   * as written — is the miss, and `withRetry` never retries those. Any other
+   * classified failure — a timeout, 5xx, rate limit, or unreachable host once
+   * the retries are spent, or an answer missing the fields the result is built
+   * from — is reported as failed, so the search falls back to text. A caller's
+   * abort and an unclassified throw propagate.
+   */
+  private async lookupSeriesId(
+    seriesId: string,
+    ctx: Context,
+    deadlineAt: number,
+  ): Promise<SeriesIdLookup> {
+    let raw: unknown;
+    try {
+      raw = await this.fetchJson<unknown>(`seriesid/${seriesId}`, { length: '1' }, ctx, deadlineAt);
+    } catch (err) {
+      if (ctx.signal.aborted || !(err instanceof McpError)) throw err;
+      if (err.code === JsonRpcErrorCode.NotFound || err.code === JsonRpcErrorCode.ValidationError)
+        return { outcome: 'unrecognized', seriesId };
+      const reason = typeof err.data?.reason === 'string' ? err.data.reason : undefined;
+      const retryable = defaultIsTransient(err);
+      ctx.log.warning('EIA series ID lookup failed; answering from the text search', {
+        seriesId,
+        code: err.code,
+        retryable,
+        ...(reason && { reason }),
+      });
+      return { outcome: 'failed', seriesId, retryable, ...(reason && { reason }) };
+    }
+
+    const answer = SeriesIdResponseSchema.safeParse(raw);
+    if (!answer.success) {
+      ctx.log.warning('EIA series ID answer lacked its route, facets, or columns', {
+        seriesId,
+        issues: answer.error.issues.map((issue) => issue.path.join('.')),
+      });
+      return {
+        outcome: 'failed',
+        seriesId,
+        retryable: true,
+        reason: 'upstream_invalid_response',
+      };
+    }
+    // EIA maps some IDs (AEO among them) to a query that matches no rows; the
+    // lookup's own total says so before the caller spends a query on it.
+    const total = answer.data.response?.total;
+    const empty = total === 0 || total === '0';
+    return {
+      outcome: 'resolved',
+      seriesId,
+      entry: seriesIdEntry(seriesId, answer.data),
+      ...(empty && { empty: true as const }),
+    };
   }
 
   /**
@@ -1523,6 +1860,12 @@ class EiaApiService {
    * `status` travels with the results so a short or oddly-ranked answer is
    * never mistaken for a settled one, and `hasMore` says whether the results
    * are every match or the first `limit` of them.
+   *
+   * A query shaped like an APIv1 series ID is looked up first, under
+   * `SERIES_ID_LOOKUP_BUDGET_MS`; a hit is the one result, at score 0, and
+   * waits on no warm. Otherwise the warm wait gets what is left of
+   * `SEARCH_WARM_BUDGET_MS` counted from entry, and `seriesId` reports why the
+   * lookup did not answer.
    */
   async search(
     query: string,
@@ -1531,10 +1874,27 @@ class EiaApiService {
   ): Promise<{
     /** True when at least one match ranks past `limit` — the results are a prefix. */
     hasMore: boolean;
-    results: Array<{ entry: SearchIndexEntry; score: number }>;
+    results: Array<{ entry: SearchResultEntry; score: number }>;
+    /** Present when the query is shaped like a series ID: what its lookup came to. */
+    seriesId?: SeriesIdLookup;
     status: IndexStatus;
   }> {
-    await this.ensureIndexWarmed(ctx, SEARCH_WARM_BUDGET_MS);
+    const startedAt = Date.now();
+    const id = parseSeriesId(query);
+    const lookup =
+      id === undefined
+        ? undefined
+        : await this.lookupSeriesId(id, ctx, startedAt + SERIES_ID_LOOKUP_BUDGET_MS);
+    if (lookup?.outcome === 'resolved') {
+      return {
+        hasMore: false,
+        results: [{ entry: lookup.entry, score: 0 }],
+        seriesId: lookup,
+        status: getIndexStatus(),
+      };
+    }
+
+    await this.ensureIndexWarmed(ctx, SEARCH_WARM_BUDGET_MS - (Date.now() - startedAt));
     // One match of lookahead: `searchRoutes` scores and sorts every candidate
     // before it slices, so asking for one more costs nothing and is the only
     // way to tell a search that ended at `limit` from one that was cut there.
@@ -1542,6 +1902,7 @@ class EiaApiService {
     return {
       hasMore: ranked.length > limit,
       results: ranked.slice(0, limit),
+      ...(lookup && { seriesId: lookup }),
       status: getIndexStatus(),
     };
   }

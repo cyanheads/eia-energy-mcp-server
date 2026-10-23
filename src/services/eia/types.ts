@@ -145,6 +145,11 @@ export interface AccumulatedRows {
   /** True when `cap` stopped accumulation short of `total`. */
   capped: boolean;
   rows: DataRow[];
+  /**
+   * Present when the call's deadline ended accumulation: the next page could
+   * not have landed in the time left, or it stalled past the deadline.
+   */
+  timedOut?: true;
 }
 
 /** Response from /v2/{route}/data/. */
@@ -189,4 +194,14 @@ export interface SearchIndexEntry {
   isLeaf: boolean;
   name: string;
   route: string;
+}
+
+/**
+ * One `eia_search_routes` result: an index entry, or the resolution of a legacy
+ * APIv1 series ID, which also carries the frequency and data columns EIA maps
+ * that ID to.
+ */
+export interface SearchResultEntry extends SearchIndexEntry {
+  columns?: string[];
+  frequency?: string;
 }

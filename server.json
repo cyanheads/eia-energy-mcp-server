@@ -50,7 +50,7 @@
         },
         {
           "name": "EIA_FACET_VALUE_CAP",
-          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs.",
+          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs, or narrow a facet with values_query.",
           "format": "string",
           "isRequired": false,
           "default": "50"
@@ -116,7 +116,7 @@
         },
         {
           "name": "EIA_FACET_VALUE_CAP",
-          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs.",
+          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs, or narrow a facet with values_query.",
           "format": "string",
           "isRequired": false,
           "default": "50"

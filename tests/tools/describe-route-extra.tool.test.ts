@@ -4,11 +4,13 @@
  * @module tests/tools/describe-route-extra.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
 import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
+import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import * as eiaService from '@/services/eia/eia-service.js';
 
 vi.mock('@/services/eia/eia-service.js', () => ({
@@ -18,6 +20,9 @@ vi.mock('@/services/eia/eia-service.js', () => ({
 }));
 
 const mockDescribe = vi.fn();
+
+const textOf = (content: readonly unknown[]): string =>
+  content.map((block) => (block as { text?: string }).text ?? '').join('\n');
 
 describe('describeRouteTool — additional coverage', () => {
   beforeEach(() => {
@@ -63,6 +68,57 @@ describe('describeRouteTool — additional coverage', () => {
 
     it('defaults values_offset to 0', () => {
       expect(describeRouteTool.input.parse({ route: 'steo' }).values_offset).toBe(0);
+    });
+
+    it('rejects a values_query of whitespace alone, as eia_search_routes rejects a blank query', () => {
+      const message = 'values_query must contain at least one non-whitespace character';
+      for (const values_query of ['', '   ', '\t\n']) {
+        expect(() => describeRouteTool.input.parse({ route: 'steo', values_query })).toThrow(
+          message,
+        );
+      }
+    });
+
+    it('trims a values_query and keeps its inner whitespace', () => {
+      expect(
+        describeRouteTool.input.parse({ route: 'steo', values_query: '  palo   verde ' })
+          .values_query,
+      ).toBe('palo   verde');
+    });
+
+    it('leaves values_query unset when omitted', () => {
+      expect(describeRouteTool.input.parse({ route: 'steo' }).values_query).toBeUndefined();
+    });
+
+    it('advertises values_query with the same JSON Schema shape as the search query', () => {
+      const advertised = (schema: z.ZodType, key: string) => {
+        const json = z.toJSONSchema(schema, { io: 'input' }) as {
+          properties: Record<string, { type?: string; minLength?: number }>;
+          required?: string[];
+        };
+        return { ...json.properties[key], required: json.required?.includes(key) ?? false };
+      };
+      const valuesQuery = advertised(describeRouteTool.input, 'values_query');
+      const searchQuery = advertised(searchRoutesTool.input, 'query');
+      expect(valuesQuery).toMatchObject({ type: 'string', minLength: 1, required: false });
+      expect({ type: valuesQuery.type, minLength: valuesQuery.minLength }).toEqual({
+        type: searchQuery.type,
+        minLength: searchQuery.minLength,
+      });
+    });
+
+    it('rejects a whitespace values_query before asking the service for anything', async () => {
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+        values_query: '   ',
+      });
+
+      expect(result.isError).toBe(true);
+      // The schema's own message, not the strict-input rejection of an unknown key.
+      expect(textOf(result.content)).toContain(
+        'values_query must contain at least one non-whitespace character',
+      );
+      expect(mockDescribe).not.toHaveBeenCalled();
     });
   });
 

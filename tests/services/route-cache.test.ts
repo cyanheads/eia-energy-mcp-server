@@ -3,18 +3,21 @@
  * @module tests/services/route-cache.test
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import Fuse from 'fuse.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WEAK_MATCH_SCORE } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import {
   _resetRouteCache,
   addEntriesToIndex,
   buildNodeMap,
   getChildren,
+  getIndexEntries,
   getIndexSize,
   getIndexStatus,
   getNode,
   indexFacetValues,
   indexNamedSeries,
+  indexVocabularyFacet,
   initRouteCache,
   isLeafNode,
   isRouteCacheReady,
@@ -198,6 +201,187 @@ describe('route-cache', () => {
       initRouteCache(SAMPLE_TREE, []);
       const results = searchRoutes('energy', 1);
       expect(results.length).toBeLessThanOrEqual(1);
+    });
+
+    describe('ranking memo', () => {
+      const SPOT_ENTRY: SearchIndexEntry = {
+        route: 'petroleum/pri/spt',
+        name: 'Gasoline Spot Prices',
+        description: 'Daily spot prices for gasoline',
+        isLeaf: true,
+        category: 'petroleum',
+        filter_hint: { series: 'EER_EPMRU_PF4_Y35NY_DPG' },
+      };
+
+      afterEach(() => {
+        vi.restoreAllMocks();
+      });
+
+      it('answers a repeated query without searching the index again', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        const search = vi.spyOn(Fuse.prototype, 'search');
+        const first = searchRoutes('gasoline prices', 5);
+        const searched = search.mock.calls.length;
+        expect(searched).toBeGreaterThan(0);
+
+        expect(searchRoutes('gasoline prices', 5)).toEqual(first);
+        expect(search.mock.calls.length).toBe(searched);
+      });
+
+      it('searches again once an append or a replaced node changes the index', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        const before = searchRoutes('gasoline', 5).map((r) => r.entry.route);
+        expect(before).not.toContain('petroleum/pri/spt');
+
+        addEntriesToIndex([SPOT_ENTRY]);
+        expect(searchRoutes('gasoline', 5).map((r) => r.entry.route)).toContain(
+          'petroleum/pri/spt',
+        );
+
+        // Renaming the leaf through replaceNode must reach the next ranking too.
+        replaceNode('petroleum/pri/gnd', {
+          id: 'gnd',
+          name: 'Diesel Only',
+          description: 'Weekly retail diesel prices',
+          frequency: [
+            { id: 'weekly', description: 'Weekly', query: 'weekly', format: 'YYYY-MM-DD' },
+          ],
+        });
+        expect(searchRoutes('gasoline', 5).map((r) => r.entry.route)).not.toContain(
+          'petroleum/pri/gnd',
+        );
+      });
+
+      it('keeps separate rankings per limit and per mode', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        expect(searchRoutes('electricity', 1)).toHaveLength(1);
+        expect(searchRoutes('electricity', 5)).toHaveLength(2);
+
+        // No entry reads like the whole phrase, so the phrase pass scores the
+        // gasoline leaf worse than the term pass the combined mode adds.
+        const phrase = searchRoutes('gasoline prices', 5, 'phrase');
+        const combined = searchRoutes('gasoline prices', 5);
+        expect(phrase[0]?.entry.route).toBe('petroleum/pri/gnd');
+        expect(combined[0]?.entry.route).toBe('petroleum/pri/gnd');
+        expect(phrase[0]?.score).toBeGreaterThan(combined[0]?.score as number);
+      });
+
+      it('returns results a caller can edit without changing a later answer or the index', () => {
+        initRouteCache(SAMPLE_TREE, [SPOT_ENTRY]);
+        const pristine = structuredClone(searchRoutes('gasoline', 5));
+        const indexBefore = structuredClone(getIndexEntries());
+        const spot = pristine.findIndex((r) => r.entry.filter_hint !== undefined);
+        expect(spot).toBeGreaterThanOrEqual(0);
+
+        const received = searchRoutes('gasoline', 5);
+        const target = received[spot] as (typeof received)[number];
+        (target.entry.filter_hint as Record<string, string>).series = 'EDITED';
+        target.entry.name = 'Edited';
+        target.score = 99;
+        received.reverse();
+        received.push({ entry: target.entry, score: -1 });
+
+        expect(searchRoutes('gasoline', 5)).toEqual(pristine);
+        expect(getIndexEntries()).toEqual(indexBefore);
+      });
+
+      // The two eviction tests count index searches; matching nothing keeps the
+      // thousands of searches they run cheap, and every ranking empty.
+      it('bounds the memo by the bytes it retains, not by a count of rankings', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        const search = vi.spyOn(Fuse.prototype, 'search').mockReturnValue([]);
+        const reSearches = (query: string): boolean => {
+          const calls = search.mock.calls.length;
+          searchRoutes(query, 5);
+          return search.mock.calls.length > calls;
+        };
+
+        // 2,000 short keys fit the byte budget: the first is still held.
+        for (let i = 0; i < 2000; i++) searchRoutes(`zq${i}`, 5);
+        expect(reSearches('zq0')).toBe(false);
+
+        // 2,000 keys of 120 characters do not: the oldest are evicted first,
+        // while the newest stays held.
+        initRouteCache(SAMPLE_TREE, []);
+        const wide = (i: number) => `zq${i}`.padEnd(120, 'x');
+        for (let i = 0; i < 2000; i++) searchRoutes(wide(i), 5);
+        expect(reSearches(wide(1999))).toBe(false);
+        expect(reSearches(wide(0))).toBe(true);
+      });
+
+      it('evicts the least recently used ranking, not the oldest one stored', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        const search = vi.spyOn(Fuse.prototype, 'search').mockReturnValue([]);
+        const wide = (i: number) => `zq${i}`.padEnd(120, 'x');
+        const keptSearches = () => search.mock.calls.filter(([pattern]) => pattern === 'kept');
+        searchRoutes('kept', 5);
+        for (let i = 0; i < 2000; i++) {
+          searchRoutes(wide(i), 5);
+          // Reading it again marks it recently used.
+          if (i % 100 === 0) searchRoutes('kept', 5);
+        }
+        searchRoutes('kept', 5);
+        // Evicted once and searched again, it would also look held at the end.
+        expect(keptSearches()).toHaveLength(1);
+        // The budget did evict: the first wide key stored is gone.
+        const calls = search.mock.calls.length;
+        searchRoutes(wide(0), 5);
+        expect(search.mock.calls.length).toBe(calls + 1);
+      });
+    });
+
+    describe('search cost bound', () => {
+      afterEach(() => {
+        vi.restoreAllMocks();
+      });
+
+      it('reads only the first 256 characters of a query, in every pass', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        const search = vi.spyOn(Fuse.prototype, 'search');
+        const head = 'gasoline prices weekly retail diesel '.repeat(7).slice(0, 256);
+        const query = `${head}electricity sales state sector`;
+
+        const ranked = searchRoutes(query, 5);
+        const patterns = search.mock.calls.map(([pattern]) => pattern as string);
+        expect(patterns.length).toBeGreaterThan(0);
+        expect(Math.max(...patterns.map((p) => p.length))).toBeLessThanOrEqual(256);
+        expect(patterns.some((p) => p.includes('electricity'))).toBe(false);
+
+        initRouteCache(SAMPLE_TREE, []);
+        expect(searchRoutes(head, 5)).toEqual(ranked);
+      });
+
+      it('answers a query of 256 characters or fewer as written', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        const search = vi.spyOn(Fuse.prototype, 'search');
+        const query = 'gasoline '.repeat(29).slice(0, 255);
+        searchRoutes(query, 5);
+        expect(search.mock.calls[0]?.[0]).toBe(query);
+      });
+
+      const cpuMs = (fn: () => void): number => {
+        const start = process.threadCpuUsage();
+        fn();
+        const used = process.threadCpuUsage(start);
+        return (used.user + used.system) / 1000;
+      };
+
+      it.each([
+        ['first input', (chars: number) => `${'§1 x'.repeat(chars / 4)}\ny`],
+        ['second input', (chars: number) => '  \r\n'.repeat(chars / 4)],
+      ])('keeps one search within its thread-CPU bound at every query length (%s)', (_, shape) => {
+        const costs: number[] = [];
+        for (let chars = 5_000; chars <= 320_000; chars *= 2) {
+          // A fresh index for each size, so no remembered ranking answers it.
+          initRouteCache(SAMPLE_TREE, []);
+          const query = shape(chars);
+          const cost = cpuMs(() => searchRoutes(query, 10));
+          expect(cost, `${chars} characters`).toBeLessThan(25);
+          costs.push(cost);
+        }
+        const [first, last] = [costs[0] as number, costs.at(-1) as number];
+        expect(last / Math.max(first, 0.05)).toBeLessThan(256);
+      });
     });
   });
 
@@ -451,6 +635,119 @@ describe('route-cache', () => {
         expect(ids).not.toContain(excluded);
       }
     });
+
+    describe('benchmark series, products, and respondents (#78)', () => {
+      const freq = (id: string) => ({ id, description: id, query: id, format: 'YYYY-MM-DD' });
+      const volumeFacets = [
+        { id: 'duoarea', description: 'DuoArea' },
+        { id: 'product', description: 'Product' },
+        { id: 'process', description: 'Process' },
+        { id: 'series', description: 'Series' },
+      ];
+      const leaf = (id: string, frequency?: RawRouteNode['frequency']): RawRouteNode => ({
+        id,
+        name: id,
+        ...(frequency !== undefined && { frequency }),
+        facets: volumeFacets,
+        data: {},
+      });
+      const BENCHMARK_TREE: RawRouteNode[] = [
+        {
+          id: 'petroleum',
+          name: 'Petroleum',
+          routes: [
+            leaf('spt', [freq('monthly'), freq('weekly'), freq('daily')]),
+            leaf('wstk', { weekly: freq('weekly') }),
+            leaf('sndw', [freq('four-week-average'), freq('weekly')]),
+            leaf('dfp1', [freq('monthly'), freq('annual')]),
+            leaf('fut', { daily: freq('daily'), monthly: freq('monthly') }),
+            leaf('bare'),
+          ],
+        },
+        {
+          id: 'electricity',
+          name: 'Electricity',
+          routes: [
+            {
+              id: 'region-data',
+              name: 'Hourly Demand By Region',
+              frequency: [freq('hourly')],
+              facets: [
+                { id: 'respondent', description: 'Balancing Authority / Region' },
+                { id: 'type', description: 'Type of Data' },
+              ],
+              data: {},
+            },
+            {
+              id: 'daily-region-data',
+              name: 'Daily Demand By Region',
+              frequency: [freq('daily')],
+              facets: [
+                { id: 'respondent', description: 'Balancing Authority / Region' },
+                { id: 'timezone', description: 'Timezone' },
+              ],
+              data: {},
+            },
+          ],
+        },
+        {
+          id: 'densified-biomass',
+          name: 'Densified Biomass',
+          routes: [
+            {
+              // An annual survey route: its respondents are reporting plants.
+              id: 'wood-pellet-plants',
+              name: 'Wood Pellet Plant Capacity',
+              frequency: [freq('annual')],
+              facets: [
+                { id: 'region', description: 'Region' },
+                { id: 'respondent', description: 'Respondent' },
+              ],
+              data: {},
+            },
+          ],
+        },
+      ];
+
+      it('selects series and product on every leaf listing a daily or weekly frequency, in either shape', () => {
+        initRouteCache(BENCHMARK_TREE, []);
+        const targets = listVocabularyFacets()
+          .filter((t) => t.route.startsWith('petroleum/'))
+          .map((t) => `${t.route} ${t.facetId}`)
+          .sort();
+        expect(targets).toEqual(
+          [
+            'petroleum/fut product',
+            'petroleum/fut series',
+            'petroleum/sndw product',
+            'petroleum/sndw series',
+            'petroleum/spt product',
+            'petroleum/spt series',
+            'petroleum/wstk product',
+            'petroleum/wstk series',
+          ].sort(),
+        );
+      });
+
+      it('selects respondent on hourly and daily leaves, never on an annual one', () => {
+        initRouteCache(BENCHMARK_TREE, []);
+        const respondents = listVocabularyFacets()
+          .filter((t) => t.facetId === 'respondent')
+          .map((t) => t.route)
+          .sort();
+        expect(respondents).toEqual(['electricity/daily-region-data', 'electricity/region-data']);
+      });
+
+      it('never selects duoarea or process, on a daily or weekly leaf or any other', () => {
+        initRouteCache(BENCHMARK_TREE, []);
+        const ids = new Set(listVocabularyFacets().map((t) => t.facetId));
+        expect(ids.has('duoarea')).toBe(false);
+        expect(ids.has('process')).toBe(false);
+        expect(ids.has('type')).toBe(false);
+        expect(ids.has('timezone')).toBe(false);
+        expect(ids.has('region')).toBe(false);
+      });
+    });
   });
 
   describe('indexFacetValues', () => {
@@ -497,6 +794,12 @@ describe('route-cache', () => {
       expect(indexFacetValues('electricity/retail-sales', [facet('coalRankId', 200)])).toBe(200);
     });
 
+    it('holds a described series facet to the bound too — only the warm pass indexes series whole', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      expect(indexFacetValues('petroleum/pri/gnd', [facet('series', 201, 'Series')])).toBe(0);
+      expect(indexFacetValues('petroleum/pri/gnd', [facet('series', 200, 'Series')])).toBe(200);
+    });
+
     it('skips a facet with no values', () => {
       initRouteCache(SAMPLE_TREE, []);
       expect(indexFacetValues('electricity/retail-sales', [facet('fueltypeid', 0)])).toBe(0);
@@ -523,6 +826,64 @@ describe('route-cache', () => {
       const routes = searchRoutes('wind', 5).map((r) => r.entry.route);
       expect(routes).toContain('electricity/retail-sales');
       expect(routes).toContain('petroleum/pri/gnd');
+    });
+  });
+
+  describe('indexVocabularyFacet (#78)', () => {
+    function facet(id: string, count: number, description = 'Series'): Facet {
+      return {
+        id,
+        description,
+        values: Array.from({ length: count }, (_, i) => ({ id: `V${i}`, name: `Value ${i}` })),
+      };
+    }
+
+    it('returns 0 before init', () => {
+      expect(indexVocabularyFacet('petroleum/pri/gnd', facet('series', 3))).toBe(0);
+    });
+
+    it('indexes a series facet whole past the bound', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      expect(indexVocabularyFacet('petroleum/pri/gnd', facet('series', 205))).toBe(205);
+      expect(getIndexSize()).toBe(6 + 205);
+    });
+
+    it('holds product, respondent, and every other facet to the bound', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      for (const id of ['product', 'respondent', 'fueltypeid']) {
+        expect(indexVocabularyFacet('petroleum/pri/gnd', facet(id, 201, id))).toBe(0);
+        expect(indexVocabularyFacet('petroleum/pri/gnd', facet(id, 200, id))).toBe(200);
+      }
+    });
+
+    it('builds the entry describe-time indexing builds, so a later describe adds nothing', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      const series: Facet = {
+        id: 'series',
+        description: 'Series',
+        values: [{ id: 'EMM_EPMR_PTE_NUS_DPG', name: 'U.S. Regular Gasoline Retail Price' }],
+      };
+      expect(indexVocabularyFacet('petroleum/pri/gnd', series)).toBe(1);
+      expect(indexFacetValues('petroleum/pri/gnd', [series])).toBe(0);
+
+      const [hit] = searchRoutes('Regular Gasoline Retail Price', 5).filter(
+        (r) => r.entry.filter_hint,
+      );
+      expect(hit?.entry).toEqual({
+        route: 'petroleum/pri/gnd',
+        name: 'U.S. Regular Gasoline Retail Price',
+        description:
+          'Series value of Gasoline and Diesel (petroleum/pri/gnd) — filter with series="EMM_EPMR_PTE_NUS_DPG".',
+        isLeaf: true,
+        category: 'petroleum',
+        filter_hint: { series: 'EMM_EPMR_PTE_NUS_DPG' },
+      });
+    });
+
+    it('adds nothing for an empty facet', () => {
+      initRouteCache(SAMPLE_TREE, []);
+      expect(indexVocabularyFacet('petroleum/pri/gnd', facet('series', 0))).toBe(0);
+      expect(indexVocabularyFacet('petroleum/pri/gnd', facet('product', 0))).toBe(0);
     });
   });
 
@@ -628,7 +989,7 @@ describe('route-cache', () => {
  * routes rather than the two the phrase path alone needed. That size is load
  * bearing: term weights are `log(N / df)`, so a handful of entries makes every
  * term look equally rare and the gate behaves nothing like it does over the real
- * 3,165-entry corpus. At this size it does — `electricity price residential`
+ * 5,459-entry corpus. At this size it does — `electricity price residential`
  * reproduces the reported bug under the phrase path (no candidate at all) and
  * resolves under the tokenized one, which is the whole change in miniature.
  *
@@ -818,7 +1179,9 @@ describe('weak-match calibration against the live Fuse scale', () => {
       const [top] = searchRoutes('electricity retail sales by state', 5);
       expect(top?.entry.route).toBe('electricity/retail-sales');
       expect(top?.entry.filter_hint).toBeUndefined();
-      expect(top?.score).toBeCloseTo(0.598, 4);
+      // The four sector values inherit "Electricity Sales to Ultimate Customers"
+      // from their route; that text weighs as one document for all four.
+      expect(top?.score).toBeCloseTo(0.5621, 4);
       expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
     });
 
@@ -853,7 +1216,7 @@ describe('weak-match calibration against the live Fuse scale', () => {
       const [top] = searchRoutes('electricity price residential', 5);
       expect(top?.entry.route).toBe('electricity/retail-sales');
       expect(top?.entry.filter_hint).toEqual({ sectorid: 'RES' });
-      expect(top?.score).toBeCloseTo(0.3804, 4);
+      expect(top?.score).toBeCloseTo(0.3476, 4);
       expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
     });
 
@@ -863,6 +1226,71 @@ describe('weak-match calibration against the live Fuse scale', () => {
       const facetRank = results.findIndex((r) => r.entry.filter_hint !== undefined);
       expect(routeRank).toBe(0);
       if (facetRank >= 0) expect(results[facetRank]!.score).toBeGreaterThan(results[0]!.score);
+    });
+  });
+
+  describe('with benchmark series, products, and respondents in the index (#78)', () => {
+    /** Verbatim live values from the warm-time benchmark targets. */
+    beforeEach(() => {
+      indexVocabularyFacet('natural-gas/pri/fut', {
+        id: 'series',
+        description: 'Series',
+        values: [
+          { id: 'RNGWHHD', name: 'Henry Hub Natural Gas Spot Price (Dollars per Million Btu)' },
+          { id: 'RNGC1', name: 'Natural Gas Futures Contract 1 (Dollars per Million Btu)' },
+        ],
+      });
+      indexVocabularyFacet('petroleum/pri/spt', {
+        id: 'series',
+        description: 'Series',
+        values: [
+          { id: 'RWTC', name: 'Cushing, OK WTI Spot Price FOB (Dollars per Barrel)' },
+          { id: 'RBRTE', name: 'Europe Brent Spot Price FOB (Dollars per Barrel)' },
+        ],
+      });
+      indexVocabularyFacet('petroleum/pri/spt', {
+        id: 'product',
+        description: 'Product',
+        values: [
+          { id: 'EPCWTI', name: 'WTI Crude Oil' },
+          { id: 'EPCBRENT', name: 'UK Brent Crude Oil' },
+        ],
+      });
+      indexVocabularyFacet('electricity/rto/region-data', {
+        id: 'respondent',
+        description: 'Balancing Authority / Region',
+        values: [
+          { id: 'ERCO', name: 'Electric Reliability Council of Texas, Inc.' },
+          { id: 'CISO', name: 'California Independent System Operator' },
+        ],
+      });
+    });
+
+    it.each([
+      ['Henry Hub', 'natural-gas/pri/fut', { series: 'RNGWHHD' }, 0.4176],
+      ['WTI crude spot price', 'petroleum/pri/spt', { product: 'EPCWTI' }, 0.5621],
+      ['Cushing', 'petroleum/pri/spt', { series: 'RWTC' }, 0.3985],
+      [
+        'Electric Reliability Council of Texas',
+        'electricity/rto/region-data',
+        { respondent: 'ERCO' },
+        0.3239,
+      ],
+    ])('ranks %s on its benchmark entry below the threshold', (query, route, hint, score) => {
+      const [top] = searchRoutes(query, 5);
+      expect(top?.entry.route).toBe(route);
+      expect(top?.entry.filter_hint).toEqual(hint);
+      expect(top?.score).toBeCloseTo(score, 4);
+      expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
+    });
+
+    it('leaves the route-shaped and unanswerable probes on their side of the threshold', () => {
+      const [advertised] = searchRoutes('electricity retail sales by state', 5);
+      expect(advertised?.entry.route).toBe('electricity/retail-sales');
+      expect(advertised?.score).toBeCloseTo(0.5617, 4);
+      const [unanswerable] = searchRoutes('solar capacity by state', 5);
+      expect(unanswerable?.score).toBeCloseTo(0.9474, 4);
+      expect(unanswerable?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
     });
   });
 });
@@ -988,6 +1416,40 @@ describe('tokenized candidate gate', () => {
     expect(full?.entry.route).toBe('full/route');
     expect(partial?.entry.route).toBe('partial/route');
     expect(partial?.score).toBeGreaterThan(full?.score as number);
+  });
+
+  /**
+   * A facet-value entry's description repeats its route's title, so a weekly
+   * route's 300 series made `weekly` look as common as `oil` — and "weekly crude
+   * oil stocks" dropped the route titled "Weekly Stocks" below the coverage bar
+   * (live: from #1 at 0.506 to outside the top 30). Text a hint entry inherits
+   * from its route counts once per route; its own name still counts per entry.
+   */
+  it('weighs a title word that facet values inherit from their route as one document', () => {
+    const survey = 'EIA petroleum gas survey data';
+    const supply = 'Weekly Supply Estimates';
+    initRouteCache(
+      [],
+      [
+        entry('petroleum/stoc/wstk', 'Weekly Stocks', survey),
+        entry('petroleum/stoc/cu', 'Crude Oil Stocks at Tank Farms & Pipelines', survey),
+        entry('petroleum/sum/sndw', supply, survey),
+        ...Array.from({ length: 300 }, (_, i) => ({
+          ...entry('petroleum/sum/sndw', `Distillate Fuel Oil Supply ${i}`, ''),
+          description: `Series value of ${supply} (petroleum/sum/sndw) — filter with series="S${i}".`,
+          filter_hint: { series: `S${i}` },
+        })),
+        ...filler(60),
+      ],
+    );
+    const results = searchRoutes('weekly crude oil stocks', 5);
+    expect(results[0]?.entry).toMatchObject({
+      route: 'petroleum/stoc/wstk',
+      name: 'Weekly Stocks',
+    });
+    expect(results[0]?.entry.filter_hint).toBeUndefined();
+    expect(results[0]?.score).toBeLessThan(WEAK_MATCH_SCORE);
+    expect(results[1]?.entry.route).toBe('petroleum/stoc/cu');
   });
 });
 
@@ -1142,5 +1604,115 @@ describe('a query spelling a route path (#73)', () => {
   it('leaves the phrase path where it was — the lift is the combined mode alone', () => {
     expect(searchRoutes('retail sales', 5, 'phrase')[0]?.entry.route).toBe('steo');
     expect(routeEntryRank('retail sales', RETAIL)).toBe(0);
+  });
+});
+
+/**
+ * The warm appends facet values as each `/facet` fetch completes, so the order
+ * entries reach the index varies from one warm to the next. Results that tie on
+ * score — "wind" matches a Wind value on eight live routes at the same score —
+ * must not inherit that order.
+ */
+describe('equal-score ordering', () => {
+  function windValue(route: string, facetId: string): SearchIndexEntry {
+    return {
+      route,
+      name: 'Wind',
+      description: `Energy Source value of ${route} — filter with ${facetId}="WND".`,
+      isLeaf: true,
+      category: 'electricity',
+      filter_hint: { [facetId]: 'WND' },
+    };
+  }
+
+  const WIND_VALUES = [
+    windValue('electricity/rto/fuel-type-data', 'fueltype'),
+    windValue('electricity/facility-fuel', 'fuelType'),
+    windValue('electricity/facility-fuel', 'fuel2002'),
+    windValue('electricity/electric-power-operational-data', 'fueltypeid'),
+    windValue('electricity/rto/daily-fuel-type-data', 'fueltype'),
+  ];
+
+  const ROUTES: SearchIndexEntry[] = [
+    {
+      route: 'electricity',
+      name: 'Electricity',
+      description: 'EIA electricity survey data',
+      isLeaf: false,
+      category: undefined,
+    },
+    {
+      route: 'coal/shipments',
+      name: 'Shipments',
+      description: 'Coal shipments by mine and plant.',
+      isLeaf: true,
+      category: 'coal',
+    },
+  ];
+
+  /** Fisher–Yates over a fixed seed, so the permutation is the same every run. */
+  function permuted<T>(items: readonly T[], seed: number): T[] {
+    const out = [...items];
+    let state = seed;
+    for (let i = out.length - 1; i > 0; i--) {
+      state = (state * 1103515245 + 12345) % 2 ** 31;
+      const j = state % (i + 1);
+      [out[i], out[j]] = [out[j] as T, out[i] as T];
+    }
+    return out;
+  }
+
+  beforeEach(() => {
+    _resetRouteCache();
+  });
+
+  it('ranks tied results identically whichever order their entries arrived in', () => {
+    initRouteCache([], [...ROUTES, ...WIND_VALUES]);
+    const forward = searchRoutes('wind', 10);
+
+    initRouteCache([], [...ROUTES, ...[...WIND_VALUES].reverse()]);
+    const reversed = searchRoutes('wind', 10);
+
+    // Appended one at a time, as the warm's facet fetches land.
+    initRouteCache([], ROUTES);
+    for (const value of permuted(WIND_VALUES, 7)) addEntriesToIndex([value]);
+    const trickled = searchRoutes('wind', 10);
+
+    expect(new Set(forward.map((r) => r.score)).size).toBe(1);
+    expect(reversed).toEqual(forward);
+    expect(trickled).toEqual(forward);
+    // The tie breaks on route path, then on the filter.
+    expect(
+      forward.map((r) => `${r.entry.route} ${Object.keys(r.entry.filter_hint ?? {})}`),
+    ).toEqual([
+      'electricity/electric-power-operational-data fueltypeid',
+      'electricity/facility-fuel fuel2002',
+      'electricity/facility-fuel fuelType',
+      'electricity/rto/daily-fuel-type-data fueltype',
+      'electricity/rto/fuel-type-data fueltype',
+    ]);
+  });
+
+  it('ranks a route entry ahead of a filter-hinted entry at the same score', () => {
+    const route: SearchIndexEntry = {
+      route: 'renewable/wind',
+      name: 'Wind',
+      description: 'Wind generation.',
+      isLeaf: true,
+      category: 'renewable',
+    };
+    // Identical searchable text, so Fuse and the term gate score the two alike.
+    const value: SearchIndexEntry = { ...route, filter_hint: { fueltype: 'WND' } };
+
+    for (const order of [
+      [value, route],
+      [route, value],
+    ]) {
+      initRouteCache([], [...ROUTES, ...order]);
+      const [first, second] = searchRoutes('wind generation', 5);
+      expect(first?.score).toBe(second?.score);
+      expect(first?.entry.filter_hint).toBeUndefined();
+      expect(second?.entry.filter_hint).toEqual({ fueltype: 'WND' });
+    }
   });
 });

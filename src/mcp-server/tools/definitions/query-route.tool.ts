@@ -17,6 +17,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { type ColumnRename, getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
+import { invertedRange } from '@/services/eia/period-bounds.js';
 import type { EiaWarning } from '@/services/eia/types.js';
 import {
   ECHO_BUDGET_BYTES,
@@ -264,9 +265,14 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Period start in the route date format (e.g. "2020-01" for monthly, "2020" for annual). Format from eia_describe_route.',
+        'Period start in the route date format (e.g. "2020-01" for monthly, "2020" for annual). Format from eia_describe_route. EIA reads a bound as the period of the effective frequency containing its first day, so a coarser bound selects that one period ("2020" is 2020-01 at monthly, "2020-Q4" is 2020-10). At local-hourly every bound needs its hour and UTC offset (YYYY-MM-DDTHH±HH, e.g. "2024-02-01T02-06").',
       ),
-    end: z.string().optional().describe('Period end (same format as start).'),
+    end: z
+      .string()
+      .optional()
+      .describe(
+        'Period end, read the same way as start: a coarser end selects only its first period, so "2020" ends at 2020-01 at monthly — use "2020-12" to include the whole year. At hourly a date-only end covers its whole day.',
+      ),
     sort: z
       .array(
         z
@@ -347,7 +353,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Human-readable note, present whenever dataset is set or staging failed, and otherwise when total exceeds the inline rows. On a stage: true call it opens with the stage outcome: the staged row count and dataset name, naming eia_dataframe_describe for the staged column names (quoting one rename when staging renamed a column) and then eia_dataframe_query for SQL — or, when the canvas failed, that no dataframe was created (dataset is then absent), with the retry and offset paging. Next, where in the matching set the staged rows sit whenever the stage does not start at row 1, and when staging stopped short of total (the EIA_CANVAS_MAX_ROWS cap, or an upstream page that did not return) the offset to resume from; last, the inline page against total and next_offset — saying when the 64,000-byte response budget rather than length ended the page, or that a single row too large for the budget was withheld and offset + 1 steps past it — and, after a registered stage, that the inline rows page with stage left off, since another stage: true call stages a new table. Where staging was not requested it places the inline page against total and names stage: true and eia_dataframe_query as the way to get SQL access to the rest; where no canvas is configured at all, staging is unavailable, so it names offset paging and CANVAS_PROVIDER_TYPE=duckdb instead.',
+        'Human-readable note, present whenever dataset is set or staging failed, and otherwise when total exceeds the inline rows. On a stage: true call it opens with the stage outcome: the staged row count and dataset name, naming eia_dataframe_describe for the staged column names (quoting one rename when staging renamed a column) and then eia_dataframe_query for SQL — or, when the canvas failed, that no dataframe was created (dataset is then absent), with the retry and offset paging. Next, where in the matching set the staged rows sit whenever the stage does not start at row 1, and when staging stopped short of total (the EIA_CANVAS_MAX_ROWS cap, the time limit of the call, or an upstream page that did not return) the offset to resume from; last, the inline page against total and next_offset — saying when the 64,000-byte response budget rather than length ended the page, or that a single row too large for the budget was withheld and offset + 1 steps past it — and, after a registered stage, that the inline rows page with stage left off, since another stage: true call stages a new table. Where staging was not requested it places the inline page against total and names stage: true and eia_dataframe_query as the way to get SQL access to the rest; where no canvas is configured at all, staging is unavailable, so it names offset paging and CANVAS_PROVIDER_TYPE=duckdb instead.',
       ),
     truncation_warning: z
       .string()
@@ -427,6 +433,15 @@ export const queryRouteTool = tool('eia_query_route', {
       recovery: 'Retry after a short wait; if it persists, check api.eia.gov availability.',
     },
     {
+      reason: 'upstream_timeout',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      when: 'EIA did not answer in time: one attempt passed 45 s, or the call passed its 56 s deadline across retries. Staging that runs out of time ends early instead, keeping the rows already staged.',
+      recovery:
+        'Retry after a short wait, or narrow the query with filters, start, or end so EIA has less to return — a deep offset (millions of rows in) is slow at any length, so narrowing until the rows you want sit at a small offset helps where a smaller length does not; if it keeps timing out, check api.eia.gov availability.',
+    },
+    {
       reason: 'route_not_found',
       thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
@@ -474,9 +489,9 @@ export const queryRouteTool = tool('eia_query_route', {
       reason: 'invalid_period',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'start or end was not in a period format the route accepts.',
+      when: 'start or end was not in a period format the route accepts, named a month, day, or hour that does not exist at a daily, weekly, hourly, or local-hourly frequency, or lacked its UTC offset at local-hourly frequency.',
       recovery:
-        'Call eia_describe_route and use the period format frequencies[].format gives for the chosen frequency.',
+        'Call eia_describe_route and use the period format frequencies[].format gives for the chosen frequency, with a month 01–12, a day its month has, and an hour 00–23; at local-hourly each bound needs its hour and UTC offset, e.g. 2024-02-01T02-06.',
     },
     {
       reason: 'uri_too_long',
@@ -490,8 +505,9 @@ export const queryRouteTool = tool('eia_query_route', {
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Date range is inverted (start is after end).',
-      recovery: 'Swap start and end values — start must be earlier than or equal to end.',
+      when: 'EIA returned no rows and start selects a later period than end at the effective frequency (the range is inverted).',
+      recovery:
+        'Pass an end that selects a period no earlier than start — a coarse end selects only its first period ("2023" is 2023-01 at monthly, so end at 2023-12 to cover the year); otherwise swap start and end.',
     },
     {
       reason: 'rate_limited',
@@ -520,21 +536,6 @@ export const queryRouteTool = tool('eia_query_route', {
       length: input.length,
       stage: input.stage,
     });
-
-    // Pre-flight: detect inverted date range before hitting the EIA API.
-    // ISO date strings (YYYY-MM, YYYY-MM-DD, YYYY) sort lexicographically, so
-    // string comparison is sufficient for this check.
-    if (input.start !== undefined && input.end !== undefined && input.start > input.end) {
-      throw ctx.fail(
-        'no_data',
-        `Date range is inverted: start "${input.start}" is after end "${input.end}". Swap start and end to retrieve data.`,
-        {
-          route: input.route,
-          start: input.start,
-          end: input.end,
-        },
-      );
-    }
 
     /**
      * A filter whose value list is empty sends EIA nothing, so it is unset —
@@ -577,6 +578,31 @@ export const queryRouteTool = tool('eia_query_route', {
 
     const fetched = dataResp.data;
     const { total } = dataResp;
+
+    /**
+     * An inverted range is diagnosed only once EIA has answered it with no
+     * rows: bounds of mixed granularity cannot be ordered as strings, and EIA
+     * reads each as the period of the frequency it reports, so a call it
+     * answers with rows is never refused. Nothing has been staged yet — an
+     * empty result registers no table.
+     */
+    if (
+      total === 0 &&
+      fetched.length === 0 &&
+      input.start !== undefined &&
+      input.end !== undefined
+    ) {
+      const inverted = invertedRange(input.start, input.end, dataResp.frequency);
+      if (inverted) {
+        throw ctx.fail('no_data', inverted, {
+          route: dataResp.route,
+          start: input.start,
+          end: input.end,
+          frequency: dataResp.frequency,
+        });
+      }
+    }
+
     const notices = [...(dataResp.notices ?? [])];
     if (requestedInput.length > input.length)
       notices.push(`Requested length ${requestedInput.length} was clamped to ${input.length}.`);
@@ -649,6 +675,8 @@ export const queryRouteTool = tool('eia_query_route', {
         if (input.offset > 0) stagedRange = `The ${range}.`;
       } else if (accumulated.capped) {
         stagedRange = `Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (${accumulated.cap.toLocaleString()}), so the ${range}. Narrow with filters, start, or end — or re-query with offset ${lastStaged.toLocaleString()} — to reach the rest.`;
+      } else if (accumulated.timedOut) {
+        stagedRange = `Staging stopped when the call's time limit ran out before EIA could answer another page, so the ${range}. Re-query with offset ${lastStaged.toLocaleString()} and stage: true to stage the next rows, or narrow with filters, start, or end so fewer pages are needed.`;
       } else {
         stagedRange = `Staging stopped before the end of the matching set, so the ${range}. Re-query with offset ${lastStaged.toLocaleString()} to continue.`;
       }

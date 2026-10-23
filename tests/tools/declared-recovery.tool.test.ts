@@ -3,12 +3,26 @@
  * @module tests/tools/declared-recovery.tool.test
  */
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { dataframeDropTool } from '@/mcp-server/tools/definitions/dataframe-drop.tool.js';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
 import { _resetCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
+
+// An inverted range fails only once EIA answers it with no rows, so the query
+// answers with an empty annual page.
+vi.mock('@/services/eia/eia-service.js', () => ({
+  getEiaApiService: () => ({
+    query: async () => ({
+      route: 'electricity/retail-sales',
+      total: 0,
+      data: [],
+      frequency: 'annual',
+      dateFormat: 'YYYY',
+    }),
+  }),
+}));
 
 describe('declared recovery', () => {
   beforeEach(_resetCanvasBridge);

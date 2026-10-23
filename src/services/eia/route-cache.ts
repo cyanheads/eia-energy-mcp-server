@@ -5,8 +5,11 @@
  * server is the appropriate refresh mechanism. The Fuse.js index is built once
  * after the tree is populated, then grown with two further entry classes that
  * both carry a `filter_hint`: named series (`NAMED_SERIES_FACETS` — STEO and
- * SEDS series names), and facet values (fuel types, sectors, coal ranks) so
- * natural-language queries naming a value resolve to the route that exposes it.
+ * SEDS series names), and facet values (fuel types, sectors, coal ranks, RTO
+ * respondents, and the `series` and `product` values of the daily and weekly
+ * petroleum and natural-gas routes) so natural-language queries naming a value
+ * — "wind", "Henry Hub", "Electric Reliability Council of Texas" — resolve to
+ * the route that exposes it.
  *
  * Completeness is tracked, not assumed. A node whose warm-time metadata fetch
  * failed is held as an incomplete stub — never classified as a leaf, listed by
@@ -28,7 +31,7 @@
  */
 
 import Fuse, { type IFuseOptions } from 'fuse.js';
-import type { Facet, RawRouteNode, SearchIndexEntry } from './types.js';
+import type { Facet, RawFrequency, RawRouteNode, SearchIndexEntry } from './types.js';
 
 /**
  * Facets whose values are named series — descriptive phrases a caller searches
@@ -81,6 +84,14 @@ interface CacheState {
   indexedKeys: Set<string>;
   /** Flat map of route path → raw node (all nodes in the tree). */
   nodeMap: Map<string, RawRouteNode>;
+  /**
+   * Rankings `searchRoutes` computed against the current `fuseIndex`, keyed by
+   * mode, limit, and query, least recently used first; emptied by every
+   * `reindex`. Each packs its results as `[refIndex, score, …]`.
+   */
+  resultMemo: Map<string, Float64Array>;
+  /** What `resultMemo` retains, as `memoBytes` charges it. */
+  resultMemoBytes: number;
   /** Entries derived from the route tree, rebuilt whenever the tree changes. */
   routeEntries: SearchIndexEntry[];
   /** Index-widening passes that have landed in full. */
@@ -96,10 +107,12 @@ let _cache: CacheState | undefined;
  * punctuation and case stripped.
  *
  * The list is deliberately short: it covers the fuel / sector / technology
- * vocabulary callers search with, and excludes the four facets that dominate
- * the taxonomy by volume (`duoarea`, `product`, `process`, `series` appear on
- * 165 leaf routes each). Measured against the live taxonomy, it resolves to 40
- * facet fetches carrying 470 values — against 892 facets in total.
+ * vocabulary callers search with. It excludes the four facets that dominate the
+ * taxonomy by volume (`duoarea`, `product`, `process`, `series` appear on 165
+ * leaf routes each); `SUB_MONTHLY_FACET_IDS` takes `series` and `product` back,
+ * with `respondent`, on the few routes that publish sub-monthly data. Measured
+ * against the live taxonomy, this list resolves to 40 facet fetches — against
+ * 892 facets in total.
  */
 const VOCABULARY_FACET_IDS = new Set([
   'coalrankid',
@@ -121,12 +134,44 @@ const VOCABULARY_FACET_IDS = new Set([
 ]);
 
 /**
+ * Facets fetched at warm time only on leaves whose metadata lists one of
+ * `SUB_MONTHLY_FREQUENCIES` — the market and grid-operations routes, where these
+ * facets name what callers ask for first. On the 16 daily and weekly petroleum
+ * and natural-gas leaves (of the 165 carrying `series` and `product`), `series`
+ * names the benchmark ("Cushing, OK WTI Spot Price FOB") and `product` the
+ * commodity ("WTI Crude Oil"); on the four hourly and daily `electricity/rto`
+ * leaves, `respondent` names the balancing authority ("Electric Reliability
+ * Council of Texas"). On monthly and annual survey routes the same facets list
+ * thousands of series, or reporting plants: the one other leaf carrying
+ * `respondent`, the annual `densified-biomass/wood-pellet-plants`, lists 161
+ * plant names that only add off-target matches ("cat food" reaching "Vulcan
+ * Wood Products"). Measured live, the selection is 36 requests for 1,753
+ * `series`, 209 `product`, and 332 `respondent` values; `series` and `product`
+ * on all 165 leaves would cost 330 requests, nearly doubling the warm.
+ */
+const SUB_MONTHLY_FACET_IDS = new Set(['product', 'respondent', 'series']);
+
+/** Frequency IDs that mark a leaf as publishing sub-monthly data. */
+const SUB_MONTHLY_FREQUENCIES = new Set(['daily', 'hourly', 'local-hourly', 'weekly']);
+
+/**
+ * Warm-time facets indexed whole past `MAX_INDEXED_FACET_VALUES`. A `series`
+ * value is a descriptive name, like the `NAMED_SERIES_FACETS` values, and three
+ * benchmark leaves run past the bound: `petroleum/sum/sndw` (608 values),
+ * `petroleum/pri/gnd` (311), and `petroleum/stoc/wstk` (205, where the Cushing
+ * stocks series lives). Describe-time indexing keeps the bound, since a
+ * described monthly route's `series` facet can run to thousands of values
+ * (`petroleum/move/impcus`: 5,124).
+ */
+const WHOLE_WARM_FACET_IDS = new Set(['series']);
+
+/**
  * Upper bound on the values a single facet contributes to the index. Facets
  * above it are opaque-identifier dimensions (mine IDs, plant codes, `duoarea`
  * area codes) that nobody searches by name, and indexing them would swamp the
- * corpus. The `NAMED_SERIES_FACETS` allowlist is the one exception: STEO's and
- * SEDS's `seriesId` facets are above the bound and reach the index whole, each
- * through its own pass.
+ * corpus. Two exceptions reach the index whole: the `NAMED_SERIES_FACETS`
+ * allowlist (STEO's and SEDS's `seriesId`, each through its own pass), and the
+ * warm-time `series` targets in `WHOLE_WARM_FACET_IDS`.
  */
 const MAX_INDEXED_FACET_VALUES = 200;
 
@@ -203,6 +248,17 @@ export function isLeafNode(node: RawRouteNode): boolean {
   return !node.routes?.length;
 }
 
+/**
+ * A node's frequencies as a list. EIA returns `frequency` as an array on every
+ * route in the standard taxonomy, but the field is not contractually an array:
+ * an object map is flattened to its values, and anything else reads as none.
+ */
+export function frequenciesOf(node: RawRouteNode): RawFrequency[] {
+  const raw = node.frequency;
+  if (Array.isArray(raw)) return raw;
+  return raw && typeof raw === 'object' ? Object.values(raw) : [];
+}
+
 /** Build search index entries from a flat node map. */
 function buildEntries(nodeMap: Map<string, RawRouteNode>): SearchIndexEntry[] {
   const entries: SearchIndexEntry[] = [];
@@ -227,6 +283,9 @@ function buildEntries(nodeMap: Map<string, RawRouteNode>): SearchIndexEntry[] {
  * entry at once and invalidates `WEAK_MATCH_SCORE`. Appending entries under an
  * unchanged config does not — Fuse scores each entry independently of corpus
  * size, which is what lets facet values join the index without recalibration.
+ * `includeMatches` moves no score: it reports which keys a match landed in,
+ * which `tokenizedScores` reads to count a term a facet value inherits from its
+ * route once per route.
  */
 const FUSE_OPTIONS: IFuseOptions<SearchIndexEntry> = {
   keys: [
@@ -237,6 +296,7 @@ const FUSE_OPTIONS: IFuseOptions<SearchIndexEntry> = {
   ],
   threshold: 0.4,
   includeScore: true,
+  includeMatches: true,
   minMatchCharLength: 2,
 };
 
@@ -250,17 +310,18 @@ function collectIncompleteRoutes(nodeMap: Map<string, RawRouteNode>): Set<string
 }
 
 /**
- * Rebuild the Fuse index over the current entry set. Route entries always lead
- * the appended ones, so the class order — and with it Fuse's tie-breaking
- * between an entry class and the next — is the one `initRouteCache` produced.
- * Within the route entries, a subtree `replaceNode` re-inserted sorts last,
- * which moves nothing but the order of an exact score tie.
+ * Rebuild the Fuse index over the current entry set, route entries first. No
+ * ranking reads this order — `searchRoutes` breaks score ties on entry identity
+ * (`compareRanked`) — so a subtree `replaceNode` re-inserted last, or facet
+ * values appended in whatever order their fetches landed, move nothing.
  */
 function reindex(cache: CacheState): void {
   const allEntries = [...cache.routeEntries, ...cache.appendedEntries];
   cache.entries = allEntries;
   cache.fuseIndex = new Fuse(allEntries, FUSE_OPTIONS);
   cache.indexedKeys = new Set(allEntries.map(entryKey));
+  cache.resultMemo = new Map();
+  cache.resultMemoBytes = 0;
 }
 
 /**
@@ -281,6 +342,8 @@ export function initRouteCache(
     incompleteRoutes: collectIncompleteRoutes(nodeMap),
     indexedKeys: new Set(),
     nodeMap,
+    resultMemo: new Map(),
+    resultMemoBytes: 0,
     routeEntries: buildEntries(nodeMap),
     settledPasses: new Set(),
   };
@@ -337,12 +400,6 @@ export function getIndexStatus(): IndexStatus {
     pendingPasses,
     size: getIndexSize(),
   };
-}
-
-/** Return the cache, throwing if not yet initialized. */
-export function getRouteCache(): CacheState {
-  if (!_cache) throw new Error('Route cache not initialized');
-  return _cache;
 }
 
 /** True when the cache has been populated. */
@@ -406,10 +463,10 @@ const MAX_QUERY_TERMS = 8;
 
 /**
  * English function words, dropped before a query is weighted. They are the one
- * class of generic term document frequency cannot recognize: measured over this
- * corpus, `by` matches 365 of 3,165 entries and so reads as *rarer* than
- * `electricity` (973) — inverse document frequency would make the preposition
- * the heaviest term in "electricity generation by fuel type". Frequency is the
+ * class of generic term document frequency cannot recognize: measured over the
+ * 5,459-entry corpus, `by` is found in 326 documents and so reads as *rarer*
+ * than `electricity` (689) — inverse document frequency would make the
+ * preposition the heaviest term in "electricity generation by fuel type". Frequency is the
  * wrong question for a word that never carried topic in the first place.
  *
  * The list is grammatical, not domain vocabulary: generic *content* words
@@ -457,9 +514,14 @@ function tokenizeQuery(query: string): string[] {
  * while an entry answering less of the query than it leaves open is not a
  * candidate at any length.
  *
- * Measured against the live 3,165-entry corpus, the widest share any off-target
- * query in `scripts/search-battery.ts` reached was 0.403 — the curve clears that
- * at every length.
+ * Measured against the 3,165-entry corpus the warm built before benchmark
+ * vocabulary was indexed, the widest share any off-target query in
+ * `scripts/search-battery.ts` reached past the matched-term floor was
+ * 0.403 — the curve clears that at every length. The bar is not the only guard:
+ * on the 5,459-entry corpus, with weekly petroleum series names indexed,
+ * `airline ticket prices` fuzzy-matches every term of a propane price series
+ * (`ticket` inside `Connecticut`), clears the bar at full share, and is flagged
+ * by its score instead (0.858, above `WEAK_MATCH_SCORE`).
  */
 function coverageBar(termCount: number): number {
   return 0.5 + 0.25 / (termCount - 1);
@@ -482,8 +544,8 @@ function minMatchedTerms(termCount: number): number {
  * Length at or below which a query term must appear verbatim before the term
  * path counts an entry as matching it. `FUSE_OPTIONS.threshold` admits a
  * one-edit match on any pattern this short, and a token this short has a large
- * one-edit neighbourhood: measured over the live 3,165-entry corpus, `cat`
- * fuzzy-matches 1,206 entries against the 49 that carry it, and `food` reaches
+ * one-edit neighbourhood: measured over the live 5,459-entry corpus, `cat`
+ * fuzzy-matches 1,834 entries against the 49 that carry it, and `food` reaches
  * `Wood`. Such a match satisfies the matched-term floor while carrying none of
  * the concept, which is how an unanswerable two-term query reaches a confident
  * score.
@@ -524,6 +586,13 @@ function carriesTerm(entry: SearchIndexEntry, term: string): boolean {
  *   nobody anticipated. A term matching *nothing* carries the most weight of all
  *   and is always unmatched, which is what makes a query naming something absent
  *   fail the bar rather than score on the words it shares with the corpus.
+ *   A document is an entry, except where a `filter_hint` entry matches only
+ *   outside its own name: its description, route, and category carry text every
+ *   entry on its route shares (the route's title and path, or a series label),
+ *   so all such matches on one route count as one document. Counted per entry, the series and products of the routes titled
+ *   "Weekly …" made `weekly` look nearly as common as `oil` (1,924 entries
+ *   against 2,858; 37 documents), and "weekly crude oil stocks" dropped the
+ *   route titled "Weekly Stocks" below the bar.
  * - **Admission is on matched weight, floored by matched term count.** Matching
  *   `sector` and `state` while missing `residential` buys almost no coverage,
  *   and the floor stops one heavy term from carrying a short query alone.
@@ -540,12 +609,16 @@ function tokenizedScores(cache: CacheState, terms: string[]): Map<number, number
   const perTerm = terms.map((term) => {
     const requireVerbatim = term.length <= VERBATIM_TERM_LENGTH;
     const hits = new Map<number, number>();
+    const documents = new Set<string>();
     for (const result of cache.fuseIndex.search(term)) {
-      if (requireVerbatim && !carriesTerm(cache.entries[result.refIndex] as SearchIndexEntry, term))
-        continue;
+      const entry = cache.entries[result.refIndex] as SearchIndexEntry;
+      if (requireVerbatim && !carriesTerm(entry, term)) continue;
       hits.set(result.refIndex, result.score ?? 1);
+      const inherited =
+        entry.filter_hint !== undefined && !result.matches?.some((m) => m.key === 'name');
+      documents.add(inherited ? `route\u0000${entry.route}` : `entry\u0000${result.refIndex}`);
     }
-    return { hits, weight: Math.log((corpusSize + 1) / (hits.size + 1)) };
+    return { hits, weight: Math.log((corpusSize + 1) / (documents.size + 1)) };
   });
 
   const totalWeight = perTerm.reduce((sum, term) => sum + term.weight, 0);
@@ -618,7 +691,15 @@ function routePathMatches(cache: CacheState, query: string): number[] {
 }
 
 /**
- * Fuzzy search across the index. Returns ranked matches, best first.
+ * Most characters of a query `searchRoutes` reads, which bounds what one search
+ * costs. The longest name in the warm corpus is 174 characters, so a query
+ * naming any indexed entry is searched whole.
+ */
+export const MAX_SEARCHED_QUERY_LENGTH = 256;
+
+/**
+ * Fuzzy search across the index. Returns ranked matches, best first, in the
+ * total order `compareRanked` defines.
  *
  * A multi-term query is scored twice — once as a phrase by Fuse, once term by
  * term through the gate above — and each entry keeps its better score. The two
@@ -631,6 +712,12 @@ function routePathMatches(cache: CacheState, query: string): number[] {
  *
  * `mode` is what `scripts/eval-search.ts` measures the gate's contribution
  * against: `'phrase'` is the un-tokenized behavior on its own.
+ *
+ * Only the first `MAX_SEARCHED_QUERY_LENGTH` characters of the query are read,
+ * by every pass. A ranking depends only on those, `limit`, `mode`, and the
+ * index, so a repeat is answered from `resultMemo` until the index next
+ * changes. Every call returns fresh result objects and entry copies: a caller
+ * that edits what it received changes neither the index nor a later answer.
  */
 export function searchRoutes(
   query: string,
@@ -640,6 +727,71 @@ export function searchRoutes(
   const cache = _cache;
   if (!cache) return [];
 
+  const searched = query.slice(0, MAX_SEARCHED_QUERY_LENGTH);
+  const key = `${mode}\u0000${limit}\u0000${searched}`;
+  let ranking = cache.resultMemo.get(key);
+  if (ranking) {
+    // Re-inserting moves the key to the most recently used end.
+    cache.resultMemo.delete(key);
+    cache.resultMemo.set(key, ranking);
+  } else {
+    ranking = rankQuery(cache, searched, limit, mode);
+    rememberRanking(cache, key, ranking);
+  }
+
+  const results: Array<{ entry: SearchIndexEntry; score: number }> = [];
+  for (let i = 0; i < ranking.length; i += 2) {
+    const entry = cache.entries[ranking[i] as number] as SearchIndexEntry;
+    results.push({
+      entry: { ...entry, ...(entry.filter_hint && { filter_hint: { ...entry.filter_hint } }) },
+      score: ranking[i + 1] as number,
+    });
+  }
+  return results;
+}
+
+/**
+ * Most bytes `resultMemo` retains per index build, as `memoBytes` charges them;
+ * the least recently used rankings are evicted to stay under it.
+ */
+const RESULT_MEMO_BUDGET_BYTES = 1024 * 1024;
+
+/**
+ * What a kept ranking retains beyond its key's characters and its packed
+ * results: the Map slot, the key string's header, and the typed array with its
+ * backing store. Set from the heap a kept ranking was measured to hold under
+ * Node 26 and Bun 1.4, so `memoBytes` charges each ranking at least that.
+ */
+const MEMO_ENTRY_OVERHEAD_BYTES = 320;
+
+/**
+ * Bytes `resultMemo` charges a ranking — key characters at two bytes each,
+ * whatever their encoding, so the charge never undercounts.
+ */
+function memoBytes(key: string, ranking: Float64Array): number {
+  return MEMO_ENTRY_OVERHEAD_BYTES + key.length * 2 + ranking.byteLength;
+}
+
+/** Keep a ranking, evicting the least recently used until the budget holds it. */
+function rememberRanking(cache: CacheState, key: string, ranking: Float64Array): void {
+  const bytes = memoBytes(key, ranking);
+  if (bytes > RESULT_MEMO_BUDGET_BYTES) return;
+  for (const [oldKey, oldRanking] of cache.resultMemo) {
+    if (cache.resultMemoBytes + bytes <= RESULT_MEMO_BUDGET_BYTES) break;
+    cache.resultMemo.delete(oldKey);
+    cache.resultMemoBytes -= memoBytes(oldKey, oldRanking);
+  }
+  cache.resultMemo.set(key, ranking);
+  cache.resultMemoBytes += bytes;
+}
+
+/** Score the query against the index and pack the best `limit` as `[refIndex, score, …]`. */
+function rankQuery(
+  cache: CacheState,
+  query: string,
+  limit: number,
+  mode: 'combined' | 'phrase',
+): Float64Array {
   const scores = new Map<number, number>();
   for (const result of cache.fuseIndex.search(query)) {
     scores.set(result.refIndex, result.score ?? 1);
@@ -655,13 +807,33 @@ export function searchRoutes(
     for (const ref of routePathMatches(cache, query)) scores.set(ref, 0);
   }
 
-  // Ties break on index position, which keeps route entries ahead of the
-  // named-series and facet-value entries appended after them — the order
-  // `reindex` produced.
-  return [...scores]
-    .sort(([refA, scoreA], [refB, scoreB]) => scoreA - scoreB || refA - refB)
-    .slice(0, limit)
-    .map(([ref, score]) => ({ entry: cache.entries[ref] as SearchIndexEntry, score }));
+  const best = [...scores]
+    .map(([ref, score]) => {
+      const entry = cache.entries[ref] as SearchIndexEntry;
+      return { ref, entry, score, key: entryKey(entry) };
+    })
+    .sort(compareRanked)
+    .slice(0, limit);
+  return Float64Array.from(best.flatMap(({ ref, score }) => [ref, score]));
+}
+
+/**
+ * The total order results are returned in: score, then route entries ahead of
+ * the named-series and facet-value entries that carry a `filter_hint`, then
+ * `entryKey` (route path, then filter) by code point. Index position never
+ * decides a tie — the warm appends facet values as each fetch lands, so that
+ * position differs from one warm to the next, and with it which of eight
+ * equally scored Wind values answered "wind" first.
+ */
+function compareRanked(
+  a: { entry: SearchIndexEntry; score: number; key: string },
+  b: { entry: SearchIndexEntry; score: number; key: string },
+): number {
+  return (
+    a.score - b.score ||
+    Number(a.entry.filter_hint !== undefined) - Number(b.entry.filter_hint !== undefined) ||
+    (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  );
 }
 
 /** Total number of indexed entries. */
@@ -694,9 +866,11 @@ export function addEntriesToIndex(entries: SearchIndexEntry[]): number {
 }
 
 /**
- * Leaf routes paired with the vocabulary facet IDs worth fetching at warm time.
- * Read straight from the cached tree, which already carries every leaf's facet
- * IDs — so the selection itself costs nothing.
+ * Leaf routes paired with the facet IDs worth fetching at warm time: the
+ * `VOCABULARY_FACET_IDS` facets wherever they appear, and the
+ * `SUB_MONTHLY_FACET_IDS` facets on leaves listing a `SUB_MONTHLY_FREQUENCIES`
+ * frequency. Read straight from the cached tree, which already carries every
+ * leaf's facet IDs and frequencies — so the selection itself costs nothing.
  */
 export function listVocabularyFacets(): Array<{
   route: string;
@@ -706,8 +880,10 @@ export function listVocabularyFacets(): Array<{
   if (!_cache) return [];
   const targets: Array<{ route: string; facetId: string; description: string }> = [];
   for (const [route, node] of _cache.nodeMap) {
+    const subMonthly = frequenciesOf(node).some((f) => SUB_MONTHLY_FREQUENCIES.has(f.id));
     for (const facet of node.facets ?? []) {
-      if (VOCABULARY_FACET_IDS.has(normalizeFacetId(facet.id))) {
+      const id = normalizeFacetId(facet.id);
+      if (VOCABULARY_FACET_IDS.has(id) || (subMonthly && SUB_MONTHLY_FACET_IDS.has(id))) {
         targets.push({ route, facetId: facet.id, description: facet.description });
       }
     }
@@ -715,34 +891,48 @@ export function listVocabularyFacets(): Array<{
   return targets;
 }
 
+/** One entry per value of `facet`, each pointing back at `route` with a ready-to-use `filter_hint`. */
+function facetValueEntries(cache: CacheState, route: string, facet: Facet): SearchIndexEntry[] {
+  const routeName = cache.nodeMap.get(route)?.name ?? route;
+  const parts = route.split('/');
+  const category = parts.length > 1 ? parts[0] : undefined;
+  const dimension = facet.description || facet.id;
+  return facet.values.map((value) => ({
+    route,
+    name: value.name,
+    description: `${dimension} value of ${routeName} (${route}) — filter with ${facet.id}="${value.id}".`,
+    isLeaf: true,
+    category,
+    filter_hint: { [facet.id]: value.id },
+  }));
+}
+
 /**
  * Index a described route's facet values, each pointing back at the route with
  * a ready-to-use `filter_hint`. Facets above `MAX_INDEXED_FACET_VALUES` are
- * skipped. Returns how many entries were added.
+ * skipped, `series` included. Returns how many entries were added.
  */
 export function indexFacetValues(route: string, facets: Facet[]): number {
-  if (!_cache) return 0;
-  const node = _cache.nodeMap.get(route);
-  const routeName = node?.name ?? route;
-  const parts = route.split('/');
-  const category = parts.length > 1 ? parts[0] : undefined;
+  const cache = _cache;
+  if (!cache) return 0;
+  return addEntriesToIndex(
+    facets
+      .filter((facet) => facet.values.length <= MAX_INDEXED_FACET_VALUES)
+      .flatMap((facet) => facetValueEntries(cache, route, facet)),
+  );
+}
 
-  const entries: SearchIndexEntry[] = [];
-  for (const facet of facets) {
-    if (facet.values.length === 0 || facet.values.length > MAX_INDEXED_FACET_VALUES) continue;
-    const dimension = facet.description || facet.id;
-    for (const value of facet.values) {
-      entries.push({
-        route,
-        name: value.name,
-        description: `${dimension} value of ${routeName} (${route}) — filter with ${facet.id}="${value.id}".`,
-        isLeaf: true,
-        category,
-        filter_hint: { [facet.id]: value.id },
-      });
-    }
+/**
+ * Index one facet the warm-time pass fetched (`listVocabularyFacets`). The same
+ * entries `indexFacetValues` builds, under the same bound, except that a
+ * `WHOLE_WARM_FACET_IDS` facet is indexed whatever its size. Returns how many
+ * entries were added.
+ */
+export function indexVocabularyFacet(route: string, facet: Facet): number {
+  if (WHOLE_WARM_FACET_IDS.has(normalizeFacetId(facet.id))) {
+    return _cache ? addEntriesToIndex(facetValueEntries(_cache, route, facet)) : 0;
   }
-  return addEntriesToIndex(entries);
+  return indexFacetValues(route, [facet]);
 }
 
 /**
