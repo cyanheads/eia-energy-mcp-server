@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-29 · ⚠️ Breaking
+
+Pages are exactly length rows (default 25) with the 64,000-byte inline cut removed, cached route metadata expires after 24 hours, and an eia-energy-guide skill is published. Breaking: eia_dataframe_query refuses an unqualified current_schema column or alias.
+
 ## [0.4.6](changelog/0.4.x/0.4.6.md) — 2026-10-23 · 🛡️ Security
 
 Legacy series IDs and benchmark facet values in route search, facet-value lookup on describe, one time bound per EIA call, impossible-period refusals, and a 256-character search bound.
