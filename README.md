@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eia-energy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eia-energy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eia-energy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/eia-energy-mcp-server/releases/latest/download/eia-energy-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=eia-energy-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZWlhLWVuZXJneS1tY3Atc2VydmVyIl0sImVudiI6eyJFSUFfQVBJX0tFWSI6InlvdXItYXBpLWtleSJ9fQ==) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22eia-energy-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Feia-energy-mcp-server%22%5D%2C%22env%22%3A%7B%22EIA_API_KEY%22%3A%22your-api-key%22%7D%7D)
 
@@ -67,7 +67,7 @@ All four route tools distinguish retryable upstream failures: `rate_limited` for
 
 ### `eia_search_routes` <sub>tool</sub>
 
-- Search route names, descriptions, STEO's 1,469 and SEDS's 968 series names, and facet values. Before any describe, the facet values cover fuel, sector, technology, and coal-rank vocabularies, RTO balancing authorities (`Electric Reliability Council of Texas` → `respondent: ERCO`), and the series and product names of the daily and weekly petroleum and natural-gas routes (`Henry Hub` → `natural-gas/pri/fut`, `series: RNGWHHD`); describing a route adds its own. `limit` defaults to 10; positive integers above 30 are clamped to 30 with requested/effective values disclosed, even on short or empty results. `truncated` is true when more matches exist. Only the first 256 characters of `query` are searched, with a notice when it is cut.
+- Search route names, descriptions, STEO's 1,469 and SEDS's 968 series names, and facet values. Before any describe, the facet values cover fuel, sector, technology, and coal-rank vocabularies, RTO balancing authorities (`Electric Reliability Council of Texas` → `respondent: ERCO`), and the series and product names of the daily and weekly petroleum and natural-gas routes (`Henry Hub` → `natural-gas/pri/fut`, `series: RNGWHHD`); describing a route adds its own. `limit` defaults to 10; a larger value returns at most 30 and says so, even on short or empty results. `truncated` is true when more matches exist. Only the first 256 characters of `query` are searched, with a notice when it is cut.
 - Matches carry `score` (0 exact, 1 no match; above 0.72 is weak) and may carry a `filter_hint` for `eia_query_route`. Check `indexComplete` and `indexGaps` before trusting a short result set.
 - A legacy APIv1 series ID, as EIA's website and Excel add-in write them, is resolved through EIA's `/v2/seriesid` lookup before any text search, in any case: `ELEC.PRICE.TX-RES.M` returns one result, `electricity/retail-sales` with `filter_hint` `{sectorid: "RES", stateid: "TX"}`, `frequency: "monthly"`, and `columns: ["price"]`, ready for `eia_query_route`. A hit needs no index, so it answers in under a second even on a cold server. When EIA's own lookup reports no rows for the mapping it returns (some AEO IDs), the notice says the query will come back empty. An ID EIA does not recognize (`PET.ZZZZZZ.W`, or `U.S.A`, which only looks like one) returns the text search with a notice saying so; a lookup that times out, is rate-limited, or hits an outage does the same with a retry notice, never an error.
 - The first search builds the index and normally takes 20–40 s (at most 45 s); later searches answer from the built index. If EIA rate-limits, cannot be reached, or does not answer in time, the call fails with retryable `rate_limited`, `upstream_unreachable`, or `upstream_timeout`.
@@ -76,9 +76,9 @@ All four route tools distinguish retryable upstream failures: `rate_limited` for
 
 ### `eia_query_route` <sub>tool</sub>
 
-- Pass a leaf `route`, with optional facet-ID `filters`, `columns`, `frequency`, `start`/`end`, and `sort`. Page with `offset` and `length` (default 100; positive integers above 5000 are clamped to 5000 with a notice).
-- Responses stay within 64,000 bytes: a page may end early at the last whole row that fits, and `next_offset` gives where to continue. A single row too large to fit is withheld, and the note gives the offset that skips it.
-- After describe has cached a complete facet vocabulary, query notices name unmatched filter values and suggest case-sensitive IDs when possible. Filters and their echoes stay unchanged; diagnostics never fetch metadata or facet values.
+- Pass a leaf `route`, with optional facet-ID `filters`, `columns`, `frequency`, `start`/`end`, and `sort`. Page with `offset` and `length` (default 25; a larger value returns at most 5,000 and says so).
+- Returns `length` rows per page; continue at `next_offset` (= `offset` + returned count).
+- After describe has cached a complete facet vocabulary, and for 24 hours after that list was fetched, query notices name unmatched filter values and suggest case-sensitive IDs when possible. Filters and their echoes stay unchanged; diagnostics never fetch metadata or facet values.
 - With effective monthly `YYYY-MM` data, a year-only bound means January: `end: "2021"` stops at `2021-01`; use `2021-12` for the full year. Query notices disclose this for either bound without expanding it.
 - EIA reads each bound as the period of the effective frequency containing its first day, so `start: "2023-01", end: "2023"` returns January at monthly. A range is reported as inverted (`no_data`) only when EIA returns no rows and `start` selects a later period than `end`; the message names both periods. At `local-hourly` each bound needs its hour and UTC offset (`2024-02-01T02-06`); one without fails as `invalid_period` before any request. So does a bound naming a date or hour that does not exist in the shape its frequency reads exactly — `2024-02-30` at `daily` or `weekly`, `2024-02-01T24` at `hourly` — since EIA answers those with an HTTP 500 rather than rows.
 - `total` reports the full match count; values remain strings and units appear as `{col}-units`. Errors cover invalid route, facet, column, frequency, sort, or period, inverted ranges (`no_data`), a filter list too long for EIA's ~8 KB request URI (`uri_too_long`; split the values across calls), and retryable `rate_limited`, `upstream_unreachable`, and `upstream_timeout`.
@@ -95,8 +95,8 @@ All four route tools distinguish retryable upstream failures: `rate_limited` for
 
 ### `eia_dataframe_query` <sub>tool</sub>
 
-- Run one read-only SQL SELECT against staged handles. `row_limit` defaults to 1000; `preview` narrows the inline slice and accepts zero. Integers above 10000 on either input are clamped to 10000 with requested/effective values disclosed; the 64,000-byte per-surface budget can end rows sooner. `register_as` still stages the complete result.
-- `truncated: true` means `totalRows` is a cap, not a full count. `register_as` stages the complete result under an unused name with an exact count; the notice gives the `ORDER BY … LIMIT/OFFSET` query that pages the rest.
+- Run one read-only SQL SELECT against staged handles. Inline rows follow `preview` (default 25; a larger value returns at most `row_limit` and says so, and `0` returns none). `row_limit` defaults to 1,000 and returns at most 10,000. Echoes (`executedSql`, `columns`) come back whole. `register_as` still stages the complete result.
+- `truncated: true` means `totalRows` is a cap, not a full count. `register_as` stages the complete result under an unused name with an exact count; the notice gives the `LIMIT/OFFSET` query, with no `ORDER BY`, that pages the rest in the order the preview showed. A result with no rows still lists its columns.
 - Cast EIA VARCHAR values for arithmetic. Writes, file reads, and system catalogs are rejected; declared failures include `missing_table`, `invalid_sql`, `non_select_statement`, `denied_function`, `multi_statement`, `sql_read_only`, `system_catalog_access`, and `register_as_clash`.
 
 ---
@@ -114,9 +114,14 @@ EIA-specific:
 
 - Covers all 14 top-level dataset categories of EIA API v2, with the route tree cached in process
 - Fuzzy search (Fuse.js) over route names/descriptions, all 1,469 STEO and 968 SEDS series names, and facet values — 1,753 benchmark petroleum and natural-gas series names and the RTO balancing authorities among them, indexed at warm time
-- Facet values are fetched and cached per route by `eia_describe_route`; a list EIA does not return is reported in `unavailable_facets` and retried on the next call
+- Facet values are fetched and cached per route by `eia_describe_route` for 24 hours, after which the next describe re-fetches the route; a list EIA does not return is reported in `unavailable_facets` and retried on the next call, and a refresh EIA does not answer serves the cached values with a notice naming when they were fetched
 - Routes whose metadata could not be fetched are reported through `eia_search_routes` instead of dropped
 - DataCanvas (DuckDB) is on by default and staging is opt-in per call; with the canvas off the three dataframe tools are not callable
+- Count inputs (`length`, `row_limit`, `preview`, `limit`) lower an over-cap value to its cap with a notice; `EIA_CLAMP_LIMITS=false` advertises and enforces each cap as a schema maximum instead
+
+Agent skill:
+
+- `eia-energy-guide` carries the gates for answering energy questions with these tools: per-route geography codes, total rows beside their components, per-row unit columns, nulls and zeros, and forecasts mixed with history. MCP clients read it from the server as `skill://eia-energy-guide/SKILL.md`; it also ships in the npm package, the Docker image, and the `.mcpb` bundle, and plugin installs scan it from `skills/`.
 
 Agent-friendly output:
 
@@ -247,10 +252,11 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 |:---------|:------------|:--------|
 | `EIA_API_KEY` | **Required.** Free API key from api.eia.gov — appended as `api_key` on every request. | — |
 | `EIA_BASE_URL` | EIA API base URL. | `https://api.eia.gov/v2` |
-| `EIA_DATASET_TTL_SECONDS` | Dataframe lifetime in seconds; each `eia_dataframe_query` that references a dataframe extends it. | `86400` (24 h) |
+| `EIA_DATASET_TTL_SECONDS` | Dataframe lifetime in seconds, at most 31,536,000 (365 days); each `eia_dataframe_query` that references a dataframe extends it. | `86400` (24 h) |
 | `EIA_DATAFRAME_DROP_ENABLED` | Set to `true` to expose `eia_dataframe_drop` (no effect with `CANVAS_PROVIDER_TYPE=none`). Off by default to avoid accidental canvas cleanup. | `false` |
-| `EIA_CANVAS_MAX_ROWS` | Row ceiling for `eia_query_route` staging. Reaching it costs five more requests: about 8.5 s on narrow routes such as `electricity/retail-sales`, 30–46 s on wide ones such as `electricity/facility-fuel`. Staging that would run past the call deadline stops early and names the offset to resume from. | `25000` |
-| `EIA_FACET_VALUE_CAP` | Facet values `eia_describe_route` returns per facet before truncating; page with `facet` and `values_offset`, or narrow with `values_query`. | `50` |
+| `EIA_CANVAS_MAX_ROWS` | Row ceiling for `eia_query_route` staging, at most 250,000. Reaching it costs five more requests: about 8.5 s on narrow routes such as `electricity/retail-sales`, 30–46 s on wide ones such as `electricity/facility-fuel`. Staging that would run past the call deadline stops early and names the offset to resume from. | `25000` |
+| `EIA_FACET_VALUE_CAP` | Facet values `eia_describe_route` returns per facet before truncating, at most 1,000; page with `facet` and `values_offset`, or narrow with `values_query`. | `50` |
+| `EIA_CLAMP_LIMITS` | Lower an over-cap `length`, `row_limit`, `preview`, or `limit` to its cap with a notice; `false` advertises and enforces each cap as a schema maximum instead. | `true` |
 | `CANVAS_PROVIDER_TYPE` | DataCanvas provider. `duckdb` enables `eia_dataframe_describe`, `eia_dataframe_query`, and `stage: true`; drop also needs `EIA_DATAFRAME_DROP_ENABLED=true`. `none` disables DataCanvas. The Claude Desktop bundle sets `none`. | `duckdb` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
@@ -304,7 +310,8 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 |:----------|:--------|
 | `src/index.ts` | `createApp()` entry point — registers tools and inits services. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
-| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`) — browse, describe, search, query, and three DataCanvas dataframe tools. |
+| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`) — browse, describe, search, query, and three DataCanvas dataframe tools — plus the shared count-input cap (`count-limit.ts`). |
+| `skills/` | Published agent skill (`eia-energy-guide`), served over MCP and shipped in the npm package, Docker image, and `.mcpb` bundle. |
 | `src/services/eia` | EIA API v2 service — route tree cache, Fuse.js index, facet fan-out, HTTP client. |
 | `src/services/canvas-bridge` | DataCanvas bridge — registers EIA query results as DuckDB dataframes, routes SQL queries. |
 | `tests/` | Unit and integration tests mirroring `src/`. |

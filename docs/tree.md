@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-10-23 06:00:12
+Generated on: 2026-10-29 08:48:06
 
 ```text
 eia-energy-mcp-server/
@@ -40,6 +40,8 @@ eia-energy-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -140,6 +142,9 @@ eia-energy-mcp-server/
 │   ├── search-battery.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
+├── skills/
+│   └── eia-energy-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -157,7 +162,7 @@ eia-energy-mcp-server/
 │   │       │   ├── describe-route.tool.ts
 │   │       │   ├── query-route.tool.ts
 │   │       │   └── search-routes.tool.ts
-│   │       ├── inline-budget.ts
+│   │       ├── count-limit.ts
 │   │       └── literal-table-cell.ts
 │   ├── services/
 │   │   ├── canvas-bridge/
@@ -170,8 +175,12 @@ eia-energy-mcp-server/
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── canvas-bridge.test.ts
 │   │   ├── cold-start.test.ts
@@ -185,6 +194,7 @@ eia-energy-mcp-server/
 │   │   ├── browse-routes-extra.tool.test.ts
 │   │   ├── browse-routes.tool.test.ts
 │   │   ├── canvas-execution.tool.test.ts
+│   │   ├── count-limit.test.ts
 │   │   ├── dataframe-describe-extra.tool.test.ts
 │   │   ├── dataframe-describe.tool.test.ts
 │   │   ├── dataframe-drop.tool.test.ts
@@ -217,7 +227,9 @@ eia-energy-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

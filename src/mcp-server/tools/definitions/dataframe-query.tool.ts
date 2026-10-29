@@ -6,25 +6,27 @@
  * EXPLAIN-plan walk, and system-catalog deny (denySystemCatalogs), over a DuckDB
  * engine that runs with external file access off.
  * EIA data values are VARCHAR — cast to DOUBLE for arithmetic.
- * Three bounds can end the inline rows and each gets its own disclosure:
+ * Two bounds can end the inline rows and each gets its own disclosure:
  * `row_limit` drops rows the canvas never counted (`truncated`, `totalRows` is
- * then the cap), while `preview` and the 64,000-byte inline budget only narrow
- * the inline slice of what is in hand.
+ * then the cap), while `preview` only narrows the inline slice of what is in
+ * hand.
  * @module mcp-server/tools/definitions/dataframe-query.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
-import {
-  boundedEcho,
-  fitRows,
-  INLINE_BUDGET_BYTES,
-  longestFittingPrefix,
-  trailerBytes,
-  utf8Bytes,
-} from '../inline-budget.js';
+import { clampCount, countSchema, modeDescription } from '../count-limit.js';
 import { literalTableCell, tableRow } from '../literal-table-cell.js';
+
+/**
+ * Most rows one statement materializes — the canvas provider's default row
+ * ceiling (`CANVAS_DEFAULT_ROW_LIMIT`), past which it refuses the query.
+ */
+const MAX_ROW_LIMIT = 10_000;
+
+/** Inline rows when the caller names no preview, lowered to a smaller row_limit. */
+const DEFAULT_PREVIEW = 25;
 
 /** The handler's return value, which `format()` renders. */
 interface DataframeQueryResult {
@@ -34,7 +36,7 @@ interface DataframeQueryResult {
   rows: Array<Record<string, unknown>>;
 }
 
-/** The markdown `format()` returns, as one string the handler can also measure. */
+/** The markdown `format()` returns. */
 function renderQueryResult(result: DataframeQueryResult): string {
   const lines: string[] = [];
   if (result.registered_as) {
@@ -42,22 +44,20 @@ function renderQueryResult(result: DataframeQueryResult): string {
       `Registered as ${result.registered_as} (expires ${result.expires_at ?? 'unknown'}).`,
     );
   }
-  if (result.rows.length === 0) {
-    lines.push('_No rows._');
-    return lines.join('\n');
-  }
   lines.push(
     `| ${result.columns.map(literalTableCell).join(' | ')} |`,
     `| ${result.columns.map(() => '---').join(' | ')} |`,
   );
   for (const row of result.rows) lines.push(tableRow(row, result.columns));
+  // The blank line ends the header-only table, which would otherwise take the note as a row.
+  if (result.rows.length === 0) lines.push('', '_No rows._');
   return lines.join('\n');
 }
 
 export const dataframeQueryTool = tool('eia_dataframe_query', {
   title: 'Query EIA Dataframes',
   description:
-    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route calls that passed stage: true — a query that staged nothing leaves no table to select from. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, file reads (read_* functions or a quoted file path), engine-setting functions (current_setting), and SQL built from a string (query_table) are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh expiry. Every dataframe named in the statement has its expiry extended by the query. Inline rows stop at a 64,000-byte budget per response surface; a result cut short says how to page the rest from a register_as table with ORDER BY … LIMIT/OFFSET.',
+    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route calls that passed stage: true — a query that staged nothing leaves no table to select from. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, file reads (read_* functions or a quoted file path), engine-setting functions (current_setting), and SQL built from a string (query_table) are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh expiry. Every dataframe named in the statement has its expiry extended by the query. Inline rows stop at preview; a result cut short says how to reach the rest, including paging a register_as table with LIMIT/OFFSET and no ORDER BY, which keeps the order the preview showed.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -145,30 +145,26 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       .describe(
         'When set, persist the result as a new dataframe with a fresh expiry. Use to chain analyses without re-running upstream queries. The name must be unused — reusing a staged name is rejected, and the fix is a different name, not dropping the existing dataframe. eia_dataframe_describe lists the names already taken.',
       ),
-    preview: z
-      .number()
-      .int()
-      .min(0)
+    preview: countSchema('preview', 0, MAX_ROW_LIMIT)
       .optional()
-      .describe(
-        'Rows to include in the immediate response. Defaults to row_limit; larger integers are clamped to 10000 with a notice. Set lower when chaining via register_as and only a sample is needed inline. The 64,000-byte response budget can end the inline rows sooner.',
+      .meta(
+        modeDescription(
+          'Rows to include in the immediate response. Default 25; a larger value returns at most row_limit and says so. 0 returns none, useful when chaining via register_as.',
+          'Rows to include in the immediate response. Default 25; at most 10,000, and a value above row_limit returns at most row_limit and says so. 0 returns none, useful when chaining via register_as.',
+        ),
       ),
-    row_limit: z
-      .number()
-      .int()
-      .min(1)
+    row_limit: countSchema('row_limit', 1, MAX_ROW_LIMIT)
       .default(1000)
-      .describe(
-        'Hard cap on rows materialized (default 1000; larger integers are clamped to 10000 with a notice). Rows past the cap are dropped without being counted — the response then carries truncated: true and a totalRows equal to the cap rather than a true total. Pass register_as to materialize the whole result instead and get an exact count. Of the rows materialized, only as many go inline as fit the 64,000-byte response budget.',
+      .meta(
+        modeDescription(
+          'Hard cap on rows materialized. Default 1,000; a larger value returns at most 10,000 and says so. Rows past the cap are dropped without being counted — the response then carries truncated: true and a totalRows equal to the cap rather than a true total. Pass register_as to materialize the whole result instead and get an exact count.',
+          'Hard cap on rows materialized. Default 1,000; at most 10,000. Rows past the cap are dropped without being counted — the response then carries truncated: true and a totalRows equal to the cap rather than a true total. Pass register_as to materialize the whole result instead and get an exact count.',
+        ),
       ),
   }),
 
   output: z.object({
-    columns: z
-      .array(z.string())
-      .describe(
-        'Column names in projection order. When no row is inline and the names pass 32,000 bytes, the list ends early with an entry counting the columns left out.',
-      ),
+    columns: z.array(z.string()).describe('Column names in projection order.'),
     rows: z
       .array(
         z
@@ -176,9 +172,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
           .passthrough()
           .describe('A result row with dynamic keys matching the SQL projection columns.'),
       )
-      .describe(
-        'Inline rows, bounded by preview, row_limit, and a 64,000-byte budget on each response surface — whole rows only; a row too large for the budget alone is withheld.',
-      ),
+      .describe('Inline rows, bounded by preview and row_limit.'),
     registered_as: z
       .string()
       .optional()
@@ -200,7 +194,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
     returnedRows: z
       .number()
       .describe(
-        'Rows included in this response. Below totalRows when preview or the response budget ended the inline rows; the notice names how to page the rest.',
+        'Rows included in this response. Below totalRows when preview ended the inline rows; the notice names how to reach the rest.',
       ),
     truncated: z
       .boolean()
@@ -209,152 +203,92 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       ),
     executedSql: z
       .string()
-      .describe(
-        'Echo of the SQL statement that was executed — confirms the exact query that ran. A statement past 4,000 bytes is echoed cut, ending with a marker that gives its full size; the whole statement ran.',
-      ),
+      .describe('Echo of the SQL statement that was executed — confirms the exact query that ran.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Discloses requested/effective row_limit and preview when clamped, including on short or empty results. When row_limit, preview, or the 64,000-byte response budget ended the inline rows, names each bound and how to reach the rows it withheld (raise a bound below its ceiling, or page a register_as table with ORDER BY … LIMIT/OFFSET).',
+        'Discloses requested/effective row_limit and preview when clamped, including on short or empty results. When row_limit or preview ended the inline rows, names each bound and how to reach the rows it withheld (raise a bound below its cap, or page a register_as table with LIMIT/OFFSET and no ORDER BY).',
       ),
   },
 
-  async handler(requestedInput, ctx) {
-    const input = {
-      ...requestedInput,
-      row_limit: Math.min(requestedInput.row_limit, 10000),
-      ...(requestedInput.preview !== undefined && {
-        preview: Math.min(requestedInput.preview, 10000),
-      }),
-    };
-    const clampNotices: string[] = [];
-    if (requestedInput.row_limit > input.row_limit)
-      clampNotices.push(
-        `Requested row_limit ${requestedInput.row_limit} was clamped to ${input.row_limit}.`,
-      );
-    if (requestedInput.preview !== undefined && requestedInput.preview > (input.preview ?? 0))
-      clampNotices.push(
-        `Requested preview ${requestedInput.preview} was clamped to ${input.preview}.`,
-      );
+  async handler(input, ctx) {
     const bridge = getCanvasBridge();
     if (!bridge) {
       throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.');
     }
 
+    const rowLimit = clampCount(
+      ctx,
+      'eia_dataframe_query',
+      'row_limit',
+      input.row_limit,
+      MAX_ROW_LIMIT,
+    );
+    /**
+     * `preview` is capped by this call's row_limit, since the canvas refuses a
+     * preview larger than the rows it materializes. An omitted preview takes
+     * the default, lowered without a notice to a smaller row_limit — the caller
+     * asked for nothing that was cut.
+     */
+    const preview =
+      input.preview === undefined
+        ? { applied: Math.min(DEFAULT_PREVIEW, rowLimit.applied) }
+        : clampCount(ctx, 'eia_dataframe_query', 'preview', input.preview, rowLimit.applied);
+
     const { result, meta } = await bridge.query(ctx, input.sql, {
       ...(input.register_as !== undefined && { registerAs: input.register_as }),
-      ...(input.preview !== undefined && { preview: input.preview }),
-      rowLimit: input.row_limit,
+      preview: preview.applied,
+      rowLimit: rowLimit.applied,
       sourceTool: 'eia_dataframe_query',
       queryParams: { sql: input.sql },
     });
 
     const truncated = result.truncated === true;
-    const materialized = result.rows.length;
-    const budget = `${INLINE_BUDGET_BYTES.toLocaleString()}-byte response budget`;
+    const shown = result.rows.length;
 
     /**
-     * The disclosure for `shown` inline rows. `row_limit` (`truncated`) drops
-     * rows uncounted, so `totalRows` is then the cap, never a total; `preview`
-     * and the response budget only narrow the inline slice of what is in hand.
-     * A budget-ended page points at `register_as` paged with LIMIT/OFFSET, the
-     * one retrieval path that is stable across calls.
+     * How the inline rows were bounded and how to reach the rest. `row_limit`
+     * (`truncated`) drops rows uncounted, so `totalRows` is then the cap, never
+     * a total; `preview` only narrows the inline slice of what is in hand.
+     * Paging points at a `register_as` table read with a bare LIMIT/OFFSET: the
+     * canvas previews that table with `SELECT * FROM <name> LIMIT n`, and DuckDB
+     * keeps a single table's stored order through LIMIT and OFFSET, so the
+     * pages continue the preview with no row repeated or skipped. An ORDER BY
+     * re-sorts — unstably, on VARCHAR — away from the order the preview showed.
      */
-    const boundNoticeFor = (shown: number): string | undefined => {
+    const boundNotice = ((): string | undefined => {
       const shownText = shown.toLocaleString();
       const shownRows = `${shownText} row${shown === 1 ? '' : 's'}`;
-      const rowLimitCut = `more rows matched than the row_limit cap of ${input.row_limit.toLocaleString()} and the remainder was dropped uncounted, so totalRows is that cap and not a total`;
+      const rowLimitCut = `more rows matched than the row_limit cap of ${rowLimit.applied.toLocaleString()} and the remainder was dropped uncounted, so totalRows is that cap and not a total`;
+      // A preview of 0 showed nothing, so paging starts at the first row with a default-sized page.
+      const step = shown || DEFAULT_PREVIEW;
       // SQL numbers carry no digit grouping — `LIMIT 3,977` does not parse.
-      const page = `ORDER BY <columns> LIMIT ${shown} OFFSET ${shown}`;
-      const paging = meta?.tableName
-        ? `The whole result is staged as ${meta.tableName}: page it with SELECT * FROM ${meta.tableName} ${page}.`
-        : `Re-run with register_as to stage the whole result as a dataframe${truncated ? ' with an exact row count' : ''}, then page it with SELECT * FROM <name> ${page}.`;
-      if (shown === 0 && materialized > 0) {
-        return `The first row alone exceeds the ${budget}, so no rows are shown inline${truncated ? ` (${rowLimitCut})` : ''} — select fewer or narrower columns; left(col, n) shortens long text.`;
-      }
-      if (shown < materialized) {
-        return truncated
-          ? `Showing ${shownRows} — ${rowLimitCut}, and the ${budget} then ended the inline rows at ${shownText} of the ${materialized.toLocaleString()} ${materialized < input.row_limit ? 'previewed' : 'materialized'}. ${paging}`
-          : `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — the ${budget} ended the inline rows. ${paging}`;
-      }
+      const page = (table: string) =>
+        `page it with SELECT * FROM ${table} LIMIT ${step} OFFSET ${shown}, raising OFFSET by ${step} for each further page (no ORDER BY: the table keeps the order the preview showed, and a sort reorders it).`;
+      const stageAndPage = `with register_as to stage the whole result as a dataframe${truncated ? ' with an exact row count' : ''}, then ${page('<name>')}`;
+      // An omitted preview below its default was lowered to row_limit, which preview never exceeds.
+      const previewCap =
+        input.preview === undefined && preview.applied < DEFAULT_PREVIEW
+          ? `preview capped the inline slice at ${preview.applied.toLocaleString()}, its default of ${DEFAULT_PREVIEW} lowered to row_limit`
+          : `preview capped the inline slice (it defaults to ${DEFAULT_PREVIEW})`;
       if (truncated) {
-        return `Showing ${shownRows} — ${rowLimitCut}. ${input.row_limit < 10000 ? 'Raise row_limit, or re-run' : 'Re-run'} with register_as to stage the whole result as a new dataframe, which reports an exact row count.`;
+        // A row_limit-cut result never carries a register_as table: that path counts the whole result.
+        return shown < result.rowCount
+          ? `Showing ${shownRows} — ${rowLimitCut}, and preview then ended the inline rows at ${shownText} of the ${result.rowCount.toLocaleString()} materialized. Raise preview to see more of them, or re-run ${stageAndPage}`
+          : `Showing ${shownRows} — ${rowLimitCut}. ${rowLimit.applied < MAX_ROW_LIMIT ? 'Raise row_limit, or re-run' : 'Re-run'} with register_as to stage the whole result as a new dataframe, which reports an exact row count.`;
       }
-      if (result.rowCount > materialized) {
+      if (result.rowCount > shown) {
         const guidance =
-          (input.preview ?? input.row_limit) < 10000
+          preview.applied < rowLimit.applied
             ? `; raise it to see more${meta?.tableName ? `, or query ${meta.tableName} directly` : ''}.`
-            : `. ${paging}`;
-        return `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — preview capped the inline slice (it defaults to row_limit)${guidance}`;
+            : meta?.tableName
+              ? `. The whole result is staged as ${meta.tableName}: ${page(meta.tableName)}`
+              : `. Re-run ${stageAndPage}`;
+        return `Showing ${shownText} of ${result.rowCount.toLocaleString()} rows — ${previewCap}${guidance}`;
       }
       return;
-    };
-    const noticeFor = (shown: number): string | undefined => {
-      const notices = [...clampNotices, boundNoticeFor(shown)].filter(Boolean);
-      return notices.length ? notices.join(' ') : undefined;
-    };
-
-    /**
-     * The column list a response with no inline row carries. A shown row's own
-     * keys already cost as much as the whole list, so beside rows it stays
-     * whole; alone, a projection wider than half the budget — a PIVOT over
-     * thousands of periods — ends early with an entry counting the rest.
-     */
-    const columnsWithoutRows = (() => {
-      const cap = INLINE_BUDGET_BYTES / 2;
-      const cost = (list: string[]) => utf8Bytes(JSON.stringify(list));
-      if (cost(result.columns) <= cap) return result.columns;
-      const listed = (m: number) => [
-        ...result.columns.slice(0, m),
-        `… ${(result.columns.length - m).toLocaleString()} more columns`,
-      ];
-      return listed(
-        longestFittingPrefix(Math.min(result.columns.length, cap), (m) => cost(listed(m)) <= cap),
-      );
     })();
-    const executedSql = boundedEcho(
-      input.sql,
-      (bytes) => ` … [echo cut here — the full ${bytes.toLocaleString()}-byte statement ran]`,
-    );
-
-    const outputFor = (shown: number) => ({
-      columns: shown > 0 ? result.columns : columnsWithoutRows,
-      rows: result.rows.slice(0, shown),
-      registered_as: meta?.tableName,
-      expires_at: meta?.expiresAt,
-    });
-    const enrichmentFor = (shown: number) => ({
-      totalRows: result.rowCount,
-      returnedRows: shown,
-      truncated,
-      executedSql,
-      notice: noticeFor(shown),
-    });
-
-    /**
-     * Inline as many whole rows as fit the budget on both surfaces:
-     * structuredContent is the output merged with enrichment, content[] the
-     * rendered table plus the enrichment trailer, `notice` as a block quote.
-     */
-    const shown = fitRows(
-      materialized,
-      (k) => {
-        const output = outputFor(k);
-        const enrichment = enrichmentFor(k);
-        return {
-          structured: utf8Bytes(JSON.stringify({ ...output, ...enrichment })),
-          text: utf8Bytes(renderQueryResult(output)) + trailerBytes(enrichment, {}, ['notice']),
-        };
-      },
-      (i) => {
-        const row = result.rows[i] ?? {};
-        return {
-          structured: utf8Bytes(JSON.stringify(row)) + 1,
-          text: utf8Bytes(tableRow(row, result.columns)) + 1,
-        };
-      },
-    );
 
     ctx.log.info('EIA dataframe query executed', {
       rowCount: result.rowCount,
@@ -363,11 +297,21 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       registeredAs: meta?.tableName,
     });
 
-    const { notice, ...enrichment } = enrichmentFor(shown);
-    ctx.enrich(enrichment);
-    if (notice !== undefined) ctx.enrich.notice(notice);
+    ctx.enrich({
+      totalRows: result.rowCount,
+      returnedRows: shown,
+      truncated,
+      executedSql: input.sql,
+    });
+    const notice = [rowLimit.notice, preview.notice, boundNotice].filter(Boolean).join(' ');
+    if (notice) ctx.enrich.notice(notice);
 
-    return outputFor(shown);
+    return {
+      columns: result.columns,
+      rows: result.rows,
+      registered_as: meta?.tableName,
+      expires_at: meta?.expiresAt,
+    };
   },
 
   format: (result) => [{ type: 'text', text: renderQueryResult(result) }],

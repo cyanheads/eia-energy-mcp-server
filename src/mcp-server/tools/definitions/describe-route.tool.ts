@@ -72,10 +72,13 @@ const matchesQuery = (v: { id: string; name: string; alias?: string }, needle: s
   v.name.toLowerCase().includes(needle) ||
   v.alias?.toLowerCase().includes(needle) === true;
 
+/** An epoch-ms instant as ISO 8601 UTC to the second — `2026-10-28T09:00:00Z`. */
+const utc = (ms: number): string => `${new Date(ms).toISOString().slice(0, 19)}Z`;
+
 export const describeRouteTool = tool('eia_describe_route', {
   title: 'Describe EIA Route',
   description:
-    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. To find a value by name in a large facet (plant, entity, and mine IDs run to thousands), pass values_query: each facet keeps only the values whose id, name, or alias contains it, values_matched counts them, and values_offset pages the matches. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints, merged, and cached per route; a facet whose values EIA did not return is left out of facets, named in unavailable_facets, and fetched again by the next call.',
+    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. To find a value by name in a large facet (plant, entity, and mine IDs run to thousands), pass values_query: each facet keeps only the values whose id, name, or alias contains it, values_matched counts them, and values_offset pages the matches. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints, merged, and cached per route for 24 hours, after which the next call fetches the route again; a facet whose values EIA did not return is left out of facets, named in unavailable_facets, and fetched again by the next call. When a refresh fails, the cached values are served instead, with a notice naming when they were fetched.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   inputAliases: { path: 'route' },
 
@@ -228,7 +231,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .optional()
       .describe(
-        'Default-frequency date-range context, composed with guidance for exhausted facet windows, a values_query no value matched, or unavailable facet values.',
+        'Default-frequency date-range context, composed with guidance for exhausted facet windows, a values_query no value matched, unavailable facet values, or cached values served because their refresh failed.',
       ),
   },
 
@@ -415,6 +418,29 @@ export const describeRouteTool = tool('eia_describe_route', {
       notices.push(
         `EIA did not return the values of ${unavailableFacets.join(', ')} after retries, so ${one ? 'it is' : 'they are'} left out of facets. ${one ? 'The ID still filters' : 'The IDs still filter'} eia_query_route; call eia_describe_route again to re-fetch only the missing value lists.`,
       );
+    }
+    /**
+     * A list served from an earlier fetch because EIA did not answer its
+     * refresh still pages and filters as before, so it stays in facets — but it
+     * can lack values EIA added since, so the time it was fetched is named.
+     */
+    if (meta.stale) {
+      const lists = meta.stale.facets.filter((f) => !input.facet || f.id === input.facet);
+      const stale: string[] = [];
+      if (meta.stale.route) {
+        stale.push(
+          `EIA did not answer the refresh of this route, so the description cached at ${utc(meta.fetchedAt)} is served as it stood; date_range, frequencies, data columns, and facet values may have changed since.`,
+        );
+      }
+      if (lists.length > 0) {
+        const one = lists.length === 1;
+        stale.push(
+          `EIA did not answer the refresh of the value ${one ? 'list' : 'lists'} of ${lists.map((f) => `${f.id} (fetched ${utc(f.fetchedAt)})`).join(', ')}, so ${one ? 'it is' : 'they are'} served as last fetched and may lack values EIA has added since.`,
+        );
+      }
+      if (stale.length > 0) {
+        notices.push(`${stale.join(' ')} The next eia_describe_route call retries the refresh.`);
+      }
     }
     ctx.enrich.notice(notices.join(' '));
 

@@ -24,6 +24,7 @@ import {
   _resetEiaApiService,
   getEiaApiService,
   initEiaApiService,
+  ROUTE_METADATA_TTL_MS,
   shutdownEiaApiService,
   TREE_BUILD_CONCURRENCY,
 } from '@/services/eia/eia-service.js';
@@ -315,44 +316,39 @@ describe('cached facet diagnostics (#81)', () => {
   it.each([
     ['repeated', Array<string>(1000).fill('ZZ')],
     ['distinct', Array.from({ length: 120 }, (_, i) => `S${String(i).padStart(3, '0')}`)],
-  ] as const)(
-    'keeps %s filter diagnostics within the response budget without dropping values',
-    async (kind, values) => {
-      const { paths, urls } = stubApiPaths({
-        [LEAF]: {
-          response: {
-            id: 'retail-sales',
-            facets: [{ id: 'stateid', description: 'State' }],
-            data: {},
-          },
+  ] as const)('keeps every %s filter value in the diagnostics', async (kind, values) => {
+    const { paths, urls } = stubApiPaths({
+      [LEAF]: {
+        response: {
+          id: 'retail-sales',
+          facets: [{ id: 'stateid', description: 'State' }],
+          data: {},
         },
-        [`${LEAF}/facet/stateid`]: {
-          response: { totalFacets: 1, facets: [{ id: 'TX', name: 'Texas' }] },
-        },
-        [`${LEAF}/data`]: { response: { total: '0', data: [] } },
-      });
-      await getEiaApiService().describe(LEAF, createMockContext());
-      paths.length = 0;
-      const result = await runToolContract(queryRouteTool, {
-        route: LEAF,
-        filters: { stateid: values },
-        columns: ['price'],
-      });
-      expect(result.isError).not.toBe(true);
-      const structured = result.structuredContent as { notice: string };
-      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
-      expect(Buffer.byteLength(JSON.stringify(structured))).toBeLessThanOrEqual(64000);
-      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(64000);
-      for (const value of new Set(values)) {
-        expect(structured.notice).toContain(JSON.stringify(value));
-        expect(text).toContain(JSON.stringify(value));
-      }
-      expect(urls.at(-1)?.searchParams.getAll('facets[stateid][]')).toEqual(values);
-      expect(paths).toEqual([`${LEAF}/data`]);
-      if (kind === 'distinct') expect(urls.at(-1)?.href.length).toBeLessThan(8192);
-      else expect(structured.notice.match(/"ZZ"/g)).toHaveLength(1);
-    },
-  );
+      },
+      [`${LEAF}/facet/stateid`]: {
+        response: { totalFacets: 1, facets: [{ id: 'TX', name: 'Texas' }] },
+      },
+      [`${LEAF}/data`]: { response: { total: '0', data: [] } },
+    });
+    await getEiaApiService().describe(LEAF, createMockContext());
+    paths.length = 0;
+    const result = await runToolContract(queryRouteTool, {
+      route: LEAF,
+      filters: { stateid: values },
+      columns: ['price'],
+    });
+    expect(result.isError).not.toBe(true);
+    const structured = result.structuredContent as { notice: string };
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    for (const value of new Set(values)) {
+      expect(structured.notice).toContain(JSON.stringify(value));
+      expect(text).toContain(JSON.stringify(value));
+    }
+    expect(urls.at(-1)?.searchParams.getAll('facets[stateid][]')).toEqual(values);
+    expect(paths).toEqual([`${LEAF}/data`]);
+    if (kind === 'distinct') expect(urls.at(-1)?.href.length).toBeLessThan(8192);
+    else expect(structured.notice.match(/"ZZ"/g)).toHaveLength(1);
+  });
 
   it('renders unmatched values literally while retaining raw notice data', async () => {
     const value = '`code` [link](https://example.test) <b> & _text_';
@@ -1396,8 +1392,12 @@ describe('EiaApiService.query — data columns for a query without columns (#69)
         description: 'State',
         values: [{ id: 'WY', name: 'Wyoming' }],
         complete: true,
+        fetchedAt: expect.any(Number),
       },
     ]);
+    // Fetched for the entry the query wrote, never stamped before its metadata.
+    expect(meta.facets[0]?.fetchedAt).toBeGreaterThanOrEqual(meta.fetchedAt);
+    expect(meta).not.toHaveProperty('stale');
     expect(meta.dataColumns.map((c) => c.id)).toEqual(['production', 'price']);
     expect(searchRoutes('Wyoming', 5)[0]?.entry.filter_hint).toEqual({ stateId: 'WY' });
 
@@ -1974,6 +1974,466 @@ describe('EiaApiService.describe — a facet value list that fails past its retr
         facets: [{ id: 'bad', value_count: 2 }],
       });
       expect(result.structuredContent).not.toHaveProperty('unavailable_facets');
+    });
+  });
+});
+
+// ------------------------------------------------------------------
+// #91 — a cached route entry expires 24 h after its fetch. The next describe
+// refreshes the route metadata and every facet list; a refresh that fails
+// serves what was cached, marked stale, and a 404 drops the entry. A query
+// never refreshes, and its unmatched-filter notice skips an expired list.
+// ------------------------------------------------------------------
+
+describe('EiaApiService.describe — cached entries expire and refresh (#91)', () => {
+  const ROUTE = 'alpha';
+
+  type Mode = 'ok' | 'unavailable' | 'not-found' | 'cancel' | 'hold';
+
+  interface Upstream {
+    /** Aborted by a `cancel` path, from inside the fetch — the call's own signal. */
+    controller?: AbortController;
+    endPeriod: string;
+    held?: PromiseWithResolvers<void>;
+    lists: Record<string, Array<{ id: string; name: string }>>;
+    /** How each path answers; absent means `ok`. */
+    mode: Record<string, Mode>;
+    /** Released to answer a `hold` path; `held` resolves once one is waiting. */
+    release?: PromiseWithResolvers<void>;
+  }
+
+  const metaOf = (endPeriod: string) => ({
+    id: 'alpha',
+    name: 'Alpha',
+    description: 'Alpha leaf',
+    facets: [
+      { id: 'fuel', description: 'Fuel' },
+      { id: 'plant', description: 'Plant' },
+    ],
+    frequency: [{ id: 'monthly', description: 'Monthly', query: 'M', format: 'YYYY-MM' }],
+    data: { generation: { alias: 'Generation', units: 'MWh' } },
+    startPeriod: '2001-01',
+    endPeriod,
+    defaultFrequency: 'monthly',
+    defaultDateFormat: 'YYYY-MM',
+  });
+
+  /** A mutable EIA: the alpha route, its two facet lists, and its data page. */
+  function stubUpstream(up: Upstream) {
+    const hits: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname.replace(/^\/v2\/?/, '').replace(/\/$/, '');
+        hits.push(path);
+        switch (up.mode[path] ?? 'ok') {
+          case 'unavailable':
+            return Response.json({ error: 'upstream unavailable' }, { status: 503 });
+          case 'not-found':
+            return Response.json({ error: 'not found' }, { status: 404 });
+          case 'cancel':
+            up.controller?.abort();
+            throw new DOMException('The operation was aborted.', 'AbortError');
+          case 'hold': {
+            up.mode[path] = 'ok';
+            up.held?.resolve();
+            // A held request still ends when its signal aborts, as a real fetch does.
+            const { promise: aborted, reject } = Promise.withResolvers<never>();
+            init?.signal?.addEventListener(
+              'abort',
+              () => reject(new DOMException('The operation was aborted.', 'AbortError')),
+              { once: true },
+            );
+            await Promise.race([up.release?.promise, aborted]);
+            break;
+          }
+        }
+        if (path === ROUTE) return Response.json({ response: metaOf(up.endPeriod) });
+        if (path === `${ROUTE}/data`) {
+          return Response.json({ response: { total: '0', frequency: 'monthly', data: [] } });
+        }
+        const list = up.lists[path.slice(`${ROUTE}/facet/`.length)];
+        if (!path.startsWith(`${ROUTE}/facet/`) || !list) {
+          return Response.json({ error: 'not found' }, { status: 404 });
+        }
+        return Response.json({ response: { totalFacets: list.length, facets: list } });
+      }),
+    );
+    return hits;
+  }
+
+  const FUEL = [{ id: 'SUN', name: 'Solar' }];
+  const PLANTS = [
+    { id: '1001', name: 'Palo Verde' },
+    { id: '1002', name: 'Comanche Peak' },
+  ];
+  const PLANTS_AFTER_RELEASE = [...PLANTS, { id: '70425', name: 'Sebree Solar II' }];
+
+  const upstream = (): Upstream => ({
+    endPeriod: '2026-07',
+    lists: { fuel: FUEL, plant: PLANTS },
+    mode: {},
+  });
+
+  /** Settle a call while running out any retry backoff on the fake clock. */
+  async function settle<T>(call: () => Promise<T>): Promise<T> {
+    const pending = call();
+    pending.catch(() => undefined);
+    await vi.runAllTimersAsync();
+    return pending;
+  }
+
+  const describeAlpha = (ctx = createMockContext()) =>
+    settle(() => getEiaApiService().describe(ROUTE, ctx));
+
+  const countOf = (hits: string[], path: string) => hits.filter((h) => h === path).length;
+
+  /** The instant the first describe of each test fetches at. */
+  const T0 = Date.parse('2026-10-01T09:00:00Z');
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: T0 });
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+    initRouteCache([metaOf('2026-07')], []);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  it('pins the TTL at exactly 24 hours', () => {
+    expect(ROUTE_METADATA_TTL_MS).toBe(86_400_000);
+  });
+
+  it('answers from the cache until 24 h after the fetch, with no request', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    await describeAlpha();
+
+    // EIA publishes meanwhile; the entry is not yet due.
+    up.endPeriod = '2026-08';
+    up.lists.plant = PLANTS_AFTER_RELEASE;
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS - 1);
+    hits.length = 0;
+    const meta = await describeAlpha();
+
+    expect(hits).toEqual([]);
+    expect(meta.dateRange.end).toBe('2026-07');
+    expect(meta.facets.find((f) => f.id === 'plant')?.values).toHaveLength(2);
+    expect(meta).not.toHaveProperty('stale');
+  });
+
+  it('re-fetches the route metadata and every list once at 24 h, and indexes added values', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    await describeAlpha();
+    expect(
+      searchRoutes('Sebree Solar II', 5).some((r) => r.entry.filter_hint?.plant === '70425'),
+    ).toBe(false);
+
+    up.endPeriod = '2026-08';
+    up.lists.plant = PLANTS_AFTER_RELEASE;
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+    hits.length = 0;
+    const meta = await describeAlpha();
+
+    expect([...hits].sort()).toEqual([ROUTE, `${ROUTE}/facet/fuel`, `${ROUTE}/facet/plant`]);
+    expect(meta.dateRange.end).toBe('2026-08');
+    expect(meta.fetchedAt).toBe(T0 + ROUTE_METADATA_TTL_MS);
+    expect(meta.facets.find((f) => f.id === 'plant')?.values).toEqual(PLANTS_AFTER_RELEASE);
+    expect(meta).not.toHaveProperty('stale');
+    expect(meta.unfetchedFacets).toBeUndefined();
+    expect(searchRoutes('Sebree Solar II', 5)[0]?.entry.filter_hint).toEqual({ plant: '70425' });
+
+    // The refreshed entry is the new 24 h baseline.
+    hits.length = 0;
+    await describeAlpha();
+    expect(hits).toEqual([]);
+  });
+
+  it('serves a list whose refresh fails from its previous values, marked stale, then retries it alone', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    await describeAlpha();
+
+    up.endPeriod = '2026-08';
+    up.lists.fuel = [...FUEL, { id: 'WND', name: 'Wind' }];
+    up.lists.plant = PLANTS_AFTER_RELEASE;
+    up.mode[`${ROUTE}/facet/plant`] = 'unavailable';
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+    hits.length = 0;
+    const meta = await describeAlpha();
+
+    // Its retries ran out; the metadata and the other list refreshed.
+    expect(countOf(hits, `${ROUTE}/facet/plant`)).toBe(4);
+    expect(meta.dateRange.end).toBe('2026-08');
+    expect(meta.facets.find((f) => f.id === 'fuel')?.values).toHaveLength(2);
+    expect(meta.facets.find((f) => f.id === 'plant')?.values).toEqual(PLANTS);
+    expect(meta.unfetchedFacets).toBeUndefined();
+    expect(meta.stale).toEqual({ route: false, facets: [{ id: 'plant', fetchedAt: T0 }] });
+
+    // The next describe retries that list alone, and clears the mark once it lands.
+    delete up.mode[`${ROUTE}/facet/plant`];
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS + 60_000);
+    hits.length = 0;
+    const next = await describeAlpha();
+    expect(hits).toEqual([`${ROUTE}/facet/plant`]);
+    expect(next.facets.find((f) => f.id === 'plant')?.values).toEqual(PLANTS_AFTER_RELEASE);
+    expect(next).not.toHaveProperty('stale');
+
+    hits.length = 0;
+    await describeAlpha();
+    expect(hits).toEqual([]);
+  });
+
+  it('serves the whole previous entry when the route metadata refresh fails, fetching no list', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    await describeAlpha();
+
+    up.endPeriod = '2026-08';
+    up.lists.plant = PLANTS_AFTER_RELEASE;
+    up.mode[ROUTE] = 'unavailable';
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+    hits.length = 0;
+    const meta = await describeAlpha();
+
+    expect(hits).toEqual([ROUTE, ROUTE, ROUTE, ROUTE]);
+    expect(meta.dateRange.end).toBe('2026-07');
+    expect(meta.fetchedAt).toBe(T0);
+    expect(meta.facets.find((f) => f.id === 'plant')?.values).toEqual(PLANTS);
+    expect(meta.stale).toEqual({ route: true, facets: [] });
+
+    // Still due: the next describe tries the refresh again, and it lands.
+    delete up.mode[ROUTE];
+    hits.length = 0;
+    const next = await describeAlpha();
+    expect([...hits].sort()).toEqual([ROUTE, `${ROUTE}/facet/fuel`, `${ROUTE}/facet/plant`]);
+    expect(next.dateRange.end).toBe('2026-08');
+    expect(next).not.toHaveProperty('stale');
+  });
+
+  it('names a list older than the served entry when the metadata refresh fails again', async () => {
+    const up = upstream();
+    stubUpstream(up);
+    await describeAlpha();
+
+    // The first refresh lands for the metadata but not for plant.
+    up.mode[`${ROUTE}/facet/plant`] = 'unavailable';
+    const T1 = T0 + ROUTE_METADATA_TTL_MS;
+    vi.setSystemTime(T1);
+    await describeAlpha();
+
+    // A day later the metadata refresh fails too: the entry from T1 is served,
+    // and plant's values are still those fetched at T0.
+    up.mode[ROUTE] = 'unavailable';
+    vi.setSystemTime(T1 + ROUTE_METADATA_TTL_MS);
+    const meta = await describeAlpha();
+    expect(meta.fetchedAt).toBe(T1);
+    expect(meta.stale).toEqual({ route: true, facets: [{ id: 'plant', fetchedAt: T0 }] });
+  });
+
+  it('drops the entry and fails route_not_found when the refresh is answered 404', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    await describeAlpha();
+
+    up.mode[ROUTE] = 'not-found';
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+    hits.length = 0;
+    await expect(describeAlpha()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'route_not_found' },
+    });
+    // A 404 is EIA's answer, not an outage: answered once, never retried.
+    expect(hits).toEqual([ROUTE]);
+
+    // Nothing is left to fall back to: an outage now fails the call outright
+    // instead of serving the dropped entry as stale.
+    up.mode[ROUTE] = 'unavailable';
+    await expect(describeAlpha()).rejects.toMatchObject({
+      data: { reason: 'upstream_unavailable' },
+    });
+  });
+
+  it.each([
+    ['the route metadata', ROUTE],
+    ['a facet list', `${ROUTE}/facet/plant`],
+  ])(
+    'propagates a caller cancellation during the refresh of %s and keeps the previous entry',
+    async (_, cancelled) => {
+      const up = upstream();
+      stubUpstream(up);
+      await describeAlpha();
+
+      up.endPeriod = '2026-08';
+      up.lists.plant = PLANTS_AFTER_RELEASE;
+      up.mode[cancelled] = 'cancel';
+      up.controller = new AbortController();
+      vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+      await expect(
+        describeAlpha(createMockContext({ signal: up.controller.signal })),
+      ).rejects.toMatchObject({ name: 'AbortError' });
+
+      // The previous entry is still there for the next caller: with EIA now
+      // down, that caller is served it as stale rather than failing.
+      up.mode = { [ROUTE]: 'unavailable' };
+      const meta = await describeAlpha();
+      expect(meta.dateRange.end).toBe('2026-07');
+      expect(meta.facets.find((f) => f.id === 'plant')?.values).toEqual(PLANTS);
+      expect(meta.stale).toEqual({ route: true, facets: [] });
+    },
+  );
+
+  it('keeps the refresh a concurrent describe lands when the other is cancelled mid-refresh', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    await describeAlpha();
+
+    up.endPeriod = '2026-08';
+    up.lists.plant = PLANTS_AFTER_RELEASE;
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+
+    // The first describe's refresh stalls on its plant list.
+    up.mode[`${ROUTE}/facet/plant`] = 'hold';
+    up.held = Promise.withResolvers();
+    up.release = Promise.withResolvers();
+    const controller = new AbortController();
+    const cancelled = getEiaApiService().describe(
+      ROUTE,
+      createMockContext({ signal: controller.signal }),
+    );
+    cancelled.catch(() => undefined);
+    await up.held.promise;
+
+    // A second describe refreshes in full meanwhile. Every request here answers
+    // at once, so no call runs the fake clock — which would fire the stalled
+    // call's attempt timeout.
+    const refreshed = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(refreshed.dateRange.end).toBe('2026-08');
+    expect(refreshed.facets.find((f) => f.id === 'plant')?.values).toEqual(PLANTS_AFTER_RELEASE);
+
+    controller.abort();
+    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+
+    // The cancellation neither drops nor reverts the refreshed entry.
+    hits.length = 0;
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(hits).toEqual([]);
+    expect(meta.dateRange.end).toBe('2026-08');
+    expect(meta.fetchedAt).toBe(T0 + ROUTE_METADATA_TTL_MS);
+    expect(meta).not.toHaveProperty('stale');
+  });
+
+  it('keeps a refreshed entry when a describe begun from the expired one lands after it', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    // plant fails on the first describe, so the entry holds it unfetched.
+    up.mode[`${ROUTE}/facet/plant`] = 'not-found';
+    await describeAlpha();
+
+    // Just inside the TTL, a describe starts repairing plant from that entry
+    // and stalls on it.
+    up.mode[`${ROUTE}/facet/plant`] = 'hold';
+    up.held = Promise.withResolvers();
+    up.release = Promise.withResolvers();
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS - 1);
+    const slow = getEiaApiService().describe(ROUTE, createMockContext());
+    await up.held.promise;
+
+    // The entry expires and another describe refreshes it in full. Every
+    // request here answers at once, so no call runs the fake clock — which
+    // would fire the stalled call's attempt timeout.
+    up.endPeriod = '2026-08';
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+    const refreshed = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(refreshed.dateRange.end).toBe('2026-08');
+
+    // The stalled repair lands last; it must not put the older entry back.
+    up.release.resolve();
+    await slow;
+    hits.length = 0;
+    const meta = await getEiaApiService().describe(ROUTE, createMockContext());
+    expect(hits).toEqual([]);
+    expect(meta.dateRange.end).toBe('2026-08');
+    expect(meta.fetchedAt).toBe(T0 + ROUTE_METADATA_TTL_MS);
+  });
+
+  it('skips an expired list in the query notice, and the query refreshes nothing', async () => {
+    const up = upstream();
+    const hits = stubUpstream(up);
+    await describeAlpha();
+    const query = () =>
+      getEiaApiService().query(ROUTE, { filters: { plant: '70425' } }, createMockContext());
+
+    // One millisecond inside the TTL the complete cached list diagnoses the
+    // unmatched value (the #81 suite carries that notice to both tool surfaces).
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS - 1);
+    hits.length = 0;
+    expect((await query()).notices).toEqual([
+      'Filter plant value "70425" is not in the complete cached vocabulary. The submitted filter was preserved.',
+    ]);
+    expect(hits).toEqual([`${ROUTE}/data`]);
+
+    // From the TTL on, EIA may have added the value since: no claim, and no refresh.
+    vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+    hits.length = 0;
+    expect((await query()).notices).toBeUndefined();
+    expect(hits).toEqual([`${ROUTE}/data`]);
+  });
+
+  describe('through eia_describe_route', () => {
+    it('keeps a stale list in facets, out of unavailable_facets, with a notice naming when it was fetched', async () => {
+      const up = upstream();
+      stubUpstream(up);
+      await settle(() => runToolContract(describeRouteTool, { route: ROUTE }));
+
+      up.mode[`${ROUTE}/facet/plant`] = 'unavailable';
+      vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+      const result = await settle(() =>
+        runToolContract(describeRouteTool, { route: ROUTE, facet: 'plant', values_query: 'palo' }),
+      );
+
+      // The facet input pages the previous list rather than failing facet_unavailable.
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).not.toHaveProperty('unavailable_facets');
+      expect(result.structuredContent).toMatchObject({
+        facets: [{ id: 'plant', value_count: 2, values_matched: 1, values: [{ id: '1001' }] }],
+      });
+      const stale =
+        'EIA did not answer the refresh of the value list of plant (fetched 2026-10-01T09:00:00Z), so it is served as last fetched and may lack values EIA has added since. The next eia_describe_route call retries the refresh.';
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice.endsWith(stale)).toBe(true);
+      const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+      expect(text).toContain('2026-10-01T09:00:00Z');
+      expect(text).toContain('may lack values EIA has added since');
+    });
+
+    it('fails a facet input whose list was never fetched when the metadata refresh fails', async () => {
+      const up = upstream();
+      stubUpstream(up);
+      up.mode[`${ROUTE}/facet/plant`] = 'not-found';
+      await settle(() => runToolContract(describeRouteTool, { route: ROUTE }));
+
+      up.mode = { [ROUTE]: 'unavailable' };
+      vi.setSystemTime(T0 + ROUTE_METADATA_TTL_MS);
+      const result = await settle(() =>
+        runToolContract(describeRouteTool, { route: ROUTE, facet: 'plant' }),
+      );
+
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'facet_unavailable', retryable: true } },
+      });
     });
   });
 });
@@ -3269,7 +3729,11 @@ describe('EiaApiService — requests are bounded in time (#90)', () => {
     const { offsets } = timedPages(9_000, 30_000);
 
     const result = await settle(
-      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+      getEiaApiService().query(
+        LEAF,
+        { columns: ['price'], accumulate: true, length: 100 },
+        createMockContext(),
+      ),
     );
 
     expect(result.ok).toBe(true);
@@ -3287,7 +3751,11 @@ describe('EiaApiService — requests are bounded in time (#90)', () => {
     const { offsets } = timedPages(13_000, 30_000);
 
     const result = await settle(
-      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+      getEiaApiService().query(
+        LEAF,
+        { columns: ['price'], accumulate: true, length: 100 },
+        createMockContext(),
+      ),
     );
 
     expect(result.ok).toBe(true);
@@ -3308,7 +3776,11 @@ describe('EiaApiService — requests are bounded in time (#90)', () => {
     const { offsets } = timedPages((offset) => (offset === 0 ? 29_000 : 1_000), 300);
 
     const result = await settle(
-      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+      getEiaApiService().query(
+        LEAF,
+        { columns: ['price'], accumulate: true, length: 100 },
+        createMockContext(),
+      ),
     );
 
     expect(result.ok).toBe(true);
@@ -3330,7 +3802,11 @@ describe('EiaApiService — requests are bounded in time (#90)', () => {
     );
 
     const result = await settle(
-      getEiaApiService().query(LEAF, { columns: ['price'], accumulate: true }, createMockContext()),
+      getEiaApiService().query(
+        LEAF,
+        { columns: ['price'], accumulate: true, length: 100 },
+        createMockContext(),
+      ),
     );
 
     expect(result.ok).toBe(true);

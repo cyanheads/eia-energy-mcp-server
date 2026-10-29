@@ -87,6 +87,12 @@ export interface Facet {
   /** True only when the upstream total proves every filterable value is cached. */
   complete?: boolean;
   description: string;
+  /**
+   * When describe fetched this value list (epoch ms). Absent on a list never
+   * fetched — one named in `RouteMetadata.unfetchedFacets`. A list whose
+   * refresh failed keeps the values and the `fetchedAt` of its last fetch.
+   */
+  fetchedAt?: number;
   id: string;
   values: Array<{ id: string; name: string; alias?: string }>;
 }
@@ -111,8 +117,23 @@ export interface RouteMetadata {
    * the same as an empty facet.
    */
   facets: Facet[];
+  /**
+   * When `GET /v2/{route}` answered (epoch ms). The cached entry expires
+   * `ROUTE_METADATA_TTL_MS` after it; the next describe then refreshes the
+   * route metadata and every facet list.
+   */
+  fetchedAt: number;
   frequencies: RawFrequency[];
   route: string;
+  /**
+   * Set only on what `describe()` returns, never on the cached entry: what this
+   * describe served as last fetched because EIA did not answer its refresh.
+   * `route` is true when the route metadata's refresh failed, so the whole
+   * entry is served as it stood (its metadata fetched at `fetchedAt`); `facets`
+   * names each value list served from an earlier fetch than the entry's
+   * metadata, with when that list was fetched.
+   */
+  stale?: { route: boolean; facets: Array<{ id: string; fetchedAt: number }> };
   /**
    * IDs of facets whose value lists are not in hand: every facet on an entry a
    * query wrote from the route metadata alone, or the lists a describe could

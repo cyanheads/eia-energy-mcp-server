@@ -13,6 +13,7 @@ import {
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext,
+  getEnrichment,
   type MockContextLogger,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
@@ -58,11 +59,16 @@ interface CanvasHarness {
  */
 const DUCKDB_TIMEOUT = { timeout: 30_000 };
 
-function newCanvas(): DataCanvas {
+/**
+ * DuckDB's thread count follows `memoryLimitMb` (one thread per 64 MB, at most
+ * the cores): 128 MB runs 2 threads; the 1,024 MB deployment default runs one
+ * per core up to 16.
+ */
+function newCanvas(memoryLimitMb = 128): DataCanvas {
   const provider = new DuckdbProvider({
     defaultRowLimit: 10000,
     exportRootPath: '/tmp/eia-canvas-tests',
-    memoryLimitMb: 128,
+    memoryLimitMb,
     schemaSniffRows: 100,
   });
   return new DataCanvas(
@@ -87,8 +93,11 @@ beforeAll(async () => {
 }, 60_000);
 
 /** Run `body` against a real DuckDB canvas wired into the bridge, then tear it down. */
-async function withCanvas(body: (harness: CanvasHarness) => Promise<void>): Promise<void> {
-  const canvas = newCanvas();
+async function withCanvas(
+  body: (harness: CanvasHarness) => Promise<void>,
+  memoryLimitMb?: number,
+): Promise<void> {
+  const canvas = newCanvas(memoryLimitMb);
   const faults: Faults = {};
   const realAcquire = canvas.acquire.bind(canvas);
   canvas.acquire = async (...args: Parameters<DataCanvas['acquire']>) => {
@@ -456,21 +465,16 @@ describe('staging and drop failures against a real canvas (#60)', DUCKDB_TIMEOUT
 });
 
 // ---------------------------------------------------------------------------
-// #58 — the inline byte budget against real DuckDB results.
+// #96 — length and preview are the inline page, against real DuckDB results.
 // ---------------------------------------------------------------------------
 
-describe('inline byte budget against a real canvas (#58)', DUCKDB_TIMEOUT, () => {
-  const BUDGET = 64_000;
-  const bytes = (text: string) => Buffer.byteLength(text, 'utf8');
+describe('page size against a real canvas (#96)', DUCKDB_TIMEOUT, () => {
   const surfaces = (result: { structuredContent?: unknown; content?: unknown }) => ({
     sc: result.structuredContent as Record<string, unknown> & {
       rows: Array<Record<string, unknown>>;
       data: Array<Record<string, unknown>>;
     },
-    scBytes: bytes(JSON.stringify(result.structuredContent)),
-    textBytes: bytes(
-      ((result.content ?? []) as Array<{ text?: string }>).map((b) => b.text ?? '').join(''),
-    ),
+    text: ((result.content ?? []) as Array<{ text?: string }>).map((b) => b.text ?? '').join(''),
   });
 
   /** A ten-row digit table to cross-join into larger results (range() is gated off). */
@@ -493,23 +497,25 @@ describe('inline byte budget against a real canvas (#58)', DUCKDB_TIMEOUT, () =>
     vi.restoreAllMocks();
   });
 
-  it('stages every accumulated row while the inline page ends at the budget', () =>
+  it('stages every accumulated row and returns the whole default 25-row page', () =>
     withCanvas(async ({ faults }) => {
       vi.stubEnv('EIA_API_KEY', 'test-key');
       initEiaApiService();
-      vi.spyOn(getEiaApiService(), 'query').mockResolvedValue({
-        route: 'electricity/operating-generator-capacity',
-        total: 26_000,
-        dateFormat: 'YYYY-MM',
-        frequency: 'monthly',
-        data: Array.from({ length: 100 }, (_, i) => plantRow(i)),
-        warnings: undefined,
-        accumulated: {
-          cap: 600,
-          capped: true,
-          rows: Array.from({ length: 600 }, (_, i) => plantRow(i)),
-        },
-      });
+      const query = vi
+        .spyOn(getEiaApiService(), 'query')
+        .mockImplementation(async (_route, opts) => ({
+          route: 'electricity/operating-generator-capacity',
+          total: 26_000,
+          dateFormat: 'YYYY-MM',
+          frequency: 'monthly',
+          data: Array.from({ length: opts.length ?? 0 }, (_, i) => plantRow(i)),
+          warnings: undefined,
+          accumulated: {
+            cap: 600,
+            capped: true,
+            rows: Array.from({ length: 600 }, (_, i) => plantRow(i)),
+          },
+        }));
       const staged: number[] = [];
       faults.registerTable = (real, name, rows, options) => {
         staged.push((rows as unknown[]).length);
@@ -520,81 +526,132 @@ describe('inline byte budget against a real canvas (#58)', DUCKDB_TIMEOUT, () =>
         route: 'electricity/operating-generator-capacity',
         stage: true,
       });
-      const { sc, scBytes, textBytes } = surfaces(result);
+      const { sc } = surfaces(result);
 
+      expect(query.mock.calls[0]?.[1]).toMatchObject({ length: 25, accumulate: true });
       expect(staged).toEqual([600]);
       expect(sc.dataset).toMatch(/^df_/);
-      expect(sc.data.length).toBeLessThan(100);
-      expect(sc.next_offset).toBe(sc.data.length);
-      expect(scBytes).toBeLessThanOrEqual(BUDGET);
-      expect(textBytes).toBeLessThanOrEqual(BUDGET);
+      expect(sc.data).toEqual(Array.from({ length: 25 }, (_, i) => plantRow(i)));
+      expect(sc.next_offset).toBe(25);
     }));
 
-  it('holds a row_limit-capped cross-join result to the budget and names both caps', () =>
+  it('shows 25 rows of a row_limit-capped cross join and names both bounds', () =>
     withCanvas(async () => {
       const result = await runToolContract(dataframeQueryTool, {
         sql: `${DIGITS} SELECT a.x * 10000 + b.x * 1000 + c.x * 100 + e.x * 10 + f.x AS i, repeat('w', 500) AS note FROM d a, d b, d c, d e, d f`,
         row_limit: 10_000,
       });
-      const { sc, scBytes, textBytes } = surfaces(result);
+      const { sc } = surfaces(result);
 
-      expect(sc.truncated).toBe(true);
-      expect(sc.totalRows).toBe(10_000);
-      expect(sc.returnedRows).toBe(sc.rows.length);
-      expect(sc.rows.length).toBeLessThan(10_000);
+      expect(sc).toMatchObject({ truncated: true, totalRows: 10_000, returnedRows: 25 });
+      expect(sc.rows).toHaveLength(25);
       expect(sc.notice).toContain('row_limit cap of 10,000');
-      expect(sc.notice).toContain('64,000-byte response budget then ended the inline rows');
-      expect(scBytes).toBeLessThanOrEqual(BUDGET);
-      expect(textBytes).toBeLessThanOrEqual(BUDGET);
+      expect(sc.notice).toContain(
+        'preview then ended the inline rows at 25 of the 10,000 materialized',
+      );
     }));
 
-  it('reports an exact count past the budget on register_as, and its paging SQL continues the page', () =>
+  /** The paging statement a notice prints, exactly as printed. */
+  const printedPage = (notice: unknown) =>
+    String(notice).match(/SELECT \* FROM \w+ LIMIT (\d+) OFFSET (\d+)/);
+
+  it('returns every preview row whole on register_as, and its printed paging SQL continues the page', () =>
     withCanvas(async () => {
-      const sql = `${DIGITS}, n AS (SELECT a.x * 1000 + b.x * 100 + c.x * 10 + e.x AS i FROM d a, d b, d c, d e) SELECT i, repeat('w', 500) AS note FROM n WHERE i < 1500`;
-      const result = await runToolContract(dataframeQueryTool, { sql, register_as: 'wide_rows' });
-      const { sc, scBytes, textBytes } = surfaces(result);
-      const shown = sc.rows.length;
+      const sql = `${DIGITS}, n AS (SELECT a.x * 1000 + b.x * 100 + c.x * 10 + e.x AS i FROM d a, d b, d c, d e) SELECT i, repeat('w', 500) AS note FROM n WHERE i < 1500 ORDER BY i`;
+      const result = await runToolContract(dataframeQueryTool, {
+        sql,
+        register_as: 'wide_rows',
+        preview: 1000,
+      });
+      const { sc } = surfaces(result);
 
-      expect(sc).toMatchObject({ truncated: false, totalRows: 1500, returnedRows: shown });
-      expect(shown).toBeLessThan(1500);
-      expect(sc.notice).toContain(
-        `The whole result is staged as wide_rows: page it with SELECT * FROM wide_rows ORDER BY <columns> LIMIT ${shown} OFFSET ${shown}.`,
+      // About 520 KB of rows, every one inline.
+      expect(sc).toMatchObject({ truncated: false, totalRows: 1500, returnedRows: 1000 });
+      expect(sc.rows.map((r) => Number(r.i))).toEqual(Array.from({ length: 1000 }, (_, n) => n));
+      expect(sc.notice).toBe(
+        'Showing 1,000 of 1,500 rows — preview capped the inline slice (it defaults to 25). The whole result is staged as wide_rows: page it with SELECT * FROM wide_rows LIMIT 1000 OFFSET 1000, raising OFFSET by 1000 for each further page (no ORDER BY: the table keeps the order the preview showed, and a sort reorders it).',
       );
-      expect(scBytes).toBeLessThanOrEqual(BUDGET);
-      expect(textBytes).toBeLessThanOrEqual(BUDGET);
 
-      // The notice's paging SQL, run on one tenant's canvas, picks up where the
-      // inline rows ended.
+      // The notice's paging SQL, run verbatim on one tenant's canvas, picks up
+      // where the inline rows ended.
       const ctx = createMockContext({ errors: dataframeQueryTool.errors });
       await dataframeQueryTool.handler(
         dataframeQueryTool.input.parse({ sql, register_as: 'wide_rows', preview: 0 }),
         ctx,
       );
       const next = await dataframeQueryTool.handler(
-        dataframeQueryTool.input.parse({
-          sql: `SELECT * FROM wide_rows ORDER BY i LIMIT ${shown} OFFSET ${shown}`,
-        }),
+        dataframeQueryTool.input.parse({ sql: printedPage(sc.notice)?.[0], preview: 1000 }),
         ctx,
       );
       expect(next.rows.map((r) => Number(r.i))).toEqual(
-        Array.from({ length: shown }, (_, n) => shown + n),
+        Array.from({ length: 500 }, (_, n) => 1000 + n),
       );
     }));
 
-  it('bounds the echo of a statement far larger than the budget', () =>
+  /**
+   * The canvas previews a register_as table with `SELECT * FROM <name> LIMIT n`,
+   * so the printed paging SQL is right only if LIMIT/OFFSET over the stored
+   * table walks the same order the preview did, every call. 250,000 rows span
+   * three DuckDB row groups (122,880 rows each), which parallel scans split
+   * across threads; GROUP BY's hash aggregate stores them in no order of `id`,
+   * so a re-sort cannot pass for the stored order. `rowid` is that order.
+   */
+  it.each([128, 1024])(
+    'walks a 250,000-row register_as table by the printed paging SQL, no row repeated or skipped (%i MB canvas)',
+    (memoryLimitMb) =>
+      withCanvas(async () => {
+        const ctx = createMockContext({ errors: dataframeQueryTool.errors });
+        const run = (input: Record<string, unknown>) =>
+          dataframeQueryTool.handler(dataframeQueryTool.input.parse(input), ctx);
+        const ids = (result: { rows: Array<Record<string, unknown>> }) =>
+          result.rows.map((r) => String(r.id));
+        const storedOrder = async (limit: number, offset: number) =>
+          ids(
+            await run({
+              sql: `SELECT id FROM big ORDER BY rowid LIMIT ${limit} OFFSET ${offset}`,
+              row_limit: limit,
+              preview: limit,
+            }),
+          );
+
+        const first = await run({
+          sql: `${DIGITS}, n AS (SELECT a.x * 100000 + b.x * 10000 + c.x * 1000 + e.x * 100 + f.x * 10 + g.x AS i FROM d a, d b, d c, d e, d f, d g) SELECT 'r' || i AS id FROM n WHERE i < 250000 GROUP BY id`,
+          register_as: 'big',
+          preview: 1000,
+        });
+        expect(getEnrichment(ctx)).toMatchObject({ totalRows: 250_000, truncated: false });
+        const page1 = ids(first);
+        expect(page1).toHaveLength(1000);
+        expect(page1).not.toEqual(page1.toSorted());
+
+        const printed = printedPage(getEnrichment(ctx).notice);
+        expect(printed?.slice(1)).toEqual(['1000', '1000']);
+        const page2 = ids(await run({ sql: printed?.[0], preview: 1000 }));
+        // "raising OFFSET by 1000 for each further page"
+        const pageAt = async (offset: number) =>
+          ids(await run({ sql: `SELECT * FROM big LIMIT 1000 OFFSET ${offset}`, preview: 1000 }));
+        const page3 = await pageAt(2000);
+
+        const walked = [...page1, ...page2, ...page3];
+        expect(new Set(walked).size).toBe(3000);
+        expect(walked).toEqual(await storedOrder(3000, 0));
+        for (let repeat = 0; repeat < 3; repeat++) expect(await pageAt(1000)).toEqual(page2);
+        // Two pages straddling the first row-group boundary at 122,880.
+        expect([...(await pageAt(121_880)), ...(await pageAt(122_880))]).toEqual(
+          await storedOrder(2000, 121_880),
+        );
+      }, memoryLimitMb),
+  );
+
+  it('echoes a statement far larger than 64 KB whole', () =>
     withCanvas(async () => {
       const sql = `SELECT 1 AS one /* ${'x'.repeat(200_000)} */`;
       const result = await runToolContract(dataframeQueryTool, { sql });
-      const { sc, scBytes, textBytes } = surfaces(result);
+      const { sc, text } = surfaces(result);
 
       expect(result.isError).not.toBe(true);
       expect(sc.rows).toEqual([{ one: 1 }]);
-      expect(sc.executedSql).toMatch(
-        new RegExp(
-          ` … \\[echo cut here — the full ${bytes(sql).toLocaleString()}-byte statement ran\\]$`,
-        ),
-      );
-      expect(scBytes).toBeLessThanOrEqual(BUDGET);
-      expect(textBytes).toBeLessThanOrEqual(BUDGET);
+      expect(sc.executedSql).toBe(sql);
+      expect(text).toContain(`**executedSql:** \`${sql}\``);
     }));
 });

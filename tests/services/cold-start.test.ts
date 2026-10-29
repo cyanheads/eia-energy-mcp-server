@@ -374,6 +374,7 @@ describe('a cold browse, describe, or query answers within a bounded wait (#74)'
         description: 'Facet',
         values: [{ id: 'TX', name: 'Texas' }],
         complete: true,
+        fetchedAt: expect.any(Number),
       },
     ]);
     await expect(category).rejects.toMatchObject({ data: { reason: 'route_not_queryable' } });

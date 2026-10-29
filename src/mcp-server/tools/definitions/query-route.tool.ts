@@ -19,15 +19,11 @@ import { type ColumnRename, getCanvasBridge } from '@/services/canvas-bridge/can
 import { getEiaApiService } from '@/services/eia/eia-service.js';
 import { invertedRange } from '@/services/eia/period-bounds.js';
 import type { EiaWarning } from '@/services/eia/types.js';
-import {
-  ECHO_BUDGET_BYTES,
-  fitRows,
-  INLINE_BUDGET_BYTES,
-  longestFittingPrefix,
-  trailerBytes,
-  utf8Bytes,
-} from '../inline-budget.js';
+import { clampCount, countSchema, modeDescription } from '../count-limit.js';
 import { literalTableCell, tableRow } from '../literal-table-cell.js';
+
+/** EIA's per-request row maximum, and so the most one page can hold. */
+const MAX_LENGTH = 5000;
 
 /**
  * EIA's per-page advisory: it fires whenever the requested `length` is smaller
@@ -63,11 +59,7 @@ function stagedPointer(rowCount: number, tableName: string, renamed: ColumnRenam
   return `${rowCount.toLocaleString()} rows staged as ${tableName} — call eia_dataframe_describe for its column names${clause}, then eia_dataframe_query to run SQL over it.`;
 }
 
-/**
- * Trailer renderers for the structured echoes, which would otherwise render as
- * JSON blobs. Module-level so the handler can measure the trailer it adds to
- * content[] against the inline budget.
- */
+/** Trailer renderers for the structured echoes, which would otherwise render as JSON blobs. */
 const enrichmentTrailer = {
   appliedFilters: {
     render: (filters: Filters | undefined) => {
@@ -93,45 +85,6 @@ const enrichmentTrailer = {
 };
 
 type Filters = Record<string, string | string[]>;
-
-/**
- * The appliedFilters echo, held to `ECHO_BUDGET_BYTES` on both surfaces. A
- * filter set past that keeps its leading values whole, in order, and gains a
- * `…` entry counting the values left out per facet — so a facet cut whole is
- * still named — under a key no facet ID can be, so the marker is never read as
- * a value that was applied.
- */
-function echoedFilters(filters: Filters): Filters {
-  const cost = (f: Filters) =>
-    Math.max(utf8Bytes(JSON.stringify(f)), utf8Bytes(enrichmentTrailer.appliedFilters.render(f)));
-  if (cost(filters) <= ECHO_BUDGET_BYTES) return filters;
-  const values = Object.entries(filters).flatMap(([key, v]) =>
-    Array.isArray(v)
-      ? v.map((value) => ({ key, value, list: true }))
-      : [{ key, value: v, list: false }],
-  );
-  const kept = (m: number): Filters => {
-    const echo: Filters = {};
-    for (const { key, value, list } of values.slice(0, m)) {
-      const echoed = echo[key];
-      if (!list) echo[key] = value;
-      else if (Array.isArray(echoed)) echoed.push(value);
-      else echo[key] = [value];
-    }
-    const cut = new Map<string, number>();
-    for (const { key } of values.slice(m)) cut.set(key, (cut.get(key) ?? 0) + 1);
-    const byFacet = [...cut].map(([key, n]) => `${key}: ${n.toLocaleString()}`).join(', ');
-    echo['…'] =
-      `${(values.length - m).toLocaleString()} of ${values.length.toLocaleString()} filter values not echoed (${byFacet}) — the query applied every one.`;
-    return echo;
-  };
-  return kept(
-    longestFittingPrefix(
-      Math.min(values.length, ECHO_BUDGET_BYTES),
-      (m) => cost(kept(m)) <= ECHO_BUDGET_BYTES,
-    ),
-  );
-}
 
 /** The handler's return value, which `format()` renders. */
 interface QueryRouteResult {
@@ -192,7 +145,7 @@ function tableLayout(rows: Array<Record<string, unknown>>): TableLayout {
   };
 }
 
-/** The markdown `format()` returns, as one string the handler can also measure. */
+/** The markdown `format()` returns. */
 function renderQueryResult(result: QueryRouteResult): string {
   const lines: string[] = [];
 
@@ -292,13 +245,13 @@ export const queryRouteTool = tool('eia_query_route', {
       .describe(
         'Row offset into the matching set (default 0). An offset at or beyond total returns zero rows.',
       ),
-    length: z
-      .number()
-      .int()
-      .min(1)
-      .default(100)
-      .describe(
-        'Rows to fetch for the inline page (default 100; larger integers are clamped to 5000 with a notice). Every fetched row is used, but the response carries only as many as fit a 64,000-byte budget per surface — wide routes end the page early, said so in canvas_preview_note, with next_offset naming where to continue. With stage: true, staging is not bounded by this — it pages past the preview on its own.',
+    length: countSchema('length', 1, MAX_LENGTH)
+      .default(25)
+      .meta(
+        modeDescription(
+          'Rows per page. Default 25; a larger value returns at most 5,000 and says so. With stage: true, staging is not bounded by this — it pages past the page on its own.',
+          'Rows per page. Default 25; at most 5,000. With stage: true, staging is not bounded by this — it pages past the page on its own.',
+        ),
       ),
     stage: z
       .boolean()
@@ -317,7 +270,7 @@ export const queryRouteTool = tool('eia_query_route', {
     data: z
       .array(z.object({}).passthrough().describe('A single data row with dynamic column keys.'))
       .describe(
-        'Inline rows: the first length rows from offset, ended early when the next whole row would push either response surface past the 64,000-byte budget. All numeric values are strings per the EIA API (e.g. "9.13"). Cast to DOUBLE in SQL for arithmetic: CAST(value AS DOUBLE). Per-column units appear as {col}-units fields inline in each row. Keys are dynamic column IDs from the EIA route.',
+        'Inline rows: the length rows from offset, fewer only at the end of the matching set. All numeric values are strings per the EIA API (e.g. "9.13"). Cast to DOUBLE in SQL for arithmetic: CAST(value AS DOUBLE). Per-column units appear as {col}-units fields inline in each row. Keys are dynamic column IDs from the EIA route.',
       ),
     total: z
       .number()
@@ -341,7 +294,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Composed guidance for empty results or an offset past total, unmatched filter values in complete cached vocabularies, year-only bounds on effective monthly YYYY-MM data, and requested/effective length when clamped. Submitted filters and date bounds are preserved. A row withheld by the response byte budget is explained in canvas_preview_note.',
+        'Composed guidance for empty results or an offset past total, unmatched filter values in complete cached vocabularies, year-only bounds on effective monthly YYYY-MM data, and requested/effective length when clamped. Submitted filters and date bounds are preserved.',
       ),
     dataset: z
       .string()
@@ -353,7 +306,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Human-readable note, present whenever dataset is set or staging failed, and otherwise when total exceeds the inline rows. On a stage: true call it opens with the stage outcome: the staged row count and dataset name, naming eia_dataframe_describe for the staged column names (quoting one rename when staging renamed a column) and then eia_dataframe_query for SQL — or, when the canvas failed, that no dataframe was created (dataset is then absent), with the retry and offset paging. Next, where in the matching set the staged rows sit whenever the stage does not start at row 1, and when staging stopped short of total (the EIA_CANVAS_MAX_ROWS cap, the time limit of the call, or an upstream page that did not return) the offset to resume from; last, the inline page against total and next_offset — saying when the 64,000-byte response budget rather than length ended the page, or that a single row too large for the budget was withheld and offset + 1 steps past it — and, after a registered stage, that the inline rows page with stage left off, since another stage: true call stages a new table. Where staging was not requested it places the inline page against total and names stage: true and eia_dataframe_query as the way to get SQL access to the rest; where no canvas is configured at all, staging is unavailable, so it names offset paging and CANVAS_PROVIDER_TYPE=duckdb instead.',
+        'Human-readable note, present whenever dataset is set or staging failed, and otherwise when total exceeds the inline rows. On a stage: true call it opens with the stage outcome: the staged row count and dataset name, naming eia_dataframe_describe for the staged column names (quoting one rename when staging renamed a column) and then eia_dataframe_query for SQL — or, when the canvas failed, that no dataframe was created (dataset is then absent), with the retry and offset paging. Next, where in the matching set the staged rows sit whenever the stage does not start at row 1, and when staging stopped short of total (the EIA_CANVAS_MAX_ROWS cap, the time limit of the call, or an upstream page that did not return) the offset to resume from; last, the inline page against total and next_offset — and, after a registered stage, that the inline rows page with stage left off, since another stage: true call stages a new table. Where staging was not requested it places the inline page against total and names stage: true and eia_dataframe_query as the way to get SQL access to the rest; where no canvas is configured at all, staging is unavailable, so it names offset paging and CANVAS_PROVIDER_TYPE=duckdb instead.',
       ),
     truncation_warning: z
       .string()
@@ -374,9 +327,7 @@ export const queryRouteTool = tool('eia_query_route', {
     appliedFilters: z
       .record(z.string(), z.union([z.string(), z.array(z.string())]))
       .optional()
-      .describe(
-        'Facet filters applied to the query, when provided. Past 4,000 bytes the echo keeps the leading values and adds a "…" entry counting those not echoed per facet — every value was still applied.',
-      ),
+      .describe('Facet filters applied to the query, when provided.'),
     appliedStart: z
       .string()
       .optional()
@@ -411,7 +362,9 @@ export const queryRouteTool = tool('eia_query_route', {
     appliedOffset: z
       .number()
       .describe('Row offset applied to the query — the cause when a page comes back empty.'),
-    appliedLength: z.number().describe('Preview row count requested for this call.'),
+    appliedLength: z
+      .number()
+      .describe('Rows per page applied to this call — length, after any clamp.'),
   },
   enrichmentTrailer,
 
@@ -529,7 +482,8 @@ export const queryRouteTool = tool('eia_query_route', {
   ],
 
   async handler(requestedInput, ctx) {
-    const input = { ...requestedInput, length: Math.min(requestedInput.length, 5000) };
+    const length = clampCount(ctx, 'eia_query_route', 'length', requestedInput.length, MAX_LENGTH);
+    const input = { ...requestedInput, length: length.applied };
     ctx.log.info('Executing eia_query_route', {
       route: input.route,
       offset: input.offset,
@@ -604,8 +558,7 @@ export const queryRouteTool = tool('eia_query_route', {
     }
 
     const notices = [...(dataResp.notices ?? [])];
-    if (requestedInput.length > input.length)
-      notices.push(`Requested length ${requestedInput.length} was clamped to ${input.length}.`);
+    if (length.notice) notices.push(length.notice);
     // Only monthly year-bound interpretation has been verified against EIA.
     if (dataResp.frequency === 'monthly' && dataResp.dateFormat === 'YYYY-MM') {
       for (const bound of ['start', 'end'] as const) {
@@ -620,10 +573,7 @@ export const queryRouteTool = tool('eia_query_route', {
 
     /**
      * DataCanvas spillover — the caller asked for it and a canvas is
-     * configured, so the service has already accumulated offset pages. Staging
-     * runs on the whole fetch before the inline page is cut to the response
-     * budget, so a budget-trimmed page stages exactly what an untrimmed one
-     * would.
+     * configured, so the service has already accumulated offset pages.
      */
     const canvasRows = dataResp.accumulated?.rows ?? fetched;
     const staging =
@@ -653,10 +603,9 @@ export const queryRouteTool = tool('eia_query_route', {
         : undefined;
 
     /**
-     * The stage-outcome sentences, which do not depend on how many rows go
-     * inline. Sentence order is fixed: the outcome (pointer or failure), then
-     * where the staged rows sit and how to resume staging, then the inline
-     * page (`inlineSentences`).
+     * The stage-outcome sentences. Sentence order is fixed: the outcome
+     * (pointer or failure), then where the staged rows sit and how to resume
+     * staging, then the inline page.
      */
     let stageOutcome: string | undefined;
     let stageCoversTotal = false;
@@ -696,29 +645,100 @@ export const queryRouteTool = tool('eia_query_route', {
         'Staging failed, so no dataframe was created — re-run with stage: true to try again, or page through with offset.';
     }
 
-    const budget = `${INLINE_BUDGET_BYTES.toLocaleString()}-byte response budget`;
-    /**
-     * Where the inline page ends and how to continue it. `length` rows were
-     * fetched, but only as many go inline as fit the budget, so this says when
-     * the budget rather than `length` ended the page — a row too large to fit
-     * on its own is withheld whole rather than cut.
-     */
-    const pageEnd = (shown: number, nextOffset: number | undefined): string | undefined => {
-      if (shown === 0) {
-        return `The row at offset ${input.offset.toLocaleString()} alone exceeds the ${budget}, so no rows are shown inline — narrow it with columns, or skip it with offset ${(input.offset + 1).toLocaleString()}.`;
-      }
-      if (nextOffset === undefined) return;
-      return shown < fetched.length
-        ? `The ${budget} ended this page at ${shown.toLocaleString()} of the ${fetched.length.toLocaleString()} rows fetched; continue the inline page at next_offset ${nextOffset.toLocaleString()}.`
-        : `Continue the inline page at next_offset ${nextOffset.toLocaleString()}.`;
+    /** Every fetched row goes inline: `length` is the page. */
+    const shown = fetched.length;
+    const nextOffset = input.offset + shown < total ? input.offset + shown : undefined;
+    const result: QueryRouteResult = {
+      route: dataResp.route,
+      data: fetched,
+      total,
+      returned_count: shown,
+      ...(nextOffset !== undefined && { next_offset: nextOffset }),
+      frequency: dataResp.frequency,
+      date_format: dataResp.dateFormat,
     };
+    const continueAt =
+      nextOffset !== undefined
+        ? `Continue the inline page at next_offset ${nextOffset.toLocaleString()}.`
+        : undefined;
 
-    const appliedFilters = hasFilters ? echoedFilters(filters) : undefined;
-    const enrichmentFor = (shown: number) => ({
+    /**
+     * Whether the response already states where the caller stands relative to
+     * `total` — a notice explaining the row-less page, a staged table running
+     * from the caller's `offset` to the last row (leaving nothing further to
+     * page to), or a `canvas_preview_note` placing the inline page against
+     * `total` because nothing was staged. Decides whether EIA's per-page
+     * advisory still tells the caller anything (see `isIncompleteReturn`).
+     */
+    let gapAccountedFor = false;
+
+    // A row-less response is a valid success, but the two causes need
+    // different guidance and neither can spill to canvas.
+    if (shown === 0) {
+      result.notice =
+        total > 0
+          ? `Offset ${input.offset.toLocaleString()} is past the last row — total is ${total.toLocaleString()}. Reduce offset below total to page through the matching rows.`
+          : 'No rows matched the filters. Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.';
+      gapAccountedFor = true;
+    } else if (stageOutcome !== undefined) {
+      if (staging?.status === 'registered') result.dataset = staging.tableName;
+      const inline =
+        total > shown
+          ? [
+              `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows inline.`,
+              continueAt,
+            ]
+          : [];
+      /**
+       * Another stage: true call at next_offset registers a second table and
+       * re-spends the accumulation, so paging the inline rows is a stage-off call.
+       */
+      const pageWithoutStaging =
+        staging?.status === 'registered' && nextOffset !== undefined
+          ? 'Page the inline rows with stage left off — another stage: true call stages a new table.'
+          : undefined;
+      result.canvas_preview_note = [stageOutcome, ...inline, pageWithoutStaging]
+        .filter(Boolean)
+        .join(' ');
+      gapAccountedFor = staging?.status === 'failed' || stageCoversTotal;
+    } else if (total > shown) {
+      /**
+       * Nothing was staged, and the two reasons need different advice. A
+       * canvas is configured and the caller simply did not ask to stage —
+       * naming `stage: true` is the only way they learn the capability is
+       * there, and the canvas-off wording would send them after a deployment
+       * change they do not need. With no canvas the lever does not exist, so
+       * offset paging is what is left.
+       */
+      const head = `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows`;
+      const advice = bridge
+        ? `${head} — nothing was staged. Re-run with stage: true to stage the matching rows for SQL with eia_dataframe_query, or page through with offset.`
+        : `${head} — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
+      result.canvas_preview_note = [advice, continueAt].filter(Boolean).join(' ');
+      gapAccountedFor = true;
+    }
+
+    // Forward EIA's own top-level advisories. Each entry is
+    // { warning, description } — flatten to one readable line, dropping only
+    // the per-page advisory the response above has already answered.
+    const advisories = (dataResp.warnings ?? []).filter(
+      (w) => !(gapAccountedFor && isIncompleteReturn(w)),
+    );
+    if (advisories.length > 0) {
+      result.truncation_warning = advisories
+        .map((w) => `${w.warning}: ${w.description}`)
+        .join('; ');
+    }
+    if (notices.length) {
+      result.notice = [result.notice, ...notices].filter(Boolean).join(' ');
+    }
+
+    // Populate enrichment — reaches both structuredContent and content[] trailer.
+    ctx.enrich({
       effectiveRoute: dataResp.route,
       totalCount: total,
       returnedCount: shown,
-      ...(appliedFilters && { appliedFilters }),
+      ...(hasFilters && { appliedFilters: filters }),
       ...(input.start !== undefined && { appliedStart: input.start }),
       ...(input.end !== undefined && { appliedEnd: input.end }),
       ...(input.frequency !== undefined && { appliedFrequency: input.frequency }),
@@ -727,127 +747,7 @@ export const queryRouteTool = tool('eia_query_route', {
       appliedOffset: input.offset,
       appliedLength: input.length,
     });
-
-    /** The response carrying the first `shown` fetched rows inline. */
-    const resultFor = (shown: number): QueryRouteResult => {
-      const nextOffset = input.offset + shown < total ? input.offset + shown : undefined;
-      const result: QueryRouteResult = {
-        route: dataResp.route,
-        data: fetched.slice(0, shown),
-        total,
-        returned_count: shown,
-        ...(nextOffset !== undefined && { next_offset: nextOffset }),
-        frequency: dataResp.frequency,
-        date_format: dataResp.dateFormat,
-      };
-
-      /**
-       * Whether the response already states where the caller stands relative
-       * to `total` — a notice explaining the row-less page, a staged table
-       * running from the caller's `offset` to the last row (leaving nothing
-       * further to page to), or a `canvas_preview_note` placing the inline page
-       * against `total` because nothing was staged. Decides whether EIA's
-       * per-page advisory still tells the caller anything (see
-       * `isIncompleteReturn`).
-       */
-      let gapAccountedFor = false;
-      const inline =
-        total > shown
-          ? [
-              shown > 0
-                ? `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows inline.`
-                : undefined,
-              pageEnd(shown, nextOffset),
-            ]
-          : [];
-
-      // A row-less response is a valid success, but the two causes need
-      // different guidance and neither can spill to canvas.
-      if (fetched.length === 0) {
-        result.notice =
-          total > 0
-            ? `Offset ${input.offset.toLocaleString()} is past the last row — total is ${total.toLocaleString()}. Reduce offset below total to page through the matching rows.`
-            : 'No rows matched the filters. Broaden filters, remove date constraints, or call eia_describe_route to verify facet values — an invalid facet value silently returns zero rows.';
-        gapAccountedFor = true;
-      } else if (stageOutcome !== undefined) {
-        if (staging?.status === 'registered') result.dataset = staging.tableName;
-        /**
-         * Another stage: true call at next_offset registers a second table and
-         * re-spends the accumulation, so paging the inline rows is a stage-off call.
-         */
-        const pageWithoutStaging =
-          staging?.status === 'registered' && nextOffset !== undefined
-            ? 'Page the inline rows with stage left off — another stage: true call stages a new table.'
-            : undefined;
-        result.canvas_preview_note = [stageOutcome, ...inline, pageWithoutStaging]
-          .filter(Boolean)
-          .join(' ');
-        gapAccountedFor = staging?.status === 'failed' || stageCoversTotal;
-      } else if (total > shown) {
-        /**
-         * Nothing was staged, and the two reasons need different advice. A
-         * canvas is configured and the caller simply did not ask to stage —
-         * naming `stage: true` is the only way they learn the capability is
-         * there, and the canvas-off wording would send them after a deployment
-         * change they do not need. With no canvas the lever does not exist, so
-         * offset paging is what is left.
-         */
-        const head = `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows`;
-        const advice = bridge
-          ? `${head} — nothing was staged. Re-run with stage: true to stage the matching rows for SQL with eia_dataframe_query, or page through with offset.`
-          : `${head} — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
-        result.canvas_preview_note = [advice, pageEnd(shown, nextOffset)].filter(Boolean).join(' ');
-        gapAccountedFor = true;
-      }
-
-      // Forward EIA's own top-level advisories. Each entry is
-      // { warning, description } — flatten to one readable line, dropping only
-      // the per-page advisory the response above has already answered.
-      const advisories = (dataResp.warnings ?? []).filter(
-        (w) => !(gapAccountedFor && isIncompleteReturn(w)),
-      );
-      if (advisories.length > 0) {
-        result.truncation_warning = advisories
-          .map((w) => `${w.warning}: ${w.description}`)
-          .join('; ');
-      }
-      if (notices.length) {
-        result.notice = [result.notice, ...notices].filter(Boolean).join(' ');
-      }
-      return result;
-    };
-
-    /**
-     * Inline as many whole fetched rows as fit the budget on both surfaces:
-     * structuredContent is the result merged with enrichment, content[] the
-     * rendered markdown plus the enrichment trailer. Row costs come from one
-     * table layout over the whole fetch; a prefix only ever absorbs more unit
-     * columns, so those costs never undercount.
-     */
-    let layout: TableLayout | undefined;
-    const shown = fitRows(
-      fetched.length,
-      (k) => {
-        const result = resultFor(k);
-        const enrichment = enrichmentFor(k);
-        return {
-          structured: utf8Bytes(JSON.stringify({ ...result, ...enrichment })),
-          text: utf8Bytes(renderQueryResult(result)) + trailerBytes(enrichment, enrichmentTrailer),
-        };
-      },
-      (i) => {
-        const row = fetched[i] ?? {};
-        layout ??= tableLayout(fetched);
-        return {
-          structured: utf8Bytes(JSON.stringify(row)) + 1,
-          text: utf8Bytes(tableRow(row, layout.columns)) + 1,
-        };
-      },
-    );
-
-    // Populate enrichment — reaches both structuredContent and content[] trailer.
-    ctx.enrich(enrichmentFor(shown));
-    return resultFor(shown);
+    return result;
   },
 
   format: (result) => [{ type: 'text', text: renderQueryResult(result) }],

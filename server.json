@@ -29,7 +29,7 @@
         },
         {
           "name": "EIA_DATASET_TTL_SECONDS",
-          "description": "Sliding per-dataframe TTL in seconds, extended by every query that references the dataframe.",
+          "description": "Sliding per-dataframe TTL in seconds, extended by every query that references the dataframe. At most 31536000 (365 days).",
           "format": "string",
           "isRequired": false,
           "default": "86400"
@@ -43,17 +43,24 @@
         },
         {
           "name": "EIA_CANVAS_MAX_ROWS",
-          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging on a stage: true call. Five requests at EIA's 5000-row-per-request ceiling.",
+          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging on a stage: true call. Five requests at EIA's 5000-row-per-request ceiling. At most 250000.",
           "format": "string",
           "isRequired": false,
           "default": "25000"
         },
         {
           "name": "EIA_FACET_VALUE_CAP",
-          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs, or narrow a facet with values_query.",
+          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs, or narrow a facet with values_query. At most 1000.",
           "format": "string",
           "isRequired": false,
           "default": "50"
+        },
+        {
+          "name": "EIA_CLAMP_LIMITS",
+          "description": "Lower an over-cap eia_query_route length, eia_dataframe_query row_limit or preview, or eia_search_routes limit to its cap with a notice. 'false' advertises and enforces each cap as a schema maximum instead.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
@@ -95,7 +102,7 @@
         },
         {
           "name": "EIA_DATASET_TTL_SECONDS",
-          "description": "Sliding per-dataframe TTL in seconds, extended by every query that references the dataframe.",
+          "description": "Sliding per-dataframe TTL in seconds, extended by every query that references the dataframe. At most 31536000 (365 days).",
           "format": "string",
           "isRequired": false,
           "default": "86400"
@@ -109,17 +116,24 @@
         },
         {
           "name": "EIA_CANVAS_MAX_ROWS",
-          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging on a stage: true call. Five requests at EIA's 5000-row-per-request ceiling.",
+          "description": "Cumulative row ceiling for eia_query_route DataCanvas staging on a stage: true call. Five requests at EIA's 5000-row-per-request ceiling. At most 250000.",
           "format": "string",
           "isRequired": false,
           "default": "25000"
         },
         {
           "name": "EIA_FACET_VALUE_CAP",
-          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs, or narrow a facet with values_query.",
+          "description": "Facet values eia_describe_route returns per facet before truncating. Page past it with the tool's facet and values_offset inputs, or narrow a facet with values_query. At most 1000.",
           "format": "string",
           "isRequired": false,
           "default": "50"
+        },
+        {
+          "name": "EIA_CLAMP_LIMITS",
+          "description": "Lower an over-cap eia_query_route length, eia_dataframe_query row_limit or preview, or eia_search_routes limit to its cap with a notice. 'false' advertises and enforces each cap as a schema maximum instead.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",

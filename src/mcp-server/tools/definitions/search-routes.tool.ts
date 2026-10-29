@@ -23,9 +23,9 @@
  * and the next search retries an index pass named there.
  *
  * `truncated` is measured, not inferred: the service looks one match past the
- * cap, so a search that ends exactly at `limit` reads as complete. `limit`
- * accepts positive integers but each call returns at most `SEARCH_RESULT_CAP`; a larger
- * value is served at the cap and disclosed rather than rejected.
+ * cap, so a search that ends exactly at `limit` reads as complete. Each call
+ * returns at most `SEARCH_RESULT_CAP`; a larger `limit` is served at the cap and
+ * disclosed, or rejected when EIA_CLAMP_LIMITS is off (`count-limit.ts`).
  *
  * A query shaped like a legacy APIv1 series ID (`PET.RWTC.W`) is resolved
  * through EIA's `/v2/seriesid` lookup before any text search: a hit is the one
@@ -40,6 +40,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
 import { MAX_SEARCHED_QUERY_LENGTH } from '@/services/eia/route-cache.js';
+import { clampCount, countSchema, modeDescription } from '../count-limit.js';
 
 /** Most results one call returns, whatever `limit` asks for. */
 const SEARCH_RESULT_CAP = 30;
@@ -104,13 +105,13 @@ export const searchRoutesTool = tool('eia_search_routes', {
       .describe(
         `Free-text search terms to match against route names and descriptions, or a legacy APIv1 series ID (e.g. "PET.RWTC.W": three or more dot-separated segments ending in a frequency code A, Q, M, W, D, H, HL, or 4; any case). Leading and trailing whitespace is ignored, and only the first ${MAX_SEARCHED_QUERY_LENGTH} characters are searched.`,
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
+    limit: countSchema('limit', 1, SEARCH_RESULT_CAP)
       .default(10)
-      .describe(
-        `Maximum results to return (default 10). One call returns at most ${SEARCH_RESULT_CAP}; a larger limit is served at ${SEARCH_RESULT_CAP}, and truncated says whether more matches exist.`,
+      .meta(
+        modeDescription(
+          `Maximum results to return. Default 10; a larger value returns at most ${SEARCH_RESULT_CAP} and says so. truncated says whether more matches exist.`,
+          `Maximum results to return. Default 10; at most ${SEARCH_RESULT_CAP}. truncated says whether more matches exist.`,
+        ),
       ),
   }),
 
@@ -250,7 +251,8 @@ export const searchRoutesTool = tool('eia_search_routes', {
   async handler(input, ctx) {
     ctx.log.info('Executing eia_search_routes', { query: input.query, limit: input.limit });
     const service = getEiaApiService();
-    const cap = Math.min(input.limit, SEARCH_RESULT_CAP);
+    const limit = clampCount(ctx, 'eia_search_routes', 'limit', input.limit, SEARCH_RESULT_CAP);
+    const cap = limit.applied;
     const { results, hasMore, seriesId, status } = await service.search(input.query, cap, ctx);
 
     const gaps = [...status.incompleteRoutes, ...status.pendingPasses];
@@ -292,7 +294,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
         break;
     }
     const notice = [
-      input.limit > cap ? `Requested limit ${input.limit} was clamped to ${cap}.` : undefined,
+      limit.notice,
       searched.length < input.query.length
         ? `Only the first ${MAX_SEARCHED_QUERY_LENGTH} characters of the query were searched.`
         : undefined,

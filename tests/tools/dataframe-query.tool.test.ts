@@ -3,11 +3,11 @@
  * @module tests/tools/dataframe-query.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
-import { ECHO_BUDGET_BYTES, INLINE_BUDGET_BYTES } from '@/mcp-server/tools/inline-budget.js';
 import * as canvasBridge from '@/services/canvas-bridge/canvas-bridge.js';
 
 vi.mock('@/services/canvas-bridge/canvas-bridge.js', () => ({
@@ -205,11 +205,11 @@ describe('dataframeQueryTool', () => {
       expect(text).toContain('8.45');
     });
 
-    it('renders no-rows state', () => {
-      const result = { columns: ['period'], rows: [] };
+    it('renders a no-row result as its header row, then the no-rows note', () => {
+      const result = { columns: ['period', 'value'], rows: [] };
       const blocks = dataframeQueryTool.format!(result);
       const text = (blocks[0] as { text: string }).text;
-      expect(text).toContain('_No rows._');
+      expect(text).toBe('| period | value |\n| --- | --- |\n\n_No rows._');
     });
 
     it('shows register info when registered_as present', () => {
@@ -227,12 +227,12 @@ describe('dataframeQueryTool', () => {
 });
 
 // ---------------------------------------------------------------------------
-// #58 — each response surface holds to a fixed byte budget, cut between whole
-// rows; row_limit (#40) keeps its own disclosure.
+// #96 — preview is the inline page (default 25, at most row_limit), returned
+// whole whatever the row width; row_limit (#40) keeps its own disclosure, and
+// the SQL and column echoes come back whole.
 // ---------------------------------------------------------------------------
 
-describe('dataframeQueryTool — inline byte budget (#58)', () => {
-  const bytes = (text: string) => Buffer.byteLength(text, 'utf8');
+describe('dataframeQueryTool — page size (#96)', () => {
   const row = (i: number, note = '') => ({
     id: `r${String(i).padStart(5, '0')}`,
     period: `2024-${String((i % 12) + 1).padStart(2, '0')}`,
@@ -280,29 +280,39 @@ describe('dataframeQueryTool — inline byte budget (#58)', () => {
       rows: Array<Record<string, unknown>>;
     };
     const text = (result.content ?? []).map((b) => (b as { text?: string }).text ?? '').join('');
-    return { sc, text, scBytes: bytes(JSON.stringify(sc)), textBytes: bytes(text) };
+    return { sc, text };
   }
 
   const textIds = (text: string) => [...text.matchAll(/^\| (r\d{5}) \|/gm)].map((m) => m[1]);
 
-  it('keeps the #40 row_limit and preview notices word for word when the budget does not bind', async () => {
-    answer([row(0), row(1)], { rowCount: 3, truncated: true });
-    expect((await call({ row_limit: 3, preview: 2 })).sc.notice).toBe(
-      'Showing 2 rows — more rows matched than the row_limit cap of 3 and the remainder was dropped uncounted, so totalRows is that cap and not a total. Raise row_limit, or re-run with register_as to stage the whole result as a new dataframe, which reports an exact row count.',
+  it('keeps the #40 row_limit and preview notices word for word where one bound binds', async () => {
+    answer([row(0), row(1)], { rowCount: 2, truncated: true });
+    expect((await call({ row_limit: 2 })).sc.notice).toBe(
+      'Showing 2 rows — more rows matched than the row_limit cap of 2 and the remainder was dropped uncounted, so totalRows is that cap and not a total. Raise row_limit, or re-run with register_as to stage the whole result as a new dataframe, which reports an exact row count.',
     );
 
     answer([row(0)], { rowCount: 5000 });
     expect((await call({ row_limit: 10_000, preview: 1 })).sc.notice).toBe(
-      'Showing 1 of 5,000 rows — preview capped the inline slice (it defaults to row_limit); raise it to see more.',
+      'Showing 1 of 5,000 rows — preview capped the inline slice (it defaults to 25); raise it to see more.',
     );
 
     answer([row(0)], { rowCount: 5000 }, meta('df_OUT', 5000));
     expect((await call({ register_as: 'df_OUT', preview: 1 })).sc.notice).toBe(
-      'Showing 1 of 5,000 rows — preview capped the inline slice (it defaults to row_limit); raise it to see more, or query df_OUT directly.',
+      'Showing 1 of 5,000 rows — preview capped the inline slice (it defaults to 25); raise it to see more, or query df_OUT directly.',
     );
   });
 
-  it('never advises raising a bound already clamped to its 10,000 ceiling (#85)', async () => {
+  it('names both bounds, and raising preview, when row_limit and preview both bind', async () => {
+    // The canvas hands back only the preview slice of the 3 rows row_limit kept.
+    answer([row(0), row(1)], { rowCount: 3, truncated: true });
+    const { sc } = await call({ row_limit: 3, preview: 2 });
+    expect(sc.notice).toBe(
+      'Showing 2 rows — more rows matched than the row_limit cap of 3 and the remainder was dropped uncounted, so totalRows is that cap and not a total, and preview then ended the inline rows at 2 of the 3 materialized. Raise preview to see more of them, or re-run with register_as to stage the whole result as a dataframe with an exact row count, then page it with SELECT * FROM <name> LIMIT 2 OFFSET 2, raising OFFSET by 2 for each further page (no ORDER BY: the table keeps the order the preview showed, and a sort reorders it).',
+    );
+    expect(sc).toMatchObject({ truncated: true, totalRows: 3, returnedRows: 2 });
+  });
+
+  it('never advises raising a bound already clamped to its cap (#85)', async () => {
     answer([row(0), row(1)], { truncated: true });
     expect((await call({ row_limit: 20_000 })).sc.notice).toBe(
       'Requested row_limit 20000 was clamped to 10000. Showing 2 rows — more rows matched than the row_limit cap of 10,000 and the remainder was dropped uncounted, so totalRows is that cap and not a total. Re-run with register_as to stage the whole result as a new dataframe, which reports an exact row count.',
@@ -310,240 +320,142 @@ describe('dataframeQueryTool — inline byte budget (#58)', () => {
 
     answer([row(0), row(1)], { rowCount: 20_000 }, meta('df_OUT', 20_000));
     expect((await call({ register_as: 'df_OUT', preview: 20_000 })).sc.notice).toBe(
-      'Requested preview 20000 was clamped to 10000. Showing 2 of 20,000 rows — preview capped the inline slice (it defaults to row_limit). The whole result is staged as df_OUT: page it with SELECT * FROM df_OUT ORDER BY <columns> LIMIT 2 OFFSET 2.',
+      'Requested preview 20000 was clamped to 1000. Showing 2 of 20,000 rows — preview capped the inline slice (it defaults to 25). The whole result is staged as df_OUT: page it with SELECT * FROM df_OUT LIMIT 2 OFFSET 2, raising OFFSET by 2 for each further page (no ORDER BY: the table keeps the order the preview showed, and a sort reorders it).',
     );
   });
 
-  it('ends the inline rows at the budget alone with an exact count and register_as paging', async () => {
+  it('asks the canvas for 25 preview rows within the default 1,000 row_limit', async () => {
+    const rows = Array.from({ length: 25 }, (_, i) => wide(i));
+    answer(rows, { rowCount: 1000 });
+
+    const { sc, text } = await call({});
+
+    expect(mockQuery.mock.calls[0]?.[2]).toMatchObject({ rowLimit: 1000, preview: 25 });
+    expect(sc.rows).toEqual(rows);
+    expect(textIds(text)).toEqual(rows.map((r) => r.id));
+    expect(sc).toMatchObject({ truncated: false, totalRows: 1000, returnedRows: 25 });
+  });
+
+  it('returns every previewed row whole however wide the rows are', async () => {
+    // About 1.1 MB of rows — the size cut used to end this at about 60.
     const rows = Array.from({ length: 1000 }, (_, i) => wide(i));
     answer(rows);
 
-    const { sc, text, scBytes, textBytes } = await call({});
-    const shown = sc.rows.length;
+    const { sc, text } = await call({ preview: 1000 });
 
-    expect(shown).toBeGreaterThan(0);
-    expect(shown).toBeLessThan(1000);
-    expect(sc.rows).toEqual(rows.slice(0, shown));
-    expect(textIds(text)).toEqual(rows.slice(0, shown).map((r) => r.id));
-    expect(sc).toMatchObject({ truncated: false, totalRows: 1000, returnedRows: shown });
-    expect(sc.notice).toBe(
-      `Showing ${shown} of 1,000 rows — the 64,000-byte response budget ended the inline rows. Re-run with register_as to stage the whole result as a dataframe, then page it with SELECT * FROM <name> ORDER BY <columns> LIMIT ${shown} OFFSET ${shown}.`,
-    );
-    expect(text).toContain(`> ${sc.notice}`);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(mockQuery.mock.calls[0]?.[2]).toMatchObject({ rowLimit: 1000, preview: 1000 });
+    expect(sc.rows).toEqual(rows);
+    expect(textIds(text)).toEqual(rows.map((r) => r.id));
+    expect(sc).toMatchObject({ truncated: false, totalRows: 1000, returnedRows: 1000 });
+    expect(sc).not.toHaveProperty('notice');
   });
 
-  it('writes the paging SQL numbers without digit grouping, however many rows fit', async () => {
+  it.each([undefined, 'df_OUT'])(
+    'lowers preview 2000 to the default row_limit of 1,000 with a notice (register_as %s)',
+    async (registerAs) => {
+      const rows = Array.from({ length: 1000 }, (_, i) => row(i));
+      answer(rows, { rowCount: 1000 }, registerAs ? meta(registerAs, 1000) : undefined);
+
+      const { sc } = await call({ preview: 2000, ...(registerAs && { register_as: registerAs }) });
+
+      expect(mockQuery.mock.calls[0]?.[2]).toMatchObject({ rowLimit: 1000, preview: 1000 });
+      expect(sc.rows).toHaveLength(1000);
+      expect(sc.notice).toBe('Requested preview 2000 was clamped to 1000.');
+    },
+  );
+
+  it('lowers the default preview to a smaller row_limit without calling it a clamp', async () => {
+    answer([row(0), row(1), row(2)]);
+
+    const { sc } = await call({ row_limit: 3 });
+
+    expect(mockQuery.mock.calls[0]?.[2]).toMatchObject({ rowLimit: 3, preview: 3 });
+    expect(sc).not.toHaveProperty('notice');
+  });
+
+  it('names row_limit, not the default, when it lowered an omitted preview on register_as', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => row(i));
+    answer(rows, { rowCount: 40 }, meta('x', 40));
+
+    const { sc } = await call({ row_limit: 10, register_as: 'x' });
+
+    expect(mockQuery.mock.calls[0]?.[2]).toMatchObject({ rowLimit: 10, preview: 10 });
+    expect(sc.notice).toBe(
+      'Showing 10 of 40 rows — preview capped the inline slice at 10, its default of 25 lowered to row_limit. The whole result is staged as x: page it with SELECT * FROM x LIMIT 10 OFFSET 10, raising OFFSET by 10 for each further page (no ORDER BY: the table keeps the order the preview showed, and a sort reorders it).',
+    );
+  });
+
+  it('pages from the first row when preview 0 showed none of a row_limit-cut result', async () => {
+    answer([], { rowCount: 3, truncated: true });
+
+    const { sc } = await call({ row_limit: 3, preview: 0 });
+
+    expect(sc.notice).toBe(
+      'Showing 0 rows — more rows matched than the row_limit cap of 3 and the remainder was dropped uncounted, so totalRows is that cap and not a total, and preview then ended the inline rows at 0 of the 3 materialized. Raise preview to see more of them, or re-run with register_as to stage the whole result as a dataframe with an exact row count, then page it with SELECT * FROM <name> LIMIT 25 OFFSET 0, raising OFFSET by 25 for each further page (no ORDER BY: the table keeps the order the preview showed, and a sort reorders it).',
+    );
+  });
+
+  it('lists the columns of a preview 0 result in content[] as in structuredContent', async () => {
+    answer([], { columns: ['period', 'value'], rowCount: 40 }, meta('df_OUT', 40));
+
+    const { sc, text } = await call({ preview: 0, register_as: 'df_OUT' });
+
+    expect(sc.columns).toEqual(['period', 'value']);
+    expect(sc.rows).toEqual([]);
+    expect(text).toContain('| period | value |\n| --- | --- |\n\n_No rows._');
+  });
+
+  it('keeps preview 0 valid: no rows inline, no clamp', async () => {
+    answer([], { rowCount: 40 }, meta('df_OUT', 40));
+
+    const { sc } = await call({ preview: 0, register_as: 'df_OUT' });
+
+    expect(mockQuery.mock.calls[0]?.[2]).toMatchObject({ preview: 0 });
+    expect(sc.rows).toEqual([]);
+    expect(sc.notice).not.toMatch(/clamped/);
+  });
+
+  it('writes the paging SQL numbers without digit grouping', async () => {
     const rows = Array.from({ length: 10_000 }, (_, i) => ({
       id: `r${String(i).padStart(5, '0')}`,
     }));
-    answer(rows, { columns: ['id'] });
+    answer(rows, { columns: ['id'], rowCount: 20_000 }, meta('df_BIG', 20_000));
 
-    const { sc } = await call({ row_limit: 10_000 });
-    const shown = sc.rows.length;
+    const { sc, text } = await call({ register_as: 'df_BIG', row_limit: 10_000, preview: 10_000 });
 
-    expect(shown).toBeGreaterThan(1_000);
-    expect(sc.notice).toContain(`Showing ${shown.toLocaleString()} of 10,000 rows`);
-    expect(sc.notice).toContain(`LIMIT ${shown} OFFSET ${shown}.`);
-  });
-
-  it('names both caps when row_limit and the budget both bind', async () => {
-    answer(
-      Array.from({ length: 10_000 }, (_, i) => wide(i)),
-      { rowCount: 10_000, truncated: true },
-    );
-
-    const { sc, scBytes, textBytes } = await call({ row_limit: 10_000 });
-    const shown = sc.rows.length;
-
-    expect(sc.truncated).toBe(true);
-    expect(sc.totalRows).toBe(10_000);
+    expect(sc.rows).toEqual(rows);
+    expect(textIds(text)).toEqual(rows.map((r) => r.id));
     expect(sc.notice).toBe(
-      `Showing ${shown} rows — more rows matched than the row_limit cap of 10,000 and the remainder was dropped uncounted, so totalRows is that cap and not a total, and the 64,000-byte response budget then ended the inline rows at ${shown} of the 10,000 materialized. Re-run with register_as to stage the whole result as a dataframe with an exact row count, then page it with SELECT * FROM <name> ORDER BY <columns> LIMIT ${shown} OFFSET ${shown}.`,
+      'Showing 10,000 of 20,000 rows — preview capped the inline slice (it defaults to 25). The whole result is staged as df_BIG: page it with SELECT * FROM df_BIG LIMIT 10000 OFFSET 10000, raising OFFSET by 10000 for each further page (no ORDER BY: the table keeps the order the preview showed, and a sort reorders it).',
     );
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
   });
 
-  it('counts the rows preview kept, not row_limit, when preview cut them before the budget', async () => {
-    // The canvas hands back only the preview slice of the 10,000 row_limit kept.
-    answer(
-      Array.from({ length: 2_000 }, (_, i) => wide(i)),
-      { rowCount: 10_000, truncated: true },
-    );
+  it('echoes a 5,000-byte multi-line statement whole, as a fenced block in content[]', async () => {
+    const sql = `SELECT *\nFROM df_T -- ${'x'.repeat(5_000)}`;
+    answer([row(0)]);
 
-    const { sc, text, scBytes, textBytes } = await call({ row_limit: 10_000, preview: 2_000 });
-    const shown = sc.rows.length;
+    const { sc, text } = await call({ sql });
 
-    expect(shown).toBeGreaterThan(0);
-    expect(shown).toBeLessThan(2_000);
-    expect(sc).toMatchObject({ truncated: true, totalRows: 10_000, returnedRows: shown });
-    expect(sc.notice).toBe(
-      `Showing ${shown} rows — more rows matched than the row_limit cap of 10,000 and the remainder was dropped uncounted, so totalRows is that cap and not a total, and the 64,000-byte response budget then ended the inline rows at ${shown} of the 2,000 previewed. Re-run with register_as to stage the whole result as a dataframe with an exact row count, then page it with SELECT * FROM <name> ORDER BY <columns> LIMIT ${shown} OFFSET ${shown}.`,
-    );
-    expect(text).toContain(`> ${sc.notice}`);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(Buffer.byteLength(sql)).toBeGreaterThan(5_000);
+    expect(sc.executedSql).toBe(sql);
+    expect(text).toContain(`**executedSql:** \n\`\`\`\n${sql}\n\`\`\``);
   });
 
-  it('pages the table register_as already created when the budget ends the rows', async () => {
-    answer(
-      Array.from({ length: 1000 }, (_, i) => wide(i)),
-      { rowCount: 4000 },
-      meta('df_PAGED', 4000),
-    );
-
-    const { sc, text } = await call({ register_as: 'df_PAGED' });
-    const shown = sc.rows.length;
-
-    expect(sc.truncated).toBe(false);
-    expect(sc.notice).toBe(
-      `Showing ${shown} of 4,000 rows — the 64,000-byte response budget ended the inline rows. The whole result is staged as df_PAGED: page it with SELECT * FROM df_PAGED ORDER BY <columns> LIMIT ${shown} OFFSET ${shown}.`,
-    );
-    expect(text).toContain('Registered as df_PAGED');
-  });
-
-  it('withholds a first row larger than the budget and says so', async () => {
-    answer([row(0, 'x'.repeat(70_000)), row(1)]);
-
-    const { sc, text, scBytes, textBytes } = await call({});
-
-    expect(sc.rows).toEqual([]);
-    expect(sc.returnedRows).toBe(0);
-    expect(sc.totalRows).toBe(2);
-    expect(sc.notice).toBe(
-      'The first row alone exceeds the 64,000-byte response budget, so no rows are shown inline — select fewer or narrower columns; left(col, n) shortens long text.',
-    );
-    expect(text).toContain('_No rows._');
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-  });
-
-  it('holds both surfaces to the budget at the maximum row_limit and preview', async () => {
-    answer(
-      Array.from({ length: 10_000 }, (_, i) =>
-        row(i, `é|<${'ü'.repeat(300)}>\n${'`'.repeat(200)}`),
-      ),
-      { rowCount: 10_000 },
-    );
-
-    const { sc, text, scBytes, textBytes } = await call({ row_limit: 10_000, preview: 10_000 });
-
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(sc.rows.length).toBeGreaterThan(0);
-    expect(textIds(text)).toEqual(sc.rows.map((r) => r.id));
-  });
-
-  async function tuneLastRow(
-    rows: (pad: number) => Array<Record<string, unknown>>,
-    surface: 'scBytes' | 'textBytes',
-  ) {
-    answer(rows(0));
-    const base = await call({});
-    expect(base.sc.rows).toHaveLength(rows(0).length);
-    const pad = INLINE_BUDGET_BYTES - base[surface];
-    expect(pad).toBeGreaterThan(0);
-    answer(rows(pad));
-    const exact = await call({});
-    answer(rows(pad + 1));
-    const over = await call({});
-    return { exact, over, count: rows(0).length };
-  }
-
-  it('fills structuredContent to exactly 64,000 bytes and drops a row one byte past it', async () => {
-    const { exact, over, count } = await tuneLastRow(
-      (pad) => [...Array.from({ length: 50 }, (_, i) => wide(i)), row(50, 'p'.repeat(pad))],
-      'scBytes',
-    );
-
-    expect(exact.scBytes).toBe(INLINE_BUDGET_BYTES);
-    expect(exact.textBytes).toBeLessThan(INLINE_BUDGET_BYTES);
-    expect(exact.sc.rows).toHaveLength(count);
-    expect(exact.sc).not.toHaveProperty('notice');
-    expect(over.sc.rows).toHaveLength(count - 1);
-    expect(over.scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-  });
-
-  it('fills content[] to exactly 64,000 bytes when escaped text binds', async () => {
-    const { exact, over, count } = await tuneLastRow(
-      (pad) => [
-        ...Array.from({ length: 36 }, (_, i) => row(i, '<'.repeat(380))),
-        row(36, 'p'.repeat(pad)),
-      ],
-      'textBytes',
-    );
-
-    expect(exact.textBytes).toBe(INLINE_BUDGET_BYTES);
-    expect(exact.scBytes).toBeLessThan(INLINE_BUDGET_BYTES);
-    expect(exact.sc.rows).toHaveLength(count);
-    expect(over.sc.rows).toHaveLength(count - 1);
-    // The budget notice now rides in the trailer, and still fits.
-    expect(over.text).toContain(`> ${over.sc.notice}`);
-    expect(over.textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-  });
-
-  it('bounds a huge SQL echo with a marker naming the full statement size', async () => {
-    const sql = `SELECT * FROM df_T -- ${'"\\\n\u0001'.repeat(20_000)}${'😀'.repeat(20_000)}`;
-    answer(
-      Array.from({ length: 100 }, (_, i) => wide(i)),
-      { rowCount: 100 },
-    );
-
-    const { sc, text, scBytes, textBytes } = await call({ sql });
-    const echo = sc.executedSql as string;
-
-    expect(bytes(JSON.stringify(echo))).toBeLessThanOrEqual(ECHO_BUDGET_BYTES);
-    const marker = ` … [echo cut here — the full ${bytes(sql).toLocaleString()}-byte statement ran]`;
-    expect(echo.endsWith(marker)).toBe(true);
-    expect(sql.startsWith(echo.slice(0, -marker.length))).toBe(true);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(text).toContain(`**executedSql:** ${echo}`);
-    expect(sc.rows.length).toBeGreaterThan(0);
-  });
-
-  it('never splits a surrogate pair where the SQL echo is cut', async () => {
-    for (const lead of ['', 'x', 'xy', 'xyz']) {
-      const sql = `${lead}${'😀'.repeat(5_000)}`;
-      answer([row(0)]);
-      const echo = (await call({ sql })).sc.executedSql as string;
-      expect(echo).toMatch(/^[xyz]{0,3}(?:😀)+ … \[echo cut here/u);
-      expect(Buffer.from(echo, 'utf8').toString('utf8')).toBe(echo);
-    }
-  });
-
-  it('cuts a column list wider than half the budget when no row is inline', async () => {
+  it('lists every column of a 6,000-column result with no rows', async () => {
     const columns = Array.from({ length: 6_000 }, (_, i) => `period_${String(i).padStart(5, '0')}`);
     answer([], { columns, rowCount: 0 });
 
-    const { sc, scBytes, textBytes } = await call({});
-    const kept = sc.columns.slice(0, -1);
+    const { sc } = await call({});
 
-    expect(sc.columns.at(-1)).toBe(`… ${(6_000 - kept.length).toLocaleString()} more columns`);
-    expect(kept).toEqual(columns.slice(0, kept.length));
-    expect(bytes(JSON.stringify(sc.columns))).toBeLessThanOrEqual(INLINE_BUDGET_BYTES / 2);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(sc.columns).toEqual(columns);
   });
 
-  it('withholds a row too wide for the budget beside a cut column list', async () => {
-    const columns = Array.from({ length: 6_000 }, (_, i) => `period_${String(i).padStart(5, '0')}`);
-    const pivoted = Object.fromEntries(columns.map((c) => [c, '1.5']));
-    answer([pivoted], { columns });
-
-    const { sc, scBytes, textBytes } = await call({});
-
-    expect(sc.rows).toEqual([]);
-    expect(sc.notice).toMatch(/^The first row alone exceeds the 64,000-byte response budget/);
-    expect(sc.columns.at(-1)).toMatch(/^… [\d,]+ more columns$/);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-  });
-
-  it('keeps a column list under half the budget whole', async () => {
-    answer([], { columns: COLUMNS, rowCount: 0 });
-    expect((await call({})).sc.columns).toEqual(COLUMNS);
+  it('describes no byte budget in anything it advertises', () => {
+    const advertised = JSON.stringify([
+      dataframeQueryTool.description,
+      z.toJSONSchema(dataframeQueryTool.input, { io: 'input' }),
+      z.toJSONSchema(dataframeQueryTool.output.extend(dataframeQueryTool.enrichment ?? {})),
+    ]);
+    expect(advertised).not.toMatch(/budget|64,000|4,000 bytes|32,000|byte/i);
   });
 });

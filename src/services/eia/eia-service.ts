@@ -15,7 +15,10 @@
  * `NAMED_SERIES_FACETS` entry (STEO and SEDS series), and every route the
  * caller describes. Only describe writes facet values to the per-route
  * metadata cache, which holds the full uncapped value set — the cap in
- * eia_describe_route shapes its own response only. Rate-limit detection: EIA
+ * eia_describe_route shapes its own response only. An entry expires
+ * `ROUTE_METADATA_TTL_MS` after its route metadata was fetched; the next
+ * describe refreshes it, and a list whose refresh fails is served as last
+ * fetched, marked stale, rather than dropped. Rate-limit detection: EIA
  * returns `OVER_RATE_LIMIT` in the response body — classified as
  * ServiceUnavailable (retryable). A 414 (request URI over EIA's ~8 KB limit) is
  * a caller-input failure, `uri_too_long`, never retried. A fetch that throws
@@ -223,6 +226,17 @@ const ATTEMPT_TIMEOUT_MS = 45_000;
  */
 const CALL_DEADLINE_MS = 56_000;
 
+/**
+ * How long a cached route entry — route metadata and facet value lists — is
+ * served before the next describe refreshes it. EIA's releases move
+ * `endPeriod` and add and drop facet values (a monthly EIA-923 release adds
+ * new plants to `electricity/facility-fuel`'s `plantCode`), and a hosted
+ * process runs for weeks between redeploys, so an entry kept for the process
+ * lifetime goes on answering from the first fetch. A day keeps a route
+ * described many times an hour to one refresh a day.
+ */
+export const ROUTE_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
+
 /** The error a caller's wait on the shared warm rejects with when its own signal aborts. */
 function cancelledWait(signal: AbortSignal): McpError {
   return requestCancelled('Cancelled while waiting for the EIA route index to warm.', undefined, {
@@ -367,8 +381,63 @@ interface DataPage {
  * Per-route merged metadata cache. `eia_describe_route` writes it with every
  * facet's values; `eia_query_route` writes it from the route metadata alone,
  * with each facet listed in `unfetchedFacets` for the next describe to fetch.
+ * An entry expires `ROUTE_METADATA_TTL_MS` after its route metadata was
+ * fetched, and the next describe replaces it with a refreshed one; only leaf
+ * routes enter it, so it needs no size bound. Query reads an expired entry's
+ * column IDs as before and never refreshes it.
  */
 const _routeMetaCache = new Map<string, RouteMetadata>();
+
+/** True once a list or entry fetched at `fetchedAt` is due for a refresh at `now`. */
+function isExpired(fetchedAt: number, now: number): boolean {
+  return now - fetchedAt >= ROUTE_METADATA_TTL_MS;
+}
+
+/**
+ * True for a facet value list served from an earlier fetch than its entry's
+ * route metadata — one whose refresh EIA did not answer. Such a list keeps its
+ * values and is retried by the next describe.
+ */
+function isStaleList(facet: Facet, meta: RouteMetadata): boolean {
+  return facet.fetchedAt !== undefined && facet.fetchedAt < meta.fetchedAt;
+}
+
+/**
+ * IDs of the value lists a describe of an unexpired entry still fetches —
+ * never fetched, or stale — or undefined when there are none.
+ */
+function dueLists(meta: RouteMetadata): Set<string> | undefined {
+  let due: Set<string> | undefined;
+  for (const facet of meta.facets) {
+    if (facet.fetchedAt !== undefined && !isStaleList(facet, meta)) continue;
+    due ??= new Set();
+    due.add(facet.id);
+  }
+  return due;
+}
+
+/**
+ * `meta` as describe returns it: annotated with what it serves as last fetched
+ * — the whole entry when `route` is true, and each stale value list — or
+ * `meta` itself when everything in it is current.
+ */
+function withStale(meta: RouteMetadata, route: boolean): RouteMetadata {
+  const facets = meta.facets.flatMap((f) =>
+    f.fetchedAt !== undefined && isStaleList(f, meta) ? [{ id: f.id, fetchedAt: f.fetchedAt }] : [],
+  );
+  return route || facets.length > 0 ? { ...meta, stale: { route, facets } } : meta;
+}
+
+/**
+ * Cache `meta` unless an entry from newer route metadata landed while this
+ * describe was in flight — a concurrent refresh, which a slow call that began
+ * from the expired entry must not overwrite with an older one.
+ */
+function storeRouteMetadata(meta: RouteMetadata): void {
+  const landed = _routeMetaCache.get(meta.route);
+  if (landed && landed.fetchedAt > meta.fetchedAt) return;
+  _routeMetaCache.set(meta.route, meta);
+}
 
 /**
  * Data columns a leaf's metadata advertises, in EIA's order. EIA uses two
@@ -420,6 +489,7 @@ function routeMetadataOf(
 
   return {
     route,
+    fetchedAt: Date.now(),
     description: normalizeDescription(raw.description),
     facets,
     dataColumns: dataColumnsOf(raw),
@@ -1311,6 +1381,18 @@ class EiaApiService {
    * leaves the describe successful and stays named, unless `opts.facet` asks
    * for exactly that facet: there is no window to page, so the call fails
    * retryably with the leg's own cause.
+   *
+   * An entry expires `ROUTE_METADATA_TTL_MS` after its route metadata was
+   * fetched, and the next describe refreshes it as a first describe would:
+   * the route metadata, then every facet list. A list whose refresh fails
+   * keeps serving its previous values — it is stale, not unavailable — and the
+   * next describe retries it alone; a route metadata refresh that fails serves
+   * the whole previous entry. Either way the result names what it serves as
+   * last fetched in `stale`. A refresh answered 404 (or naming a category) is
+   * EIA's answer, not a failure: the entry is dropped and the call fails as a
+   * cold describe would. A caller's cancellation propagates and leaves the
+   * previous entry for the next caller. Concurrent describes of an expired
+   * entry each refresh under their own signal, as cold describes do.
    */
   async describe(
     route: string,
@@ -1321,7 +1403,12 @@ class EiaApiService {
     const normalizedRoute = normalizeRoutePath(route);
 
     const cached = _routeMetaCache.get(normalizedRoute);
-    if (cached && !cached.unfetchedFacets) return cached;
+    if (cached && !isExpired(cached.fetchedAt, Date.now())) {
+      // The common case — every list current — allocates nothing.
+      const due = dueLists(cached);
+      if (due === undefined) return cached;
+      return this.finishDescribe(cached, due, ctx, deadlineAt, opts.facet);
+    }
 
     if (!cached) {
       await this.ensureTreeWarmed(ctx);
@@ -1337,15 +1424,63 @@ class EiaApiService {
       }
     }
 
-    const { meta, failures } = await this.fetchFacetValues(
-      cached ?? (await this.fetchRouteMetadata(normalizedRoute, ctx, deadlineAt)),
+    let fresh: RouteMetadata;
+    try {
+      fresh = await this.fetchRouteMetadata(normalizedRoute, ctx, deadlineAt);
+    } catch (err) {
+      if (!cached || ctx.signal.aborted) throw err;
+      const reason = err instanceof McpError ? err.data?.reason : undefined;
+      if (reason === 'route_not_found' || reason === 'route_not_queryable') {
+        _routeMetaCache.delete(normalizedRoute);
+        throw err;
+      }
+      ctx.log.warning(
+        'EIA route metadata refresh failed — serving the cached entry as last fetched',
+        {
+          route: normalizedRoute,
+          fetchedAt: new Date(cached.fetchedAt).toISOString(),
+          error: errorMessage(err),
+        },
+      );
+      if (opts.facet !== undefined && cached.unfetchedFacets?.includes(opts.facet)) {
+        throw facetUnavailable(normalizedRoute, opts.facet, err);
+      }
+      return withStale(cached, true);
+    }
+
+    // Each list the expired entry held rides into the refreshed one, so a
+    // refresh of it that fails still has its previous values to serve.
+    const previous = new Map(cached?.facets.map((f) => [f.id, f]));
+    const facets = fresh.facets.map((f): Facet => {
+      const prior = previous.get(f.id);
+      return prior?.fetchedAt === undefined ? f : { ...prior, description: f.description };
+    });
+    return this.finishDescribe(
+      { ...fresh, facets },
+      new Set(facets.map((f) => f.id)),
       ctx,
       deadlineAt,
+      opts.facet,
     );
-    if (opts.facet !== undefined && failures.has(opts.facet)) {
-      throw facetUnavailable(meta.route, opts.facet, failures.get(opts.facet));
+  }
+
+  /**
+   * Fetch the `pending` value lists of `meta`, cache the result, and return it
+   * as describe does — failing the call only when `facet` names a list that
+   * failed and has no previous values to serve.
+   */
+  private async finishDescribe(
+    meta: RouteMetadata,
+    pending: ReadonlySet<string>,
+    ctx: Context,
+    deadlineAt: number,
+    facet: string | undefined,
+  ): Promise<RouteMetadata> {
+    const { meta: updated, failures } = await this.fetchFacetValues(meta, pending, ctx, deadlineAt);
+    if (facet !== undefined && failures.has(facet) && updated.unfetchedFacets?.includes(facet)) {
+      throw facetUnavailable(updated.route, facet, failures.get(facet));
     }
-    return meta;
+    return withStale(updated, false);
   }
 
   /**
@@ -1399,6 +1534,8 @@ class EiaApiService {
    * fallback when neither the warmed node nor a prior describe holds the
    * route's data columns. Every facet stays in `unfetchedFacets`, so the entry
    * never reads as a described route and the next describe fetches the lists.
+   * Like a describe's, the entry expires `ROUTE_METADATA_TTL_MS` after its
+   * fetch, and the first describe past that refreshes its metadata too.
    */
   private async cacheRouteMetadata(
     route: string,
@@ -1414,45 +1551,51 @@ class EiaApiService {
   }
 
   /**
-   * Fetch, in parallel, the value lists `meta` names in `unfetchedFacets`, and
-   * cache and index the merged result. A list that fails past its retries is
-   * not cached as an empty facet: it stays in `unfetchedFacets` for the next
-   * describe to re-fetch, and its error is returned under its facet ID. A
-   * caller's cancellation propagates instead of reading as a failed list.
+   * Fetch, in parallel, the `pending` value lists of `meta`, and cache and
+   * index the merged result. A list that fails past its retries is not cached
+   * as an empty facet: one never fetched stays in `unfetchedFacets`, one with
+   * previous values keeps them as a stale list, and either is re-fetched by the
+   * next describe; its error is returned under its facet ID. A caller's
+   * cancellation propagates instead of reading as a failed list, and caches
+   * nothing.
    */
   private async fetchFacetValues(
     meta: RouteMetadata,
+    pending: ReadonlySet<string>,
     ctx: Context,
     deadlineAt: number,
   ): Promise<{ meta: RouteMetadata; failures: Map<string, unknown> }> {
-    const pending = new Set(meta.unfetchedFacets);
     const failures = new Map<string, unknown>();
     const facets = await Promise.all(
       meta.facets.map(async (facet): Promise<Facet> => {
         if (!pending.has(facet.id)) return facet;
         try {
-          return await this.fetchFacet(meta.route, facet, ctx, deadlineAt);
+          const fetched = await this.fetchFacet(meta.route, facet, ctx, deadlineAt);
+          // Stamped no earlier than the entry's own metadata, even across a
+          // wall-clock step back, so a list fetched now never reads as stale.
+          return { ...fetched, fetchedAt: Math.max(Date.now(), meta.fetchedAt) };
         } catch (err) {
           if (ctx.signal.aborted) throw err;
           failures.set(facet.id, err);
-          ctx.log.warning('EIA facet fetch failed — left for the next describe to retry', {
-            route: meta.route,
-            facetId: facet.id,
-            error: errorMessage(err),
-          });
+          ctx.log.warning(
+            facet.fetchedAt === undefined
+              ? 'EIA facet fetch failed — left for the next describe to retry'
+              : 'EIA facet refresh failed — serving its last fetched values until the next describe retries it',
+            { route: meta.route, facetId: facet.id, error: errorMessage(err) },
+          );
           return facet;
         }
       }),
     );
 
     const { unfetchedFacets: _fetchedNow, ...rest } = meta;
-    const unfetchedFacets = facets.filter((f) => failures.has(f.id)).map((f) => f.id);
+    const unfetchedFacets = facets.filter((f) => f.fetchedAt === undefined).map((f) => f.id);
     const updated: RouteMetadata = {
       ...rest,
       facets,
       ...(unfetchedFacets.length > 0 && { unfetchedFacets }),
     };
-    _routeMetaCache.set(meta.route, updated);
+    storeRouteMetadata(updated);
 
     // The facet values are already in hand, so folding them into the search
     // index costs nothing upstream. This is what makes a described route's
@@ -1495,8 +1638,7 @@ class EiaApiService {
    * With `accumulate`, additional offset pages are fetched and returned under
    * `accumulated` for canvas registration — bounded by `EIA_CANVAS_MAX_ROWS`
    * and by EIA's 5,000-row-per-request ceiling. `data` is never widened: it is
-   * the one page of `length` rows, which the tool, not the service, trims to the
-   * inline response budget.
+   * the one page of `length` rows, which the tool returns inline whole.
    */
   async query(
     route: string,
@@ -1584,7 +1726,7 @@ class EiaApiService {
     }
 
     const offset = opts.offset ?? 0;
-    const length = opts.length ?? 100;
+    const length = opts.length ?? 25;
 
     // An omitted frequency is the route's default, read from what this process
     // already holds; with neither the node nor its metadata, EIA judges the bounds.
@@ -1618,11 +1760,19 @@ class EiaApiService {
       ...(appliedColumns && { appliedColumns }),
     };
 
+    // A list never fetched, or one past its refresh time, is not evidence that
+    // a value is missing — EIA may have added it since — and a query never
+    // refreshes a list, so such a list is skipped.
     const notices: string[] = [];
-    const meta = _routeMetaCache.get(normalizedRoute);
-    for (const facet of meta?.facets ?? []) {
+    const now = Date.now();
+    for (const facet of _routeMetaCache.get(normalizedRoute)?.facets ?? []) {
       const submitted = opts.filters?.[facet.id];
-      if (!facet.complete || meta?.unfetchedFacets?.includes(facet.id) || submitted === undefined)
+      if (
+        !facet.complete ||
+        facet.fetchedAt === undefined ||
+        isExpired(facet.fetchedAt, now) ||
+        submitted === undefined
+      )
         continue;
       const ids = new Set(facet.values.map((v) => v.id));
       const unmatched = [...new Set(Array.isArray(submitted) ? submitted : [submitted])].filter(

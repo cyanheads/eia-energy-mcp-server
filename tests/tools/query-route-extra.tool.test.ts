@@ -5,11 +5,11 @@
  * @module tests/tools/query-route-extra.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
-import { ECHO_BUDGET_BYTES, INLINE_BUDGET_BYTES } from '@/mcp-server/tools/inline-budget.js';
 import * as canvasBridge from '@/services/canvas-bridge/canvas-bridge.js';
 import * as eiaService from '@/services/eia/eia-service.js';
 
@@ -722,7 +722,7 @@ describe('queryRouteTool — additional coverage', () => {
 
     const enrichment = getEnrichment(ctx);
     expect(enrichment.appliedOffset).toBe(0);
-    expect(enrichment.appliedLength).toBe(100);
+    expect(enrichment.appliedLength).toBe(25);
   });
 
   // ------------------------------------------------------------------
@@ -1583,13 +1583,11 @@ describe('queryRouteTool — additional coverage', () => {
 });
 
 // ---------------------------------------------------------------------------
-// #58 — each response surface holds to a fixed byte budget, cut between whole
-// rows, with next_offset naming where the inline page continues.
+// #96 — length is the page: every fetched row goes inline whatever its width,
+// next_offset is offset + returned_count, and the filter echo comes back whole.
 // ---------------------------------------------------------------------------
 
-describe('queryRouteTool — inline byte budget (#58)', () => {
-  const bytes = (text: string) => Buffer.byteLength(text, 'utf8');
-
+describe('queryRouteTool — page size (#96)', () => {
   /** A row whose first cell is a unique id, so its position shows on both surfaces. */
   const row = (i: number, note = '') => ({
     id: `r${String(i).padStart(4, '0')}`,
@@ -1624,7 +1622,7 @@ describe('queryRouteTool — inline byte budget (#58)', () => {
       data: Array<Record<string, unknown>>;
     };
     const text = (result.content ?? []).map((b) => (b as { text?: string }).text ?? '').join('');
-    return { sc, text, scBytes: bytes(JSON.stringify(sc)), textBytes: bytes(text) };
+    return { sc, text };
   }
 
   /** Row ids in the order the content[] table lists them. */
@@ -1638,156 +1636,53 @@ describe('queryRouteTool — inline byte budget (#58)', () => {
     mockQuery.mockReset();
   });
 
-  it('pins the budget at 64,000 bytes per surface and an echo at 4,000', () => {
-    expect(INLINE_BUDGET_BYTES).toBe(64_000);
-    expect(ECHO_BUDGET_BYTES).toBe(4_000);
-  });
-
-  it('keeps a default 100-row page whole on a narrow route', async () => {
-    const fetched = Array.from({ length: 100 }, (_, i) => narrow(i));
+  it('fetches 25 rows when length is omitted and echoes that as appliedLength', async () => {
+    const fetched = Array.from({ length: 25 }, (_, i) => narrow(i));
     respond(fetched, 5000);
 
-    const { sc, text, scBytes, textBytes } = await call({});
+    const { sc, text } = await call({});
 
+    expect(mockQuery.mock.calls[0]?.[1].length).toBe(25);
+    expect(sc).toMatchObject({ appliedLength: 25, returned_count: 25, next_offset: 25 });
     expect(sc.data).toEqual(fetched);
-    expect(sc.returned_count).toBe(100);
     expect(textIds(text)).toEqual(fetched.map((r) => r.id));
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(sc).not.toHaveProperty('notice');
   });
 
-  it('ends a wide default page early, with the same rows and next call on both surfaces', async () => {
+  it('returns a whole 100-row page of wide rows, the same rows and next call on both surfaces', async () => {
+    // About 108 KB of structuredContent — a page the size cut used to end at 59 rows.
     const fetched = Array.from({ length: 100 }, (_, i) => wide(i));
     respond(fetched, 26_000);
 
-    const { sc, text, scBytes, textBytes } = await call({});
-    const shown = sc.data.length;
+    const { sc, text } = await call({ length: 100 });
 
-    expect(shown).toBeGreaterThan(0);
-    expect(shown).toBeLessThan(100);
-    expect(sc.data).toEqual(fetched.slice(0, shown));
-    expect(textIds(text)).toEqual(fetched.slice(0, shown).map((r) => r.id));
-    expect(sc.returned_count).toBe(shown);
-    expect(sc.next_offset).toBe(shown);
-    expect(sc.returnedCount).toBe(shown);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    // The page is as long as the budget allows: one more row overflows a surface.
-    const next = fetched[shown] as ReturnType<typeof wide>;
-    const nextJson = bytes(JSON.stringify(next)) + 1;
-    const nextLine = bytes(`\n| ${next.id} | ${next.period} | ${next.stateid} | ${next.note} |`);
-    expect(
-      scBytes + nextJson > INLINE_BUDGET_BYTES || textBytes + nextLine > INLINE_BUDGET_BYTES,
-    ).toBe(true);
-
+    expect(mockQuery.mock.calls[0]?.[1].length).toBe(100);
+    expect(sc.data).toEqual(fetched);
+    expect(textIds(text)).toEqual(fetched.map((r) => r.id));
+    expect(sc).toMatchObject({ returned_count: 100, returnedCount: 100, next_offset: 100 });
     const note = sc.canvas_preview_note as string;
-    expect(note).toContain(
-      `The 64,000-byte response budget ended this page at ${shown} of the 100 rows fetched; continue the inline page at next_offset ${shown}.`,
+    expect(note).toBe(
+      'Showing 100 of 26,000 rows — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset. Continue the inline page at next_offset 100.',
     );
     expect(text).toContain(note);
-    expect(text).toContain(`**Next offset:** ${shown}`);
+    expect(text).toContain('**Next offset:** 100');
   });
 
-  it('holds both surfaces to the budget at the maximum length with wide multibyte strings', async () => {
+  it('returns all 5,000 rows at the maximum length, wide multibyte strings included', async () => {
     const fetched = Array.from({ length: 5000 }, (_, i) =>
       row(i, `é|<${'ü'.repeat(400)}>\n${'x'.repeat(300)}`),
     );
-    respond(fetched, 5000);
+    respond(fetched, 6000);
 
-    const { sc, text, scBytes, textBytes } = await call({ length: 5000 });
+    const { sc, text } = await call({ length: 5000 });
 
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(sc.data.length).toBeGreaterThan(0);
-    expect(sc.returned_count).toBe(sc.data.length);
-    expect(sc.next_offset).toBe(sc.data.length);
-    expect(textIds(text)).toEqual(sc.data.map((r) => r.id));
+    expect(sc.data).toEqual(fetched);
+    expect(sc).toMatchObject({ returned_count: 5000, next_offset: 5000 });
+    expect(textIds(text)).toEqual(fetched.map((r) => r.id));
   });
 
-  /**
-   * Exact boundaries: the padding on the last row is tuned so the binding
-   * surface lands on exactly 64,000 bytes with every row inline, then one byte
-   * past it. Measured through the framework's own composition, so the
-   * handler's trailer estimate is held to what the caller actually receives.
-   */
-  async function tuneLastRow(
-    rows: (pad: number) => Array<Record<string, unknown>>,
-    total: number,
-    surface: 'scBytes' | 'textBytes',
-    input: Record<string, unknown> = {},
-  ) {
-    respond(rows(0), total);
-    const base = await call(input);
-    expect(base.sc.data).toHaveLength(rows(0).length);
-    const pad = INLINE_BUDGET_BYTES - base[surface];
-    expect(pad).toBeGreaterThan(0);
-    respond(rows(pad), total);
-    const exact = await call(input);
-    respond(rows(pad + 1), total);
-    const over = await call(input);
-    return { exact, over, count: rows(0).length };
-  }
-
-  it('fills structuredContent to exactly 64,000 bytes and drops a row one byte past it', async () => {
-    const rows = (pad: number) => [
-      ...Array.from({ length: 50 }, (_, i) => wide(i)),
-      row(50, `${'p'.repeat(pad)}`),
-    ];
-    const { exact, over, count } = await tuneLastRow(rows, 51, 'scBytes');
-
-    expect(exact.scBytes).toBe(INLINE_BUDGET_BYTES);
-    expect(exact.textBytes).toBeLessThan(INLINE_BUDGET_BYTES);
-    expect(exact.sc.data).toHaveLength(count);
-    expect(exact.sc).not.toHaveProperty('next_offset');
-
-    expect(over.sc.data).toHaveLength(count - 1);
-    expect(over.sc.next_offset).toBe(count - 1);
-    expect(over.scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-  });
-
-  it('fills content[] to exactly 64,000 bytes when escaped text binds, filters in the trailer', async () => {
-    // Every `<` costs one byte in JSON and four as `&lt;` in the table, so the
-    // text surface binds; the filter list ends in a bullet, which the trailer
-    // separates from the next field with a blank line.
-    const filters = { stateid: ['TX', 'CA'], sectorid: 'RES' };
-    const rows = (pad: number) => [
-      ...Array.from({ length: 36 }, (_, i) => row(i, '<'.repeat(380))),
-      row(36, `${'<'.repeat(100)}${'p'.repeat(pad)}`),
-    ];
-    const { exact, over, count } = await tuneLastRow(rows, 37, 'textBytes', { filters });
-
-    expect(exact.text).toContain('- **sectorid:** RES\n\n**appliedOffset:** 0');
-    expect(exact.textBytes).toBe(INLINE_BUDGET_BYTES);
-    expect(exact.scBytes).toBeLessThan(INLINE_BUDGET_BYTES);
-    expect(exact.sc.data).toHaveLength(count);
-
-    expect(over.sc.data).toHaveLength(count - 1);
-    expect(over.textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textIds(over.text)).toEqual(over.sc.data.map((r) => r.id));
-  });
-
-  it('withholds a row larger than the budget and names the offset that skips it', async () => {
-    respond([row(0, 'x'.repeat(70_000)), wide(1)], 5000);
-
-    const { sc, text, scBytes, textBytes } = await call({ offset: 10, length: 2 });
-
-    expect(sc.data).toEqual([]);
-    expect(sc.returned_count).toBe(0);
-    // next_offset stays on the withheld row; the note says how to step past it.
-    expect(sc.next_offset).toBe(10);
-    const note = sc.canvas_preview_note as string;
-    expect(note).toContain(
-      'The row at offset 10 alone exceeds the 64,000-byte response budget, so no rows are shown inline — narrow it with columns, or skip it with offset 11.',
-    );
-    expect(text).toContain(note);
-    expect(text).toContain('_No rows returned._');
-    expect(sc).not.toHaveProperty('notice');
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-  });
-
-  it('pages a mixed-width match by next_offset with no gap or overlap', async () => {
-    // Widths vary row to row; row 137 alone overflows the budget.
+  it('pages a mixed-width match by next_offset, every row once and every page full until the last', async () => {
+    // Widths vary row to row; row 137 alone is 80 KB.
     const dataset = Array.from({ length: 420 }, (_, i) =>
       i === 137 ? row(i, 'x'.repeat(80_000)) : row(i, 'v'.repeat((i * 97) % 2_400)),
     );
@@ -1803,30 +1698,21 @@ describe('queryRouteTool — inline byte budget (#58)', () => {
     );
 
     const seen: Array<Record<string, unknown>> = [];
-    const skipped: number[] = [];
+    const pageSizes: number[] = [];
     let offset = 0;
-    let pages = 0;
     for (;;) {
-      const { sc, scBytes, textBytes } = await call({ offset, length: 100 });
-      pages++;
-      expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-      expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+      const { sc, text } = await call({ offset, length: 100 });
+      pageSizes.push(sc.returned_count as number);
+      expect(textIds(text)).toEqual(sc.data.map((r) => r.id));
       seen.push(...sc.data);
       if (sc.next_offset === undefined) break;
       expect(sc.next_offset).toBe(offset + (sc.returned_count as number));
-      if (sc.returned_count === 0) {
-        // The withheld-row note's own instruction: skip with offset + 1.
-        skipped.push(offset);
-        offset += 1;
-      } else {
-        offset = sc.next_offset as number;
-      }
-      expect(pages).toBeLessThan(100);
+      offset = sc.next_offset as number;
+      expect(pageSizes.length).toBeLessThan(10);
     }
 
-    expect(skipped).toEqual([137]);
-    expect(seen).toEqual(dataset.filter((_, i) => i !== 137));
-    expect(pages).toBeGreaterThan(5);
+    expect(pageSizes).toEqual([100, 100, 100, 100, 20]);
+    expect(seen).toEqual(dataset);
   });
 
   it('omits next_offset on the last page, an empty match, and an offset past the end', async () => {
@@ -1844,69 +1730,46 @@ describe('queryRouteTool — inline byte budget (#58)', () => {
     expect(past.sc.notice).toMatch(/^Offset 60 is past the last row/);
   });
 
-  it('stages every fetched row when the budget trims the inline page, pointer → range → inline', async () => {
+  it('stages every accumulated row and inlines the whole page, pointer → range → inline', async () => {
     const register = registeringBridge('df_WIDE', 500);
     const fetched = Array.from({ length: 100 }, (_, i) => wide(i));
     const accumulated = Array.from({ length: 500 }, (_, i) => wide(i));
     respond(fetched, 26_000, { accumulated: { rows: accumulated, capped: true, cap: 500 } });
 
-    const { sc, text, scBytes, textBytes } = await call({ stage: true });
-    const shown = sc.data.length;
+    const { sc, text } = await call({ length: 100, stage: true });
 
     expect(register.mock.calls[0]?.[1].rows).toEqual(accumulated);
-    expect(shown).toBeLessThan(100);
-    expect(sc.next_offset).toBe(shown);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
+    expect(sc.data).toEqual(fetched);
+    expect(sc.next_offset).toBe(100);
 
-    const note = sc.canvas_preview_note as string;
-    const pointer = note.indexOf('500 rows staged as df_WIDE');
-    const range = note.indexOf('Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (500)');
-    const inline = note.indexOf(`Showing ${shown} of 26,000 rows inline.`);
-    const budget = note.indexOf(`The 64,000-byte response budget ended this page at ${shown}`);
-    const pageWithoutStaging = note.indexOf('Page the inline rows with stage left off');
-    expect(pointer).toBe(0);
-    expect(range).toBeGreaterThan(pointer);
-    expect(inline).toBeGreaterThan(range);
-    expect(budget).toBeGreaterThan(inline);
-    expect(pageWithoutStaging).toBeGreaterThan(budget);
-    expect(text).toContain(note);
+    expect(sc.canvas_preview_note).toBe(
+      '500 rows staged as df_WIDE — call eia_dataframe_describe for its column names, then eia_dataframe_query to run SQL over it. Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (500), so the staged rows are 1–500 of 26,000. Narrow with filters, start, or end — or re-query with offset 500 — to reach the rest. Showing 100 of 26,000 rows inline. Continue the inline page at next_offset 100. Page the inline rows with stage left off — another stage: true call stages a new table.',
+    );
+    expect(text).toContain(sc.canvas_preview_note as string);
   });
 
-  it('bounds a huge filter echo with a marker and still sends every value', async () => {
+  it('echoes a 20,000-value filter set whole and sends every value', async () => {
     const values = Array.from({ length: 20_000 }, (_, i) => `PLANT${String(i).padStart(6, '0')}`);
+    const filters = { plantid: values, stateid: 'TX' };
     respond(
-      Array.from({ length: 100 }, (_, i) => wide(i)),
+      Array.from({ length: 25 }, (_, i) => wide(i)),
       26_000,
     );
 
-    const { sc, text, scBytes, textBytes } = await call({
-      filters: { plantid: values, stateid: 'TX' },
-    });
+    const { sc, text } = await call({ filters });
 
     expect(mockQuery.mock.calls[0]?.[1].filters.plantid).toHaveLength(20_000);
-    expect(scBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(textBytes).toBeLessThanOrEqual(INLINE_BUDGET_BYTES);
-    expect(sc.data.length).toBeGreaterThan(0);
-
-    const echo = sc.appliedFilters as Record<string, string | string[]>;
-    expect(bytes(JSON.stringify(echo))).toBeLessThanOrEqual(ECHO_BUDGET_BYTES);
-    const kept = echo.plantid as string[];
-    expect(kept).toEqual(values.slice(0, kept.length));
-    expect(echo).not.toHaveProperty('stateid');
-    // A facet cut whole is still named in the marker, with its count.
-    expect(echo['…']).toBe(
-      `${(20_001 - kept.length).toLocaleString()} of 20,001 filter values not echoed (plantid: ${(20_000 - kept.length).toLocaleString()}, stateid: 1) — the query applied every one.`,
-    );
-    expect(text).toContain(`- **…:** ${echo['…']}`);
+    expect(sc.appliedFilters).toEqual(filters);
+    expect(text).toContain(`- **plantid:** ${values.join(', ')}\n- **stateid:** TX`);
+    expect(sc.data).toHaveLength(25);
   });
 
-  it('echoes a filter set under the echo budget unchanged', async () => {
-    respond([narrow(0)], 1);
-    const filters = { stateid: ['TX', 'CA'], sectorid: 'RES' };
-
-    const { sc } = await call({ filters });
-
-    expect(sc.appliedFilters).toEqual(filters);
+  it('describes no byte budget in anything it advertises', () => {
+    const advertised = JSON.stringify([
+      queryRouteTool.description,
+      z.toJSONSchema(queryRouteTool.input, { io: 'input' }),
+      z.toJSONSchema(queryRouteTool.output.extend(queryRouteTool.enrichment ?? {})),
+    ]);
+    expect(advertised).not.toMatch(/budget|64,000|4,000 bytes|byte/i);
   });
 });

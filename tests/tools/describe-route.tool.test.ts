@@ -454,6 +454,103 @@ describe('describeRouteTool', () => {
     });
   });
 
+  // #91 — a refresh that fails serves what was cached; the service names it in
+  // `stale`, and the tool keeps those lists in facets and says when each was fetched.
+  describe('lists served as last fetched', () => {
+    const META_AT = Date.parse('2026-10-02T09:00:00Z');
+    const STALE_META = {
+      ...FULL_META,
+      fetchedAt: META_AT,
+      facets: [
+        { ...wideFacet('stateid', 3), fetchedAt: Date.parse('2026-10-01T09:00:00Z') },
+        { ...wideFacet('sectorid', 2), fetchedAt: Date.parse('2026-09-30T18:30:00Z') },
+        { ...wideFacet('fresh', 1), fetchedAt: META_AT },
+      ],
+      stale: {
+        route: false,
+        facets: [
+          { id: 'stateid', fetchedAt: Date.parse('2026-10-01T09:00:00Z') },
+          { id: 'sectorid', fetchedAt: Date.parse('2026-09-30T18:30:00Z') },
+        ],
+      },
+    };
+    const RETRY = 'The next eia_describe_route call retries the refresh.';
+    const noticeOf = (r: Awaited<ReturnType<typeof runToolContract>>) =>
+      (r.structuredContent as { notice: string }).notice;
+    const textOf = (r: Awaited<ReturnType<typeof runToolContract>>) =>
+      r.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+
+    it('keeps stale lists in facets and names each with its fetch time, on both surfaces', async () => {
+      mockDescribe.mockResolvedValue(STALE_META);
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/retail-sales',
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        facets: [
+          { id: 'stateid', value_count: 3 },
+          { id: 'sectorid', value_count: 2 },
+          { id: 'fresh', value_count: 1 },
+        ],
+      });
+      expect(result.structuredContent).not.toHaveProperty('unavailable_facets');
+      const expected = `EIA did not answer the refresh of the value lists of stateid (fetched 2026-10-01T09:00:00Z), sectorid (fetched 2026-09-30T18:30:00Z), so they are served as last fetched and may lack values EIA has added since. ${RETRY}`;
+      expect(noticeOf(result).endsWith(` ${expected}`)).toBe(true);
+      expect(textOf(result)).toContain(expected);
+    });
+
+    it('names only the requested facet when the input restricts to one', async () => {
+      mockDescribe.mockResolvedValue(STALE_META);
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/retail-sales',
+        facet: 'sectorid',
+      });
+
+      const expected = `EIA did not answer the refresh of the value list of sectorid (fetched 2026-09-30T18:30:00Z), so it is served as last fetched and may lack values EIA has added since. ${RETRY}`;
+      expect(noticeOf(result).endsWith(` ${expected}`)).toBe(true);
+      expect(noticeOf(result)).not.toContain('stateid');
+    });
+
+    it('says nothing of staleness when the requested facet is current', async () => {
+      mockDescribe.mockResolvedValue(STALE_META);
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/retail-sales',
+        facet: 'fresh',
+      });
+
+      expect(noticeOf(result)).not.toContain('refresh');
+    });
+
+    it('names the whole entry when the route metadata refresh failed, and any older list', async () => {
+      mockDescribe.mockResolvedValue({
+        ...STALE_META,
+        stale: { route: true, facets: [STALE_META.stale.facets[1]] },
+      });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/retail-sales',
+      });
+
+      const expected = `EIA did not answer the refresh of this route, so the description cached at 2026-10-02T09:00:00Z is served as it stood; date_range, frequencies, data columns, and facet values may have changed since. EIA did not answer the refresh of the value list of sectorid (fetched 2026-09-30T18:30:00Z), so it is served as last fetched and may lack values EIA has added since. ${RETRY}`;
+      expect(noticeOf(result).endsWith(` ${expected}`)).toBe(true);
+      expect(textOf(result)).toContain(expected);
+    });
+
+    it('adds no staleness notice to a current entry', async () => {
+      mockDescribe.mockResolvedValue({ ...FULL_META, fetchedAt: META_AT });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/retail-sales',
+      });
+
+      expect(noticeOf(result)).not.toContain('refresh');
+    });
+  });
+
   describe('format()', () => {
     it('renders all required fields including query and alias', () => {
       const result = {
