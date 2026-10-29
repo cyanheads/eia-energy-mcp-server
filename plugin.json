@@ -1,0 +1,35 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "eia-energy-mcp-server",
+  "version": "0.4.6",
+  "description": "Browse and query the U.S. Energy Information Administration API v2 — electricity, petroleum, natural gas, coal, forecasts, and more via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/eia-energy-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/eia-energy-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "eia",
+    "energy",
+    "energy-information-administration",
+    "electricity",
+    "petroleum",
+    "natural-gas",
+    "coal",
+    "energy-data",
+    "energy-api",
+    "steo",
+    "us-energy",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ]
+}
