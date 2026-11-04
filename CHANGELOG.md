@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-11-03
+
+eia_search_routes finds a route by its data-column alias, a Monthly Energy Review series by name or ID, and a balancing authority by ISO/RTO acronym; eia_query_route refuses an impossible month, day, or hour before any request; eia_describe_route says where a unitless column's unit is.
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-29 · ⚠️ Breaking
 
 Pages are exactly length rows (default 25) with the 64,000-byte inline cut removed, cached route metadata expires after 24 hours, and an eia-energy-guide skill is published. Breaking: eia_dataframe_query refuses an unqualified current_schema column or alias.

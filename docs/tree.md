@@ -1,6 +1,6 @@
 # eia-energy-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 09:40:47
+Generated on: 2026-11-04 04:34:15
 
 ```text
 eia-energy-mcp-server/
@@ -169,6 +169,7 @@ eia-energy-mcp-server/
 │   │   ├── canvas-bridge/
 │   │   │   └── canvas-bridge.ts
 │   │   └── eia/
+│   │       ├── balancing-authorities.ts
 │   │       ├── eia-service.ts
 │   │       ├── period-bounds.ts
 │   │       ├── route-cache.ts
@@ -178,11 +179,14 @@ eia-energy-mcp-server/
 ├── tests/
 │   ├── config/
 │   │   └── server-config.test.ts
+│   ├── fixtures/
+│   │   └── balancing-authority-facets.json
 │   ├── prompts/
 │   ├── resources/
 │   ├── scripts/
 │   │   └── bundle-agent-docs.test.ts
 │   ├── services/
+│   │   ├── balancing-authorities.test.ts
 │   │   ├── canvas-bridge.test.ts
 │   │   ├── cold-start.test.ts
 │   │   ├── eia-service.test.ts
