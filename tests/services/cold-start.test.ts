@@ -91,6 +91,7 @@ function coldBodies(): Record<string, unknown> {
     steo: { response: LEAF_META('steo', 'seriesId') },
     'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
     'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+    'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
     'electricity/retail-sales/facet/fueltype': { response: { totalFacets: 0, facets: [] } },
     'electricity/rto/fuel-type-data/facet/fueltype': { response: { totalFacets: 0, facets: [] } },
   };

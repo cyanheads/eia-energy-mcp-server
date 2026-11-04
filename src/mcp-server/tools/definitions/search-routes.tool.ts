@@ -1,15 +1,17 @@
 /**
  * @fileoverview Tool definition for eia_search_routes. Fuzzy text search across
- * route names, descriptions, and category labels using an in-memory Fuse.js
- * index. Resolves natural-language queries to route paths. Two further entry
- * classes join the index and answer with a `filter_hint`: named series (STEO's
- * 1,469 and SEDS's 968 `seriesId` values) and facet values — fuel types,
+ * route names, descriptions, category labels, and each leaf's data-column
+ * aliases using an in-memory Fuse.js index. Resolves natural-language queries to
+ * route paths. Two further entry classes join the index and answer with a
+ * `filter_hint`: named series (STEO's 1,469 and SEDS's 968 `seriesId` values,
+ * the Monthly Energy Review's 984 `msn` values) and facet values — fuel types,
  * sectors, coal ranks, RTO respondents, and the `series` and `product` values of
  * the daily and weekly petroleum and natural-gas routes, where benchmarks such
  * as Henry Hub, WTI, and Cushing live — so a query naming a value resolves to
- * the route that exposes it. Facet values of any route the caller describes
- * join too. A multi-term query is additionally matched term by term, which is
- * what reaches the route behind a commodity + metric + sector question, and a
+ * the route that exposes it. A balancing authority is found by its EIA code or
+ * ISO/RTO acronym too (`ERCOT` → `ERCO`). Facet values of any route the caller
+ * describes join too. A multi-term query is additionally matched term by term,
+ * which is what reaches the route behind a commodity + metric + sector question, and a
  * query spelling the end of a route's path ("retail sales") ranks that route
  * first as an exact match; `route-cache.ts` carries the mechanism and
  * `scripts/eval-search.ts` measures it.
@@ -49,20 +51,28 @@ const SEARCH_RESULT_CAP = 30;
  * Score above which a hit is labelled a weak match.
  *
  * Derived by running `scripts/search-battery.ts` through `scripts/eval-search.ts`
- * against the live corpus, 5,459 entries as warmed before any describe. The
+ * against the live corpus, 6,443 entries as warmed before any describe. The
  * measurement finds two clusters: the routes the battery's answerable queries
- * surface score at or below 0.6582, and the queries the taxonomy cannot answer
- * score at or above 0.7632. 0.72 sits between them, and no battery query falls
- * between 0.6582 and 0.7632. The off-target floor is `ticket prices` against
+ * surface score at or below 0.6837, and the queries the taxonomy cannot answer
+ * score at or above 0.7822. 0.72 sits between them, and no battery query falls
+ * between 0.6837 and 0.7822. The off-target floor is `ticket prices` against
  * the `Spot Prices` route, as it was at 3,165 entries, before benchmark series,
  * products, and RTO respondents were indexed. Indexing the 161 plant names of
  * the annual `densified-biomass/wood-pellet-plants` route's `respondent` facet
- * too would lower it to 0.7454 (`cat food` reaching `Vulcan Wood Products`),
- * which is why that facet stays out of the warm.
+ * too lowered it from 0.7632 to 0.7454 at the scale before the `terms` key
+ * (`cat food` reaching `Vulcan Wood Products`), which is why that facet stays
+ * out of the warm.
+ *
+ * The `terms` key (column aliases, MER series IDs) moved the whole scale: on
+ * the 5,459-entry corpus before it, the clusters ended at 0.6582 and 0.7632;
+ * with it and the 984 MER series, the same queries end at 0.6837 and 0.7822,
+ * and the six battery queries naming a column alias or an MER series land their
+ * route first at 0.04–0.57. The threshold stays where it was. At a `terms` weight of 1.0 instead of 0.5,
+ * `stock options` scored 0.669 and would have been the one false confident.
  *
  * One case falls on the wrong side, and it does not move by choosing a
  * different number — it sits above every off-target score, so any threshold
- * that clears it stops flagging noise. `recoverable reserves` scores 0.8326 on
+ * that clears it stops flagging noise. `recoverable reserves` scores 0.8465 on
  * the route whose description contains that exact phrase, and is labelled weak.
  * Fuse penalizes a match this far into a long description, and scoring the
  * terms separately does not help because each term is buried just as deep. This
@@ -94,7 +104,7 @@ export const WEAK_MATCH_SCORE = 0.72;
 export const searchRoutesTool = tool('eia_search_routes', {
   title: 'Search EIA Routes',
   description:
-    'Fuzzy text search across route names, descriptions, and category labels. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths. Multi-term queries are also matched term by term, so combining a commodity, a metric, and a sector — "electricity price residential", "coal generation industrial sector" — reaches the route carrying that data even when no single entry reads like the whole phrase. A query spelling the end of a route path in words — "retail sales" for electricity/retail-sales — ranks that route first. STEO and SEDS series names are indexed so queries like "crude oil production forecast" or "motor gasoline total consumption" also resolve, and so are facet values, so a fuel type or sector term like "wind" or "anthracite coal" resolves to the route that exposes it, with filter_hint carrying the filter to pass on. That includes the series and product names of the daily and weekly petroleum and natural-gas routes and the RTO balancing authorities, so benchmarks like "Henry Hub", "WTI crude spot price", "Cushing", or "Electric Reliability Council of Texas" resolve before any describe. A legacy APIv1 series ID as the EIA website and Excel add-in write them — "PET.RWTC.W", "ELEC.PRICE.TX-RES.M" — is resolved through the EIA series lookup into one result with its route, filter_hint, frequency, and columns, ready for eia_query_route, without waiting on the index. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.72 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy. The first call after server start waits 20-40s while the index warms, and at most 45s; later calls answer from the built index. Check indexComplete before reading anything into a short or empty result set.',
+    'Fuzzy text search across route names, descriptions, category labels, and the names of the data columns a route publishes. Resolves natural-language queries like "electricity retail sales by state" or "natural gas imports" to matching route paths, and a measure named only by its column — "nameplate capacity", "gross generation" — to the route that publishes it. Multi-term queries are also matched term by term, so combining a commodity, a metric, and a sector — "electricity price residential", "coal generation industrial sector" — reaches the route carrying that data even when no single entry reads like the whole phrase. A query spelling the end of a route path in words — "retail sales" for electricity/retail-sales — ranks that route first. STEO, SEDS, and Monthly Energy Review (total-energy) series names are indexed so queries like "crude oil production forecast", "motor gasoline total consumption", or "primary energy consumption total" also resolve — a Monthly Energy Review series also by its ID, such as "TETCBUS" — and so are facet values, so a fuel type or sector term like "wind" or "anthracite coal" resolves to the route that exposes it, with filter_hint carrying the filter to pass on. That includes the series and product names of the daily and weekly petroleum and natural-gas routes and the RTO balancing authorities, so benchmarks like "Henry Hub", "WTI crude spot price", "Cushing", or "Electric Reliability Council of Texas" resolve before any describe; a balancing authority also answers to its EIA code or its ISO/RTO acronym ("ERCO", "ERCOT", "CAISO", "SPP"). A legacy APIv1 series ID as the EIA website and Excel add-in write them — "PET.RWTC.W", "ELEC.PRICE.TX-RES.M" — is resolved through the EIA series lookup into one result with its route, filter_hint, frequency, and columns, ready for eia_query_route, without waiting on the index. Results include isLeaf so you know whether to browse further or query directly. Results with score > 0.72 are weak matches — try a more specific query or use eia_browse_routes to explore the taxonomy. The first call after server start waits 20-40s while the index warms, and at most 45s; later calls answer from the built index. Check indexComplete before reading anything into a short or empty result set.',
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   input: z.object({
@@ -139,7 +149,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
               .record(z.string(), z.string())
               .optional()
               .describe(
-                'Pre-built filter for eia_query_route when a specific facet value is required. Present on STEO and SEDS series results and facet-value results — fuel, sector, and RTO respondent values, and the series and product values of daily and weekly petroleum and natural-gas routes (e.g. {"series": "RNGWHHD"} on natural-gas/pri/fut) — and on a resolved series ID, where it holds every facet EIA maps the ID to, values as EIA writes them (e.g. {"sectorid": "RES", "stateid": "TX"}). Pass directly as filters (e.g. eia_query_route(route="seds", filters=filter_hint)).',
+                'Pre-built filter for eia_query_route when a specific facet value is required. Present on STEO and SEDS series results ({"seriesId": ...}), Monthly Energy Review series results ({"msn": "TETCBUS"} on total-energy), and facet-value results — fuel, sector, and RTO balancing-authority values (found by name, EIA code, or ISO/RTO acronym: "ERCOT" gives {"respondent": "ERCO"} on electricity/rto/region-data), and the series and product values of daily and weekly petroleum and natural-gas routes (e.g. {"series": "RNGWHHD"} on natural-gas/pri/fut) — and on a resolved series ID, where it holds every facet EIA maps the ID to, values as EIA writes them (e.g. {"sectorid": "RES", "stateid": "TX"}). Pass directly as filters (e.g. eia_query_route(route="seds", filters=filter_hint)).',
               ),
             frequency: z
               .string()
@@ -168,7 +178,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
     totalIndexed: z
       .number()
       .describe(
-        'Total entries in the search index: routes, STEO and SEDS series names, and the facet values indexed at warm time, plus the facet values of every route described since the server started — so the count grows with describe calls.',
+        'Total entries in the search index: routes, STEO, SEDS, and Monthly Energy Review series names, and the facet values indexed at warm time, plus the facet values of every route described since the server started — so the count grows with describe calls.',
       ),
     indexComplete: z
       .boolean()
@@ -179,7 +189,7 @@ export const searchRoutesTool = tool('eia_search_routes', {
       .array(z.string())
       .optional()
       .describe(
-        'Present only when indexComplete is false: route paths whose metadata could not be fetched (call eia_browse_routes on one to re-fetch it) and index passes that did not land ("steo_series", "seds_series", "facet_values"), which the next search retries.',
+        'Present only when indexComplete is false: route paths whose metadata could not be fetched (call eia_browse_routes on one to re-fetch it) and index passes that did not land ("steo_series", "seds_series", "total_energy_series", "facet_values"), which the next search retries.',
       ),
     truncated: z
       .boolean()

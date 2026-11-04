@@ -12,8 +12,8 @@
  * everywhere, plus `series`, `product`, and `respondent` on the routes that
  * publish sub-monthly data — the daily and weekly petroleum and natural-gas
  * routes and the hourly and daily RTO routes), one whole-facet pass per
- * `NAMED_SERIES_FACETS` entry (STEO and SEDS series), and every route the
- * caller describes. Only describe writes facet values to the per-route
+ * `NAMED_SERIES_FACETS` entry (STEO, SEDS, and Monthly Energy Review series),
+ * and every route the caller describes. Only describe writes facet values to the per-route
  * metadata cache, which holds the full uncapped value set — the cap in
  * eia_describe_route shapes its own response only. An entry expires
  * `ROUTE_METADATA_TTL_MS` after its route metadata was fetched; the next
@@ -28,10 +28,10 @@
  * attempt by `ATTEMPT_TIMEOUT_MS`, and every attempt, backoff, and chained
  * request of a tool call by one `CALL_DEADLINE_MS` deadline set when browse,
  * describe, or query is entered; EIA not answering in time is
- * `upstream_timeout` (Timeout, retryable). A bound EIA answers with HTTP 500 —
- * a `local-hourly` bound without its UTC offset, or one in the frequency's own
- * period shape naming a month, day, or hour that does not exist — is refused
- * as `invalid_period` before the request.
+ * `upstream_timeout` (Timeout, retryable). A bound EIA would not read as
+ * written — a `local-hourly` bound without its UTC offset, or one whose month,
+ * day, or hour does not exist and which EIA would answer with HTTP 500 or with
+ * another period — is refused as `invalid_period` before the request.
  *
  * The warm has two milestones. `ensureTreeWarmed` resolves once the route tree
  * is built — all browse, describe, and query need — or once
@@ -439,23 +439,78 @@ function storeRouteMetadata(meta: RouteMetadata): void {
   _routeMetaCache.set(meta.route, meta);
 }
 
+/** The facet value lists of one route that EIA publishes partial. */
+export interface PartialFacetLists {
+  /** Each partial list: its facet ID, and the row field carrying each ID's label. */
+  facets: ReadonlyArray<{ id: string; labelField: string }>;
+  /** Frequency IDs whose rows carry only IDs the lists hold. */
+  frequencies: readonly string[];
+}
+
+/**
+ * Facet value lists EIA's `/facet/{id}` endpoint returns partial with nothing
+ * to say so — `totalFacets` equals the list's length — while data rows carry
+ * IDs the list omits. Keyed by canonical route. `international`'s `productId`,
+ * `activityId`, and `unit` lists hold the vocabulary of its monthly and
+ * quarterly series (18 petroleum products, 4 activities, 3 units); its annual
+ * rows also carry electricity, coal, and dry natural gas, activities such as
+ * generation and exports, and units such as `BKWH` and `BCF`. The endpoint
+ * takes no frequency, so the annual vocabulary cannot be fetched.
+ *
+ * `fetchFacet` never marks a list named here complete, so a filter on it draws
+ * no unmatched-value notice, and `eia_describe_route` discloses each one from
+ * this table — never from `Facet.complete`, which is also false on lists EIA
+ * sends whole but with a null or repeated ID (`international`'s `dataFlagId`,
+ * `electricity/facility-fuel`'s `plantCode`).
+ */
+const PARTIAL_FACET_LISTS: ReadonlyMap<string, PartialFacetLists> = new Map([
+  [
+    'international',
+    {
+      facets: [
+        { id: 'productId', labelField: 'productName' },
+        { id: 'activityId', labelField: 'activityName' },
+        { id: 'unit', labelField: 'unitName' },
+      ],
+      frequencies: ['monthly', 'quarterly'],
+    },
+  ],
+]);
+
+/** The value lists of `route` (canonical spelling) EIA publishes partial, when it has any. */
+export function partialFacetLists(route: string): PartialFacetLists | undefined {
+  return PARTIAL_FACET_LISTS.get(route);
+}
+
 /**
  * Data columns a leaf's metadata advertises, in EIA's order. EIA uses two
  * `data` shapes: `{ colId: { alias, units } }`, and `{ value: [] }` on
- * time-series routes whose single column is always `value` — synthesized here
- * so a query without `columns` still requests the measurement.
+ * time-series routes whose single column is always `value` — synthesized here,
+ * and marked so, so a query without `columns` still requests the measurement.
+ * Neither shape always names a unit: a synthesized column never has one, and
+ * a named column can omit it (three of `electricity/facility-fuel`'s seven);
+ * either way `units` is empty. A synthesized column's rows carry the unit
+ * themselves; a named one's rows carry it in `{col}-units` when the column is
+ * a measure, and carry none when it is a descriptor (`county`, `latitude` on
+ * `electricity/operating-generator-capacity`), which the metadata does not
+ * tell apart.
  */
 function dataColumnsOf(raw: RawRouteNode): DataColumn[] {
   const dataObj = raw.data ?? {};
-  const columns = Object.entries(dataObj)
+  const columns: DataColumn[] = Object.entries(dataObj)
     .filter(([, meta]) => meta !== null && typeof meta === 'object' && !Array.isArray(meta))
     .map(([id, meta]) => {
-      const col = meta as { alias?: string; units?: string };
-      // alias and units may be undefined for some EIA routes (e.g. crude-oil-imports)
-      return { id, alias: col.alias ?? id, units: col.units ?? '' };
+      const col = meta as { alias?: string; unit?: string; units?: string };
+      /**
+       * alias and units may be undefined for some EIA routes (e.g.
+       * crude-oil-imports), and some spell the unit key `unit`
+       * (`densified-biomass/inventories-by-region`, whose rows carry no
+       * `inventory-units`, so the metadata is the only place it is stated).
+       */
+      return { id, alias: col.alias ?? id, units: col.units ?? col.unit ?? '' };
     });
   if (columns.length === 0 && Array.isArray(dataObj.value)) {
-    columns.push({ id: 'value', alias: 'Value', units: '' });
+    columns.push({ id: 'value', alias: 'Value', units: '', synthesized: true });
   }
   return columns;
 }
@@ -568,17 +623,19 @@ function upstreamTimeout(message: string, cause?: unknown): McpError {
 }
 
 /**
- * Refuse a query whose start or end EIA answers with HTTP 500 — never with
- * rows — at `frequency`: a `local-hourly` bound without its UTC offset, or a
- * bound in the frequency's own period shape naming a month, day, or hour that
- * does not exist (see `impossiblePeriod`). Sent, either would read as an outage
- * and be retried, so it fails as `invalid_period` before the request.
+ * Refuse a query whose start or end EIA would not read as written at
+ * `frequency`: a `local-hourly` bound without its UTC offset, which EIA
+ * answers with HTTP 500, or a bound whose month, day, or hour does not exist
+ * and which EIA would answer with HTTP 500 or with rows from another period
+ * than the bound names (see `impossiblePeriod`). Sent, a 500 would read as an
+ * outage and be retried and another period as the answer, so each fails as
+ * `invalid_period` before the request. With `frequency` undefined (none known),
+ * only a month or hour no frequency reads is refused.
  */
 function assertPeriodBounds(
   frequency: string | undefined,
   bounds: { start?: string | undefined; end?: string | undefined },
 ): void {
-  if (frequency === undefined) return;
   for (const side of ['start', 'end'] as const) {
     const value = bounds[side];
     if (value === undefined) continue;
@@ -596,11 +653,13 @@ function assertPeriodBounds(
     const problem = impossiblePeriod(value, frequency);
     if (problem === undefined) continue;
     throw validationError(
-      `At ${frequency} frequency EIA cannot read ${side} ${JSON.stringify(value)}: it has ${problem}.`,
+      frequency === undefined
+        ? `EIA would not read ${side} ${JSON.stringify(value)} as written at any frequency: it has ${problem}.`
+        : `At ${frequency} frequency EIA would not read ${side} ${JSON.stringify(value)} as written: it has ${problem}.`,
       {
         reason: 'invalid_period',
         recovery: {
-          hint: 'Write each bound as a period that exists — a month 01–12, a day the month has (February 29 only in leap years), and an hour of two digits, 00–23 — e.g. "2024-02-29" or "2024-02-01T23".',
+          hint: 'Write each bound as the period you mean, with components that exist — a month 01–12, a day the month has (February 29 only in leap years), and an hour of two digits, 00–23 — e.g. "2024-02-29" or "2024-02-01T23".',
         },
       },
     );
@@ -998,6 +1057,7 @@ class EiaApiService {
     const runners: Record<IndexPass, () => Promise<boolean>> = {
       steo_series: namedSeries('steo_series'),
       seds_series: namedSeries('seds_series'),
+      total_energy_series: namedSeries('total_energy_series'),
       facet_values: async () => {
         warm.facetTargets = await this.indexVocabularyFacets(
           warm.facetTargets ?? listVocabularyFacets(),
@@ -1194,6 +1254,12 @@ class EiaApiService {
    * of `electricity/state-electricity-profiles/meters`'s `technology` facet
    * omits `name`, so the facet read as having none. The fallback is also what
    * keeps the non-null `id`/`name` contract the describe output schema declares.
+   *
+   * A list in `PARTIAL_FACET_LISTS` is never complete, whatever its total says.
+   * A 200 without the `response.facets` list is `upstream_invalid_response`,
+   * as a route body without its envelope is: read as an empty list, it would
+   * settle an index pass with nothing in it and cache an empty facet. Only a
+   * `totalFacets` of 0 reads a missing list as empty.
    */
   private async fetchFacet(
     route: string,
@@ -1201,22 +1267,36 @@ class EiaApiService {
     scope: CallScope,
     deadlineAt?: number,
   ): Promise<Facet> {
-    const resp = await this.fetchJson<{ response: RawFacetResponse }>(
+    const resp = await this.fetchJson<{ response?: Partial<RawFacetResponse> }>(
       `${route}/facet/${meta.id}`,
       {},
       scope,
       deadlineAt,
     );
+    const facets = resp?.response?.facets ?? (resp?.response?.totalFacets === 0 ? [] : undefined);
+    if (!Array.isArray(facets)) {
+      throw serviceUnavailable(
+        `EIA did not return the values of facet "${meta.id}" on "${route}".`,
+        {
+          reason: 'upstream_invalid_response',
+          retryable: true,
+          route,
+          facetId: meta.id,
+        },
+      );
+    }
+    const totalFacets = resp.response?.totalFacets;
     return {
       id: meta.id,
       description: meta.description,
       complete:
-        Number.isInteger(resp?.response?.totalFacets) &&
-        resp.response.totalFacets >= 0 &&
-        resp.response.facets?.length === resp.response.totalFacets &&
-        new Set(resp.response.facets.filter((v) => v.id != null).map((v) => v.id)).size ===
-          resp.response.totalFacets,
-      values: (resp?.response?.facets ?? [])
+        !PARTIAL_FACET_LISTS.get(route)?.facets.some((f) => f.id === meta.id) &&
+        typeof totalFacets === 'number' &&
+        Number.isInteger(totalFacets) &&
+        totalFacets >= 0 &&
+        facets.length === totalFacets &&
+        new Set(facets.filter((v) => v.id != null).map((v) => v.id)).size === totalFacets,
+      values: facets
         .filter((v): v is RawFacetValue & { id: string } => v.id != null)
         .map((v) => ({
           id: v.id,
@@ -1657,7 +1737,10 @@ class EiaApiService {
   ): Promise<DataResponse> {
     const deadlineAt = Date.now() + CALL_DEADLINE_MS;
     const normalizedRoute = normalizeRoutePath(route);
-    // An explicit frequency is checked before any request, the warm included.
+    /**
+     * Bounds are checked before any request, the warm included: in full at an
+     * explicit frequency, and without one for the month or hour no frequency reads.
+     */
     assertPeriodBounds(opts.frequency, opts);
 
     // Pre-flight: if the route is in the cache as a category node, fail early
@@ -1729,7 +1812,7 @@ class EiaApiService {
     const length = opts.length ?? 25;
 
     // An omitted frequency is the route's default, read from what this process
-    // already holds; with neither the node nor its metadata, EIA judges the bounds.
+    // already holds; with neither the node nor its metadata, EIA judges a rollover.
     if (opts.frequency === undefined) {
       assertPeriodBounds(
         cachedNode?.defaultFrequency ?? _routeMetaCache.get(normalizedRoute)?.defaultFrequency,
@@ -1775,9 +1858,16 @@ class EiaApiService {
       )
         continue;
       const ids = new Set(facet.values.map((v) => v.id));
-      const unmatched = [...new Set(Array.isArray(submitted) ? submitted : [submitted])].filter(
+      const missing = [...new Set(Array.isArray(submitted) ? submitted : [submitted])].filter(
         (value) => !ids.has(value),
       );
+      if (missing.length === 0) continue;
+      /**
+       * A returned row carrying the value under this facet proves it valid
+       * whatever the list says, so the notice never contradicts its own rows.
+       */
+      const carried = new Set(data.map((row) => row[facet.id]));
+      const unmatched = missing.filter((value) => !carried.has(value));
       if (unmatched.length === 0) continue;
       const folded = new Map<string, string[]>();
       for (const id of ids) {

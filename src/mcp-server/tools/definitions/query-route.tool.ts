@@ -257,7 +257,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .boolean()
       .default(false)
       .describe(
-        'Stage the matching rows as a DataCanvas table for SQL (default false). Off, the call makes one upstream request and returns the preview alone. On, the service pages past the preview up to EIA_CANVAS_MAX_ROWS and registers the accumulated rows, returning the handle in dataset — several extra upstream requests and seconds of latency on a large route, so turn it on when moving to analysis, not while exploring. Requires a canvas, which is on unless the server sets CANVAS_PROVIDER_TYPE=none; without one nothing is staged whatever this is set to.',
+        'Stage the matching rows as a DataCanvas table for SQL (default false). Off, the call makes one upstream request and returns the preview alone. On, the service pages past the preview up to the staging row cap this server sets and registers the accumulated rows, starting at offset, returning the handle in dataset — several extra upstream requests and seconds of latency on a large route, so turn it on when moving to analysis, not while exploring. Requires the server to have a canvas, which it does unless its operator turned it off; without one nothing is staged whatever this is set to.',
       ),
   }),
 
@@ -306,7 +306,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Human-readable note, present whenever dataset is set or staging failed, and otherwise when total exceeds the inline rows. On a stage: true call it opens with the stage outcome: the staged row count and dataset name, naming eia_dataframe_describe for the staged column names (quoting one rename when staging renamed a column) and then eia_dataframe_query for SQL — or, when the canvas failed, that no dataframe was created (dataset is then absent), with the retry and offset paging. Next, where in the matching set the staged rows sit whenever the stage does not start at row 1, and when staging stopped short of total (the EIA_CANVAS_MAX_ROWS cap, the time limit of the call, or an upstream page that did not return) the offset to resume from; last, the inline page against total and next_offset — and, after a registered stage, that the inline rows page with stage left off, since another stage: true call stages a new table. Where staging was not requested it places the inline page against total and names stage: true and eia_dataframe_query as the way to get SQL access to the rest; where no canvas is configured at all, staging is unavailable, so it names offset paging and CANVAS_PROVIDER_TYPE=duckdb instead.',
+        'Human-readable note, present whenever dataset is set or staging failed, and otherwise when total exceeds the inline rows. On a stage: true call it opens with the stage outcome: the staged row count and dataset name, naming eia_dataframe_describe for the staged column names (quoting one rename when staging renamed a column) and then eia_dataframe_query for SQL — or, when the canvas failed, that no dataframe was created (dataset is then absent), with the retry — from offset 0 past the first page — and, while rows remain, offset paging. Next, where in the matching set the staged rows sit whenever the stage does not start at row 1, and when staging stopped short of total (the staging row cap this server sets, the time limit of the call, or an upstream page that did not return) the offset to resume from; last, the row range of the inline page (e.g. rows 21–30 of 55), whether it is the last page, and next_offset — and, after a registered stage, that the inline rows page with stage left off, since another stage: true call stages a new table. Where staging was not requested it names the row range of the inline page, says when it is the last page, and names stage: true and eia_dataframe_query as the way to get SQL access to the matching rows — with offset 0 past the first page, since a stage starts at offset — and offset paging while rows remain; where this server has no canvas, it says staging is unavailable on this deployment and, while rows remain, names offset paging instead.',
       ),
     truncation_warning: z
       .string()
@@ -442,9 +442,9 @@ export const queryRouteTool = tool('eia_query_route', {
       reason: 'invalid_period',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'start or end was not in a period format the route accepts, named a month, day, or hour that does not exist in the period shape its frequency reads exactly (YYYY-MM-DD at daily or weekly, YYYY-MM-DDTHH at hourly, YYYY-MM-DDTHH±HH at local-hourly), or lacked its UTC offset at local-hourly frequency.',
+      when: 'start or end was not in a period format the route accepts; named a month outside 01–12 or an hour that is not two digits; named a day its month lacks or an hour 24–99 that rolls the bound into another period at the chosen frequency (any such day or hour at daily, hourly, and local-hourly, and any such day at weekly and four-week-average); or lacked its UTC offset at local-hourly frequency.',
       recovery:
-        'Call eia_describe_route and use the period format frequencies[].format gives for the chosen frequency, with a month 01–12, a day its month has, and an hour 00–23; at local-hourly each bound needs its hour and UTC offset, e.g. 2024-02-01T02-06.',
+        'Call eia_describe_route and use the period format frequencies[].format gives for the chosen frequency, with a month 01–12, a day its month has, and a two-digit hour 00–23; at local-hourly each bound needs its hour and UTC offset, e.g. 2024-02-01T02-06.',
     },
     {
       reason: 'uri_too_long',
@@ -602,6 +602,18 @@ export const queryRouteTool = tool('eia_query_route', {
           })
         : undefined;
 
+    /** Every fetched row goes inline: `length` is the page. */
+    const shown = fetched.length;
+    const nextOffset = input.offset + shown < total ? input.offset + shown : undefined;
+    /**
+     * The last page has nothing further to page to, and past offset 0 the
+     * stage advice names offset 0: a stage starts at `offset`, so one from here
+     * would hold only the tail.
+     */
+    const lastPage = nextOffset === undefined;
+    const paging = lastPage ? '' : ', or page through with offset';
+    const stageFrom = input.offset > 0 ? 'stage: true and offset 0' : 'stage: true';
+
     /**
      * The stage-outcome sentences. Sentence order is fixed: the outcome
      * (pointer or failure), then where the staged rows sit and how to resume
@@ -623,7 +635,7 @@ export const queryRouteTool = tool('eia_query_route', {
          */
         if (input.offset > 0) stagedRange = `The ${range}.`;
       } else if (accumulated.capped) {
-        stagedRange = `Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (${accumulated.cap.toLocaleString()}), so the ${range}. Narrow with filters, start, or end — or re-query with offset ${lastStaged.toLocaleString()} — to reach the rest.`;
+        stagedRange = `Accumulation stopped at the staging row cap (${accumulated.cap.toLocaleString()}), so the ${range}. Narrow with filters, start, or end — or re-query with offset ${lastStaged.toLocaleString()} — to reach the rest.`;
       } else if (accumulated.timedOut) {
         stagedRange = `Staging stopped when the call's time limit ran out before EIA could answer another page, so the ${range}. Re-query with offset ${lastStaged.toLocaleString()} and stage: true to stage the next rows, or narrow with filters, start, or end so fewer pages are needed.`;
       } else {
@@ -641,13 +653,9 @@ export const queryRouteTool = tool('eia_query_route', {
        * failed stage stays a successful call — the missing dataset is the
        * signal, and the note is the account of it.
        */
-      stageOutcome =
-        'Staging failed, so no dataframe was created — re-run with stage: true to try again, or page through with offset.';
+      stageOutcome = `Staging failed, so no dataframe was created — re-run with ${stageFrom} to try again${paging}.`;
     }
 
-    /** Every fetched row goes inline: `length` is the page. */
-    const shown = fetched.length;
-    const nextOffset = input.offset + shown < total ? input.offset + shown : undefined;
     const result: QueryRouteResult = {
       route: dataResp.route,
       data: fetched,
@@ -661,6 +669,8 @@ export const queryRouteTool = tool('eia_query_route', {
       nextOffset !== undefined
         ? `Continue the inline page at next_offset ${nextOffset.toLocaleString()}.`
         : undefined;
+    /** Where the inline page sits in the matching set, written like the staged range. */
+    const pageRange = `rows ${(input.offset + 1).toLocaleString()}–${(input.offset + shown).toLocaleString()} of ${total.toLocaleString()}`;
 
     /**
      * Whether the response already states where the caller stands relative to
@@ -684,10 +694,7 @@ export const queryRouteTool = tool('eia_query_route', {
       if (staging?.status === 'registered') result.dataset = staging.tableName;
       const inline =
         total > shown
-          ? [
-              `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows inline.`,
-              continueAt,
-            ]
+          ? [`Showing ${pageRange} inline${lastPage ? ', the last page' : ''}.`, continueAt]
           : [];
       /**
        * Another stage: true call at next_offset registers a second table and
@@ -706,14 +713,15 @@ export const queryRouteTool = tool('eia_query_route', {
        * Nothing was staged, and the two reasons need different advice. A
        * canvas is configured and the caller simply did not ask to stage —
        * naming `stage: true` is the only way they learn the capability is
-       * there, and the canvas-off wording would send them after a deployment
-       * change they do not need. With no canvas the lever does not exist, so
-       * offset paging is what is left.
+       * there. With no canvas the lever does not exist, so offset paging is
+       * what is left; that note names no setting, since the caller cannot
+       * change one and the `.mcpb` bundle pins the canvas off (it ships
+       * without DuckDB's native bindings).
        */
-      const head = `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows`;
+      const head = `Showing ${pageRange}${lastPage ? ', the last page' : ''}`;
       const advice = bridge
-        ? `${head} — nothing was staged. Re-run with stage: true to stage the matching rows for SQL with eia_dataframe_query, or page through with offset.`
-        : `${head} — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset.`;
+        ? `${head} — nothing was staged. Re-run with ${stageFrom} to stage the matching rows for SQL with eia_dataframe_query${paging}.`
+        : `${head} — staging rows for SQL is unavailable on this deployment${lastPage ? '' : ', so page through with offset'}.`;
       result.canvas_preview_note = [advice, continueAt].filter(Boolean).join(' ');
       gapAccountedFor = true;
     }

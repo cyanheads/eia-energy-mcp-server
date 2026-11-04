@@ -3,6 +3,7 @@
  * @module tests/tools/describe-route.tool.test
  */
 
+import { readFileSync } from 'node:fs';
 import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
@@ -11,7 +12,10 @@ import { _resetServerConfig } from '@/config/server-config.js';
 import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
 import * as eiaService from '@/services/eia/eia-service.js';
 
-vi.mock('@/services/eia/eia-service.js', () => ({
+vi.mock('@/services/eia/eia-service.js', async (importOriginal) => ({
+  // The table of lists EIA publishes partial is read as written; only the service is faked.
+  partialFacetLists: (await importOriginal<typeof import('@/services/eia/eia-service.js')>())
+    .partialFacetLists,
   getEiaApiService: vi.fn(),
   initEiaApiService: vi.fn(),
   _resetEiaApiService: vi.fn(),
@@ -152,6 +156,18 @@ describe('describeRouteTool', () => {
     await expect(describeRouteTool.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.InvalidParams,
     });
+  });
+
+  // Agent-facing text describes the facet window by its behavior, not the server's configuration.
+  it('names no server setting in its description, schemas, or error contract', () => {
+    const texts = [
+      describeRouteTool.description,
+      JSON.stringify(z.toJSONSchema(describeRouteTool.input)),
+      JSON.stringify(z.toJSONSchema(describeRouteTool.output)),
+      ...(describeRouteTool.errors ?? []).flatMap((entry) => [entry.when, entry.recovery]),
+    ];
+    expect(texts.join('\n')).toContain('capped at the window size this server sets');
+    for (const text of texts) expect(text).not.toMatch(/\b(?:EIA|CANVAS|MCP)_[A-Z_]+\b/);
   });
 
   // ------------------------------------------------------------------
@@ -548,6 +564,349 @@ describe('describeRouteTool', () => {
       });
 
       expect(noticeOf(result)).not.toContain('refresh');
+    });
+  });
+
+  // #98 — a column whose metadata names no unit points at the row field its
+  // unit is in when a row has one. #100 — the lists EIA publishes partial are
+  // named as such.
+  describe('notices drawn from the route metadata', () => {
+    const noticeOf = (r: Awaited<ReturnType<typeof runToolContract>>) =>
+      (r.structuredContent as { notice: string }).notice;
+    const textOf = (r: Awaited<ReturnType<typeof runToolContract>>) =>
+      r.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    const DATE =
+      'date_range reports route metadata for the default frequency (monthly); another frequency may extend outside this range.';
+
+    /** `international` as the service returns it: a synthesized value column, six facets. */
+    const INTL_META = {
+      ...FULL_META,
+      route: 'international',
+      description: 'Country level production, consumption, imports, exports by energy source',
+      facets: [
+        {
+          id: 'productId',
+          description: 'Product',
+          values: [
+            { id: '5', name: 'Petroleum and other liquids' },
+            { id: '57', name: 'Crude oil including lease condensate' },
+          ],
+        },
+        {
+          id: 'activityId',
+          description: 'Activity',
+          values: [
+            { id: '1', name: 'Production' },
+            { id: '2', name: 'Consumption' },
+          ],
+        },
+        {
+          id: 'countryRegionId',
+          description: 'Country/Region',
+          values: [
+            { id: 'USA', name: 'United States' },
+            { id: 'CHN', name: 'China' },
+            { id: 'FRA', name: 'France' },
+          ],
+        },
+        {
+          id: 'dataFlagId',
+          description: 'Data flag ID',
+          // Whole upstream but for a null ID, so the service marks it incomplete.
+          complete: false,
+          values: [{ id: '6', name: 'A value exists, but cannot be published' }],
+        },
+        {
+          id: 'unit',
+          description: 'Unit',
+          values: [
+            { id: 'MBBL', name: 'millions barrels' },
+            { id: 'TBPD', name: 'thousand barrels per day' },
+          ],
+        },
+      ],
+      dataColumns: [{ id: 'value', alias: 'Value', units: '', synthesized: true }],
+    };
+    const PARTIAL =
+      'EIA lists only part of the values of productId, activityId, unit: the lists hold the IDs of the monthly and quarterly series, and rows at other frequencies can carry IDs they omit. An ID missing from them still filters eia_query_route; a query without that filter returns the IDs rows carry, each beside its label in productName, activityName, unitName.';
+    const SYNTHESIZED =
+      'Data column value has no unit in the route metadata; each eia_query_route row carries the unit, which can differ by row, in a field named units or unit.';
+
+    /** `electricity/facility-fuel`'s seven columns as EIA's metadata gives them. */
+    const FF_META = {
+      ...FULL_META,
+      route: 'electricity/facility-fuel',
+      description: 'Facility-level fuel consumption and generation',
+      facets: [
+        {
+          id: 'plantCode',
+          description: 'Plant',
+          // Whole upstream, but one ID listed twice: incomplete, not partial.
+          complete: false,
+          values: [
+            { id: '3', name: 'Barry' },
+            { id: '3', name: 'Barry (former)' },
+          ],
+        },
+      ],
+      dataColumns: [
+        { id: 'generation', alias: 'Net Generation', units: 'megawatthours' },
+        { id: 'gross-generation', alias: 'Gross Generation', units: 'megawatthours' },
+        {
+          id: 'total-consumption',
+          alias:
+            'Consumption of Fuels for Electricity Generation and Useful Thermal Output (Physical Units)',
+          units: '',
+        },
+        {
+          id: 'total-consumption-btu',
+          alias: 'Consumption of Fuels for Electricity Generation and Useful Thermal Output (BTUs)',
+          units: 'MMBtu',
+        },
+        {
+          id: 'consumption-for-eg',
+          alias: 'Consumption of Fuels for Electricity Generation (Physical Units)',
+          units: '',
+        },
+        {
+          id: 'consumption-for-eg-btu',
+          alias: 'Consumption of Fuels for Electricity Generation (BTUs)',
+          units: 'MMBtu',
+        },
+        { id: 'average-heat-content', alias: 'Average Heat Content of Consumed Fuels', units: '' },
+      ],
+    };
+    const NAMED =
+      'Data columns total-consumption, consumption-for-eg, average-heat-content have no unit in the route metadata. Where an eia_query_route row carries a unit for one of them, it is in total-consumption-units, consumption-for-eg-units, average-heat-content-units, and it can differ by row; a column whose rows carry no such field has no unit.';
+
+    it('names each list EIA publishes partial and the field labelling its IDs, on both surfaces', async () => {
+      mockDescribe.mockResolvedValue(INTL_META);
+
+      const result = await runToolContract(describeRouteTool, { route: 'international' });
+
+      expect(result.isError).not.toBe(true);
+      expect(noticeOf(result)).toContain(PARTIAL);
+      expect(textOf(result)).toContain(PARTIAL);
+      // An incomplete list is not a partial one: the disclosure reads the table.
+      expect(noticeOf(result)).not.toContain('dataFlagId');
+      expect(noticeOf(result)).not.toContain('countryRegionId');
+    });
+
+    it('names only the requested facet when the input restricts to one', async () => {
+      mockDescribe.mockResolvedValue(INTL_META);
+
+      const unit = await runToolContract(describeRouteTool, {
+        route: 'international',
+        facet: 'unit',
+      });
+      expect(noticeOf(unit)).toContain(
+        'EIA lists only part of the values of unit: the list holds the IDs of the monthly and quarterly series, and rows at other frequencies can carry IDs it omits. An ID missing from it still filters eia_query_route; a query without that filter returns the IDs rows carry, each beside its label in unitName.',
+      );
+
+      const country = await runToolContract(describeRouteTool, {
+        route: 'international',
+        facet: 'countryRegionId',
+      });
+      expect(noticeOf(country)).not.toContain('EIA lists only part');
+    });
+
+    it('leaves a partial list EIA did not return to the unavailable notice', async () => {
+      mockDescribe.mockResolvedValue({ ...INTL_META, unfetchedFacets: ['productId'] });
+
+      const result = await runToolContract(describeRouteTool, { route: 'international' });
+
+      expect(noticeOf(result)).toContain(
+        'EIA lists only part of the values of activityId, unit: the lists hold',
+      );
+      expect(noticeOf(result)).toContain('each beside its label in activityName, unitName.');
+      expect(noticeOf(result)).toContain('EIA did not return the values of productId');
+    });
+
+    it('keys the partial lists on the route, not on facet IDs another route shares', async () => {
+      mockDescribe.mockResolvedValue({ ...INTL_META, route: 'ieo/2023' });
+
+      const result = await runToolContract(describeRouteTool, { route: 'ieo/2023' });
+
+      expect(noticeOf(result)).not.toContain('EIA lists only part');
+    });
+
+    it('names the {col}-units field of each column the metadata gives no unit, on both surfaces', async () => {
+      mockDescribe.mockResolvedValue(FF_META);
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/facility-fuel',
+      });
+
+      expect(noticeOf(result)).toBe(`${DATE} ${NAMED}`);
+      expect(textOf(result)).toContain(`> ${DATE} ${NAMED}`);
+      // The column lines render as before; the notice carries the pointer.
+      expect(textOf(result)).toContain(
+        '- **average-heat-content** (Average Heat Content of Consumed Fuels) — \n',
+      );
+      expect(textOf(result)).toContain('- **generation** (Net Generation) — megawatthours');
+    });
+
+    /**
+     * `electricity/operating-generator-capacity`'s twelve columns as EIA's
+     * metadata gives them. The seven without units are dates, a county, and
+     * coordinates: their rows carry no `{col}-units` field (the only one is
+     * `nameplate-capacity-mw-units`), so the metadata omitting `units` reads
+     * the same as on facility-fuel while the rows do not.
+     */
+    const OGC_META = {
+      ...FULL_META,
+      route: 'electricity/operating-generator-capacity',
+      description: 'Inventory of operating generators',
+      facets: [],
+      dataColumns: [
+        { id: 'nameplate-capacity-mw', alias: 'Nameplate Capacity', units: 'MW' },
+        { id: 'net-summer-capacity-mw', alias: 'Net Summer Capacity', units: 'MW' },
+        { id: 'net-winter-capacity-mw', alias: 'Net Winter Capacity', units: 'MW' },
+        { id: 'operating-year-month', alias: 'Operating Date (Year and Month)', units: '' },
+        {
+          id: 'planned-retirement-year-month',
+          alias: 'Planned Retirement Date (Year and Month)',
+          units: '',
+        },
+        {
+          id: 'planned-derate-year-month',
+          alias: 'Planned Derate Date (Year and Month)',
+          units: '',
+        },
+        {
+          id: 'planned-derate-summer-cap-mw',
+          alias: 'Magnitude of Planned Derate (Summer Capacity)',
+          units: 'MW',
+        },
+        {
+          id: 'planned-uprate-year-month',
+          alias: 'Planned Uprate Date (Year and Month)',
+          units: '',
+        },
+        {
+          id: 'planned-uprate-summer-cap-mw',
+          alias: 'Magnitude of Planned Uprate (Summer Capacity)',
+          units: 'MW',
+        },
+        { id: 'county', alias: 'County', units: '' },
+        { id: 'longitude', alias: 'Longitude', units: '' },
+        { id: 'latitude', alias: 'Latitude', units: '' },
+      ],
+    };
+    const DESCRIPTORS =
+      'Data columns operating-year-month, planned-retirement-year-month, planned-derate-year-month, planned-uprate-year-month, county, longitude, latitude have no unit in the route metadata. Where an eia_query_route row carries a unit for one of them, it is in operating-year-month-units, planned-retirement-year-month-units, planned-derate-year-month-units, planned-uprate-year-month-units, county-units, longitude-units, latitude-units, and it can differ by row; a column whose rows carry no such field has no unit.';
+
+    it('does not say rows carry a unit field for descriptor columns with no unit, on both surfaces', async () => {
+      mockDescribe.mockResolvedValue(OGC_META);
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/operating-generator-capacity',
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(noticeOf(result)).toBe(`${DATE} ${DESCRIPTORS}`);
+      expect(textOf(result)).toContain(`> ${DATE} ${DESCRIPTORS}`);
+      expect(noticeOf(result)).not.toContain('each eia_query_route row carries the unit');
+      expect(textOf(result)).not.toContain('each eia_query_route row carries the unit');
+    });
+
+    it('offers units or unit, naming neither, for the column synthesized from { value: [] }', async () => {
+      mockDescribe.mockResolvedValue({ ...INTL_META, route: 'steo', facets: [] });
+
+      const result = await runToolContract(describeRouteTool, { route: 'steo' });
+
+      expect(noticeOf(result)).toBe(`${DATE} ${SYNTHESIZED}`);
+      expect(textOf(result)).toContain(SYNTHESIZED);
+      // The marker stays in the service: data_columns keeps its three fields.
+      expect(
+        JSON.stringify((result.structuredContent as { data_columns: unknown }).data_columns),
+      ).toBe(JSON.stringify([{ id: 'value', alias: 'Value', units: '' }]));
+    });
+
+    it('points a named value column with no unit at value-units, not at units or unit', async () => {
+      mockDescribe.mockResolvedValue({
+        ...FULL_META,
+        dataColumns: [{ id: 'value', alias: 'Value', units: '' }],
+      });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'electricity/retail-sales',
+      });
+
+      expect(noticeOf(result)).toBe(
+        `${DATE} Data column value has no unit in the route metadata. Where an eia_query_route row carries a unit for it, it is in value-units, and it can differ by row; a column whose rows carry no such field has no unit.`,
+      );
+    });
+
+    it.each([
+      ['crude-oil-imports', [{ id: 'quantity', alias: 'quantity', units: 'thousand barrels' }]],
+      [
+        'co2-emissions/co2-emissions-aggregates',
+        [{ id: 'value', alias: 'value', units: 'million metric tons of CO2' }],
+      ],
+    ])(
+      'adds no unit notice on %s, whose every column names its unit',
+      async (route, dataColumns) => {
+        mockDescribe.mockResolvedValue({ ...FULL_META, route, dataColumns });
+
+        const result = await runToolContract(describeRouteTool, { route });
+
+        expect(noticeOf(result)).toBe(DATE);
+      },
+    );
+
+    it('joins every notice one call raises into one, in the order the response reads', async () => {
+      const fetchedAt = Date.parse('2026-10-01T09:00:00Z');
+      mockDescribe.mockResolvedValue({
+        ...INTL_META,
+        stale: { route: false, facets: [{ id: 'countryRegionId', fetchedAt }] },
+      });
+
+      const result = await runToolContract(describeRouteTool, {
+        route: 'international',
+        values_offset: 2,
+      });
+
+      const expected = [
+        DATE,
+        SYNTHESIZED,
+        PARTIAL,
+        "values_offset 2 is past the last value of productId (2 values, last valid offset 1), activityId (2 values, last valid offset 1), dataFlagId (1 values, last valid offset 0), unit (2 values, last valid offset 1). Reduce values_offset to at most that facet's last valid offset, or pass facet to page one facet at a time so a shared offset stops emptying the narrower ones.",
+        'EIA did not answer the refresh of the value list of countryRegionId (fetched 2026-10-01T09:00:00Z), so it is served as last fetched and may lack values EIA has added since. The next eia_describe_route call retries the refresh.',
+      ].join(' ');
+      expect(noticeOf(result)).toBe(expected);
+      expect(result.content.at(-1)).toEqual({ type: 'text', text: `\n\n> ${expected}` });
+    });
+
+    it('says in the units description what an empty string means', () => {
+      const schema = z.toJSONSchema(describeRouteTool.output, { io: 'output' });
+      expect(schema).toMatchObject({
+        properties: {
+          data_columns: {
+            items: {
+              properties: {
+                units: {
+                  description: expect.stringContaining(
+                    'An empty string means the route metadata names no unit',
+                  ),
+                },
+              },
+            },
+          },
+        },
+      });
+      // No field joins the column shape.
+      const columns = schema.properties?.data_columns as {
+        items: { properties: { units: { description: string } } };
+      };
+      expect(Object.keys(columns.items.properties)).toEqual(['id', 'alias', 'units']);
+      // A descriptor column's rows carry no unit field, so the field is not promised.
+      expect(columns.items.properties.units.description).toContain(
+        'a column whose rows have no such field has no unit',
+      );
+      expect(columns.items.properties.units.description).not.toContain(
+        'names the field each eia_query_route row carries it in',
+      );
     });
   });
 
@@ -1320,6 +1679,253 @@ describe('describeRouteTool', () => {
             },
           },
         },
+      });
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // values_query by ISO/RTO acronym on balancing-authority facets (#102)
+  // ------------------------------------------------------------------
+
+  describe('values_query on balancing-authority facets (#102)', () => {
+    /** EIA's own value lists, captured live: seven grid lists, a state list, a plant list. */
+    const CAPTURED = JSON.parse(
+      readFileSync(new URL('../fixtures/balancing-authority-facets.json', import.meta.url), 'utf8'),
+    ) as Array<{
+      route: string;
+      facet: string;
+      description: string;
+      values: Array<{ id: string; name: string; alias?: string }>;
+    }>;
+
+    function list(route: string, facet: string) {
+      const found = CAPTURED.find((l) => l.route === route && l.facet === facet);
+      if (!found) throw new Error(`no captured list for ${route} ${facet}`);
+      return found;
+    }
+
+    /** Describe `route` with one captured list as its only facet. */
+    function describeList(l: (typeof CAPTURED)[number], values_query: string) {
+      mockDescribe.mockResolvedValue({
+        ...FULL_META,
+        route: l.route,
+        description: 'Captured',
+        facets: [{ id: l.facet, description: l.description, values: l.values }],
+        dataColumns: [],
+        frequencies: [],
+      });
+      return runToolContract(describeRouteTool, { route: l.route, values_query });
+    }
+
+    type Window = { values: Array<{ id: string; name: string }>; values_matched?: number };
+    const windowOf = (result: Awaited<ReturnType<typeof describeList>>): Window =>
+      (result.structuredContent as { facets: Window[] }).facets[0] as Window;
+    const textOf = (result: Awaited<ReturnType<typeof describeList>>): string =>
+      result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+
+    it.each([
+      ['ERCOT', 'electricity/rto/region-data', 'respondent', ['ERCO']],
+      ['SPP', 'electricity/rto/interchange-data', 'toba', ['SWPW', 'SWPP']],
+      [
+        'CAISO',
+        'electricity/operating-generator-capacity',
+        'balancing_authority_code',
+        ['CA', 'CISO'],
+      ],
+      ['nyiso', 'electricity/rto/region-sub-ba-data', 'parent', ['NYIS']],
+      ['iso-ne', 'electricity/rto/fuel-type-data', 'respondent', ['ISNE']],
+    ])('matches %s on %s %s by acronym, on both surfaces', async (query, route, facet, ids) => {
+      const result = await describeList(list(route, facet), query);
+
+      expect(result.isError).not.toBe(true);
+      const window = windowOf(result);
+      expect(window.values.map((v) => v.id)).toEqual(ids);
+      expect(window.values_matched).toBe(ids.length);
+      const text = textOf(result);
+      for (const value of window.values) expect(text).toContain(`${value.id}=${value.name}`);
+      expect(text).toContain(`(${ids.length} of ${ids.length} matching values from offset 0;`);
+      expect((result.structuredContent as { notice: string }).notice).not.toContain('No value of');
+    });
+
+    it('matches nothing for an acronym on a state facet, though CA is a CAISO code elsewhere', async () => {
+      const result = await describeList(list('electricity/retail-sales', 'stateid'), 'CAISO');
+
+      expect(result.isError).not.toBe(true);
+      expect(windowOf(result)).toMatchObject({ values: [], values_matched: 0 });
+      const miss = 'No value of stateid has an id, name, or alias containing values_query "CAISO"';
+      expect((result.structuredContent as { notice: string }).notice).toContain(miss);
+      expect(textOf(result)).toContain(miss);
+    });
+
+    /**
+     * The acronym test is an added disjunct, so a query matches every value it
+     * matched by id, name, or alias, and gains only the values whose acronym
+     * contains it. Run over every captured list against the acronyms, the codes
+     * they map from, fragments of both, and words from the mapped authorities'
+     * names — the queries where an acronym match and a text match meet.
+     */
+    it('keeps every value a query matched before, adding only those an acronym contains', async () => {
+      vi.stubEnv('EIA_FACET_VALUE_CAP', '500');
+      _resetServerConfig();
+      const ACRONYMS: Record<string, string[]> = {
+        ERCO: ['ERCOT'],
+        CISO: ['CAISO'],
+        CA: ['CAISO'],
+        NYIS: ['NYISO'],
+        SWPP: ['SPP'],
+        SWPW: ['SPP'],
+        ISNE: ['ISO-NE'],
+        MISO: ['MISO'],
+        PJM: ['PJM'],
+      };
+      const GRID_FACETS = ['respondent', 'fromba', 'toba', 'parent', 'balancing_authority_code'];
+      const queries = new Set([
+        ...Object.values(ACRONYMS).flat(),
+        ...Object.keys(ACRONYMS),
+        ...['iso', 'ca', 'sw', 'pp', 'ne', 'ny', 'inc.', 'power pool'],
+        ...['electric', 'texas', 'california', 'new york', 'southwest', 'independent'],
+      ]);
+
+      let gained = 0;
+      for (const l of CAPTURED) {
+        const grid = l.route.startsWith('electricity/') && GRID_FACETS.includes(l.facet);
+        for (const query of queries) {
+          const needle = query.toLowerCase();
+          const byText = (v: { id: string; name: string; alias?: string }) =>
+            [v.id, v.name, v.alias ?? ''].some((s) => s.toLowerCase().includes(needle));
+          const byAcronym = (v: { id: string }) =>
+            grid && (ACRONYMS[v.id] ?? []).some((a) => a.toLowerCase().includes(needle));
+          const label = (v: { id: string; name: string }) => `${v.id}=${v.name}`;
+
+          const got = windowOf(await describeList(l, query)).values.map(label);
+          const where = `${l.route} ${l.facet} ${JSON.stringify(query)}`;
+          expect(got, where).toEqual(expect.arrayContaining(l.values.filter(byText).map(label)));
+          expect(got, where).toEqual(l.values.filter((v) => byText(v) || byAcronym(v)).map(label));
+          gained += l.values.filter((v) => !byText(v) && byAcronym(v)).length;
+        }
+      }
+      // The acronyms do add matches; the superset is not vacuous.
+      expect(gained).toBeGreaterThan(0);
+    });
+
+    it('pages acronym matches: the cap, an offset into them, and one past them, on both surfaces', async () => {
+      vi.stubEnv('EIA_FACET_VALUE_CAP', '1');
+      _resetServerConfig();
+      const toba = list('electricity/rto/interchange-data', 'toba');
+      const nameOf = (id: string) => toba.values.find((v) => v.id === id)?.name;
+      const page = (values_offset: number) => {
+        mockDescribe.mockResolvedValue({
+          ...FULL_META,
+          route: toba.route,
+          description: 'Captured',
+          facets: [{ id: toba.facet, description: toba.description, values: toba.values }],
+          dataColumns: [],
+          frequencies: [],
+        });
+        return runToolContract(describeRouteTool, {
+          route: toba.route,
+          values_query: 'SPP',
+          values_offset,
+        });
+      };
+      const noticeOf = (result: Awaited<ReturnType<typeof page>>) =>
+        (result.structuredContent as { notice: string }).notice;
+      const inAll = `${toba.values.length} values in all`;
+
+      // Neither SWPW nor SWPP carries "SPP" in its id, name, or alias: every match is by acronym.
+      const first = await page(0);
+      expect(windowOf(first)).toMatchObject({
+        values: [{ id: 'SWPW' }],
+        values_matched: 2,
+        values_truncated: true,
+      });
+      expect(textOf(first)).toContain(`(1 of 2 matching values from offset 0; ${inAll})`);
+      expect(textOf(first)).toContain(`SWPW=${nameOf('SWPW')}`);
+      expect(textOf(first)).toContain(
+        '(+1 more — eia_describe_route(route="electricity/rto/interchange-data", facet="toba", values_query="SPP", values_offset=1))',
+      );
+
+      const second = await page(1);
+      expect(windowOf(second)).toMatchObject({
+        values: [{ id: 'SWPP' }],
+        values_matched: 2,
+        values_truncated: false,
+      });
+      expect(textOf(second)).toContain(`(1 of 2 matching values from offset 1; ${inAll})`);
+      expect(textOf(second)).toContain(`SWPP=${nameOf('SWPP')}`);
+      expect(textOf(second)).not.toContain('more — eia_describe_route');
+
+      const past = await page(2);
+      expect(windowOf(past)).toMatchObject({
+        values: [],
+        values_matched: 2,
+        values_truncated: false,
+      });
+      const overshoot =
+        'values_offset 2 is past the last value matching values_query "SPP" of toba (values_matched 2, last valid offset 1).';
+      expect(noticeOf(past)).toContain(overshoot);
+      expect(textOf(past)).toContain(overshoot);
+      expect(noticeOf(past)).not.toContain('No value of');
+    });
+
+    /**
+     * values_query is caller text of any length, lower-cased once and tested
+     * with `includes` against every value's id, name, alias, and — on a
+     * balancing-authority facet — acronyms, then echoed in the notice and the
+     * text. Thread CPU per batch of calls at doubling sizes: an absolute bound
+     * at each size, then the 320k/5k ratio, never a single step.
+     */
+    describe('work over caller-sized text', () => {
+      const region = list('electricity/rto/region-data', 'respondent');
+      const states = list('electricity/retail-sales', 'stateid');
+      const META = {
+        ...FULL_META,
+        route: region.route,
+        description: 'Captured',
+        facets: [
+          { id: region.facet, description: region.description, values: region.values },
+          { id: states.facet, description: states.description, values: states.values },
+        ],
+        dataColumns: [],
+        frequencies: [],
+      };
+
+      /** Thread CPU milliseconds for `reps` parse + handler + format runs, the least of three trials. */
+      async function cpuMs(values_query: string, reps: number): Promise<number> {
+        const ctx = createMockContext({ errors: describeRouteTool.errors });
+        let best = Number.POSITIVE_INFINITY;
+        let rendered = 0;
+        for (let trial = 0; trial < 3; trial++) {
+          const start = process.threadCpuUsage();
+          for (let i = 0; i < reps; i++) {
+            const input = describeRouteTool.input.parse({ route: region.route, values_query });
+            const blocks = describeRouteTool.format?.(await describeRouteTool.handler(input, ctx));
+            rendered += blocks?.length ?? 0;
+          }
+          const used = process.threadCpuUsage(start);
+          best = Math.min(best, (used.user + used.system) / 1000);
+        }
+        // Every run rendered its text, so no call was dead code.
+        expect(rendered).toBe(3 * reps);
+        return best;
+      }
+
+      it.each([
+        ['repeated openers with no closer', (n: number) => '('.repeat(n)],
+        ['one long line ending in a newline', (n: number) => `${'ERCOT '.repeat(n / 6)}\n`],
+        ['line breaks throughout', (n: number) => `x${'  \r\n'.repeat(n / 4)}x`],
+        ['a digit run', (n: number) => '1'.repeat(n)],
+      ])('stays linear on %s', async (_name, shape) => {
+        mockDescribe.mockResolvedValue(META);
+        const reps = 5;
+        const timings: number[] = [];
+        for (let n = 5_000; n <= 320_000; n *= 2) {
+          const ms = await cpuMs(shape(n), reps);
+          expect(ms, `${reps} calls at ${n} characters`).toBeLessThan(1_000);
+          timings.push(ms);
+        }
+        const first = Math.max(timings[0] ?? 0, 0.05);
+        expect((timings.at(-1) ?? 0) / first).toBeLessThan(256);
       });
     });
   });

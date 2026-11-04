@@ -19,14 +19,21 @@
  * `values_query` narrows each facet to the values whose `id`, `name`, or
  * `alias` contains it, read from the same cached list, before the window is
  * cut — so a plant or entity ID among tens of thousands of values is one call
- * away instead of hundreds of pages. The offset then indexes the matches.
+ * away instead of hundreds of pages. On a balancing-authority facet a value's
+ * ISO/RTO acronyms (`balancing-authorities.ts`) match too, so `ERCOT` finds
+ * `ERCO`. The offset then indexes the matches.
+ *
+ * Every notice a call raises is joined into one: besides the paging and cache
+ * guidance, it names the row field carrying the unit of each data column the
+ * metadata gives none, and the facet value lists EIA publishes partial.
  * @module mcp-server/tools/definitions/describe-route.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
-import { getEiaApiService } from '@/services/eia/eia-service.js';
+import { balancingAuthorityAcronyms } from '@/services/eia/balancing-authorities.js';
+import { getEiaApiService, partialFacetLists } from '@/services/eia/eia-service.js';
 
 /**
  * True when a facet value's alias only repeats the `id=name` pair the rendered
@@ -63,14 +70,22 @@ const showBlank = (s: string): string => (s.trim() === '' ? `"${s}"` : s);
 
 /**
  * True when a facet value's `id`, `name`, or `alias` contains `needle`, which
- * the caller has already lower-cased. A plain substring test rather than a
- * pattern: the query is caller text matched against EIA labels, and nothing
- * in it should read as syntax.
+ * the caller has already lower-cased — or, on a balancing-authority facet
+ * (`acronyms` set), one of the value's ISO/RTO acronyms does, so `ERCOT` finds
+ * `ERCO`. The acronym test is an added disjunct: every value the first three
+ * match still matches. A plain substring test rather than a pattern: the query
+ * is caller text matched against EIA labels, and nothing in it should read as
+ * syntax.
  */
-const matchesQuery = (v: { id: string; name: string; alias?: string }, needle: string): boolean =>
+const matchesQuery = (
+  v: { id: string; name: string; alias?: string },
+  needle: string,
+  acronyms: ReadonlyMap<string, readonly string[]> | undefined,
+): boolean =>
   v.id.toLowerCase().includes(needle) ||
   v.name.toLowerCase().includes(needle) ||
-  v.alias?.toLowerCase().includes(needle) === true;
+  v.alias?.toLowerCase().includes(needle) === true ||
+  acronyms?.get(v.id)?.some((a) => a.toLowerCase().includes(needle)) === true;
 
 /** An epoch-ms instant as ISO 8601 UTC to the second — `2026-10-28T09:00:00Z`. */
 const utc = (ms: number): string => `${new Date(ms).toISOString().slice(0, 19)}Z`;
@@ -78,7 +93,7 @@ const utc = (ms: number): string => `${new Date(ms).toISOString().slice(0, 19)}Z
 export const describeRouteTool = tool('eia_describe_route', {
   title: 'Describe EIA Route',
   description:
-    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. To find a value by name in a large facet (plant, entity, and mine IDs run to thousands), pass values_query: each facet keeps only the values whose id, name, or alias contains it, values_matched counts them, and values_offset pages the matches. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints, merged, and cached per route for 24 hours, after which the next call fetches the route again; a facet whose values EIA did not return is left out of facets, named in unavailable_facets, and fetched again by the next call. When a refresh fails, the cached values are served instead, with a notice naming when they were fetched.',
+    'Returns metadata for a leaf route: available facets with their valid values, data column names and units, frequency options, and date range. Call this before eia_query_route to discover valid facet IDs, facet values, column IDs, and frequency codes. Each facet returns a capped window of its values with value_count and values_truncated alongside; pass facet and values_offset to page through the rest of one facet. To find a value by name in a large facet (plant, entity, and mine IDs run to thousands), pass values_query: each facet keeps only the values whose id, name, or alias contains it — on a balancing-authority facet, also a value whose ISO/RTO acronym does, so "ERCOT" finds ERCO — values_matched counts them, and values_offset pages the matches. A values_offset past the last value of a facet returns an empty window for it and a notice naming the count to page against. Facet values are fetched from separate EIA endpoints, merged, and cached per route for 24 hours, after which the next call fetches the route again; a facet whose values EIA did not return is left out of facets, named in unavailable_facets, and fetched again by the next call. When a refresh fails, the cached values are served instead, with a notice naming when they were fetched.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   inputAliases: { path: 'route' },
 
@@ -110,7 +125,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .min(1, 'values_query must contain at least one non-whitespace character')
       .optional()
       .describe(
-        'Keep only the facet values whose id, name, or alias contains this text, ignoring case (e.g. "palo verde" on plantCode). A plain substring match, not a pattern or a ranked search. Applied to every facet in the response, before values_offset and the cap. Leading and trailing whitespace is ignored. Omit to list every value.',
+        'Keep only the facet values whose id, name, or alias contains this text, ignoring case (e.g. "palo verde" on plantCode). On the balancing-authority facets of electricity routes (respondent, fromba, toba, parent, balancing_authority_code), a value also matches when its ISO/RTO acronym contains the text: "ERCOT" finds ERCO, "CAISO" finds CISO, "SPP" finds SWPP and SWPW. A plain substring match, not a pattern or a ranked search. Applied to every facet in the response, before values_offset and the cap. Leading and trailing whitespace is ignored. Omit to list every value.',
       ),
   }),
 
@@ -142,7 +157,7 @@ export const describeRouteTool = tool('eia_describe_route', {
                   .describe('A valid facet value.'),
               )
               .describe(
-                'Valid values for this facet dimension, starting at values_offset and capped at EIA_FACET_VALUE_CAP. With values_query, only the matching values, in upstream order.',
+                'Valid values for this facet dimension, starting at values_offset and capped at the window size this server sets. With values_query, only the matching values, in upstream order.',
               ),
             value_count: z
               .number()
@@ -153,7 +168,7 @@ export const describeRouteTool = tool('eia_describe_route', {
               .number()
               .optional()
               .describe(
-                'Values of this facet whose id, name, or alias contains values_query — what values_offset indexes and values_truncated is measured against. One ID listed under two historical names counts twice. Present only when values_query is set.',
+                'Values of this facet whose id, name, or alias contains values_query — or, on a balancing-authority facet, whose ISO/RTO acronym does — what values_offset indexes and values_truncated is measured against. One ID listed under two historical names counts twice. Present only when values_query is set.',
               ),
             values_truncated: z
               .boolean()
@@ -187,7 +202,11 @@ export const describeRouteTool = tool('eia_describe_route', {
           .object({
             id: z.string().describe('Column ID — use in the columns parameter of eia_query_route.'),
             alias: z.string().describe('Human-readable column alias.'),
-            units: z.string().describe('Measurement units (e.g. "cents per kilowatt-hour").'),
+            units: z
+              .string()
+              .describe(
+                'Measurement units (e.g. "cents per kilowatt-hour"). An empty string means the route metadata names no unit for this column; the notice then names the eia_query_route row field that holds its unit when a row has one, and a column whose rows have no such field has no unit.',
+              ),
           })
           .describe('A data column available for this route.'),
       )
@@ -231,7 +250,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .optional()
       .describe(
-        'Default-frequency date-range context, composed with guidance for exhausted facet windows, a values_query no value matched, unavailable facet values, or cached values served because their refresh failed.',
+        'Default-frequency date-range context, composed with the row field carrying the unit of each data column the route metadata gives no unit, the facet value lists EIA publishes partial, and guidance for exhausted facet windows, a values_query no value matched, unavailable facet values, or cached values served because their refresh failed.',
       ),
   },
 
@@ -349,8 +368,9 @@ export const describeRouteTool = tool('eia_describe_route', {
     const windows = facets.map((f) => {
       // The match runs over the full cached list, never over a window, so
       // values_matched is exact and the offset pages the matches themselves.
+      const acronyms = balancingAuthorityAcronyms(meta.route, f.id);
       const pool =
-        needle === undefined ? f.values : f.values.filter((v) => matchesQuery(v, needle));
+        needle === undefined ? f.values : f.values.filter((v) => matchesQuery(v, needle, acronyms));
       const window = pool.slice(offset, offset + cap);
       return {
         id: f.id,
@@ -367,6 +387,49 @@ export const describeRouteTool = tool('eia_describe_route', {
     });
 
     /**
+     * Every notice this call raises is collected here and sent as one, in the
+     * order the response reads: date range, data columns, facets, then paging
+     * and the state of the cached lists.
+     */
+    const notices: string[] = [
+      `date_range reports route metadata for the default frequency (${meta.defaultFrequency || 'unspecified'}); another frequency may extend outside this range.`,
+    ];
+    /**
+     * The route metadata omits `units` for two kinds of column it cannot tell
+     * apart. A measure carries its unit on each row, and it can change from row
+     * to row (`Mcf` on natural-gas rows, `short tons` on coal, on
+     * `electricity/facility-fuel`); a descriptor has none, and its rows carry
+     * no unit field (`county`, `latitude`, `operating-year-month` on
+     * `electricity/operating-generator-capacity`). So a column the metadata
+     * names is pointed at `{col}-units` only for where a row's unit is when it
+     * has one. The `value` column the service synthesizes from `{ value: [] }`
+     * is the route's only column, and its rows carry the unit in a route-level
+     * `units` or `unit`; the metadata does not say which, so both are named.
+     */
+    const unitless = meta.dataColumns.filter((c) => c.units === '');
+    if (unitless.length > 0) {
+      const one = unitless.length === 1;
+      const head = `Data ${one ? 'column' : 'columns'} ${unitless.map((c) => c.id).join(', ')} ${one ? 'has' : 'have'} no unit in the route metadata`;
+      notices.push(
+        unitless.some((c) => c.synthesized)
+          ? `${head}; each eia_query_route row carries the unit, which can differ by row, in a field named units or unit.`
+          : `${head}. Where an eia_query_route row carries a unit for ${one ? 'it' : 'one of them'}, it is in ${unitless.map((c) => `${c.id}-units`).join(', ')}, and it can differ by row; a column whose rows carry no such field has no unit.`,
+      );
+    }
+    /**
+     * A list EIA publishes partial looks whole — value_count is its length —
+     * yet rows carry IDs it omits, so each one this response shows is named,
+     * with the row field that labels its IDs.
+     */
+    const partial = partialFacetLists(meta.route);
+    const shownPartial = partial?.facets.filter((p) => facets.some((f) => f.id === p.id)) ?? [];
+    if (partial && shownPartial.length > 0) {
+      const one = shownPartial.length === 1;
+      notices.push(
+        `EIA lists only part of the values of ${shownPartial.map((p) => p.id).join(', ')}: ${one ? 'the list holds' : 'the lists hold'} the IDs of the ${new Intl.ListFormat('en').format(partial.frequencies)} series, and rows at other frequencies can carry IDs ${one ? 'it omits' : 'they omit'}. An ID missing from ${one ? 'it' : 'them'} still filters eia_query_route; a query without that filter returns the IDs rows carry, each beside its label in ${shownPartial.map((p) => p.labelField).join(', ')}.`,
+      );
+    }
+    /**
      * An offset past a facet's last value returns the same shape as a facet
      * enumerated to its end — empty values, nothing truncated — and the offset
      * applies to every facet, so one large enough to page a wide facet empties
@@ -375,9 +438,6 @@ export const describeRouteTool = tool('eia_describe_route', {
      * With values_query the offset indexes the matches, so the count named is
      * values_matched; a facet nothing matched is reported once, as a miss.
      */
-    const notices: string[] = [
-      `date_range reports route metadata for the default frequency (${meta.defaultFrequency || 'unspecified'}); another frequency may extend outside this range.`,
-    ];
     const pageable = (f: (typeof windows)[number]) => f.values_matched ?? f.value_count;
     const overshot = windows.filter((f) => f.values.length === 0 && pageable(f) > 0);
     if (overshot.length > 0) {
@@ -507,7 +567,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       result.values_query === undefined ? undefined : JSON.stringify(result.values_query);
     if (query !== undefined) {
       lines.push(
-        `**Values query:** ${query} — each facet lists only the values whose id, name, or alias contains it, ignoring case.\n`,
+        `**Values query:** ${query} — each facet lists only the values whose id, name, or alias contains it, or on a balancing-authority facet whose ISO/RTO acronym does, ignoring case.\n`,
       );
     }
 

@@ -6,9 +6,10 @@
  * as strings. At `hourly` a bound without an hour — or with a UTC offset — is
  * read as its first day, which as an end covers the whole day; at
  * `local-hourly` every bound carries an offset and two bounds compare as
- * instants. `weekly` periods are dates, compared as days. Each frequency also
- * parses one bound shape strictly, and in that shape a month, day, or hour
- * that does not exist draws HTTP 500 from EIA (`impossiblePeriod`).
+ * instants. `weekly` periods are dates, compared as days. A bound naming a
+ * month, day, or hour that does not exist is never read as written: EIA rolls
+ * it into another day or answers HTTP 500, and `impossiblePeriod` names the
+ * ones EIA would not answer with the period the bound names.
  * @module services/eia/period-bounds
  */
 
@@ -72,26 +73,42 @@ function daysInMonth(year: number, month: number): number {
   return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
+/** The first component of a lexed bound that does not exist. */
+interface ImpossibleComponent {
+  problem: string;
+  /**
+   * What EIA rolls into an adjacent day as `Date.UTC` does: a `day` the month
+   * lacks, or an `hour` 24–99 of a real day. Absent for a month outside 01–12
+   * or an hour that is not two digits, which it never reads as a period the
+   * bound names.
+   */
+  rollover?: 'day' | 'hour';
+}
+
 /**
  * What is wrong with the date and hour of a lexed bound — a month outside
- * 01–12, a day the month does not have, an hour that is not two digits 00–23 —
- * or undefined when every component it carries exists.
+ * 01–12, an hour that is not two digits, a day the month does not have, an
+ * hour past 23, checked in that order — or undefined when every component it
+ * carries exists.
  */
-function impossibleComponent(bound: LexedBound): string | undefined {
-  const year = Number(bound.year);
-  if (bound.month !== undefined) {
-    const month = Number(bound.month);
-    if (month < 1 || month > 12) return `month ${bound.month}, but months run 01–12`;
-    if (bound.day !== undefined) {
-      const day = Number(bound.day);
-      const last = daysInMonth(year, month);
-      if (day < 1) return `day ${bound.day}, but days start at 01`;
-      if (day > last) return `day ${bound.day}, but ${bound.year}-${bound.month} has ${last} days`;
+function impossibleComponent(bound: LexedBound): ImpossibleComponent | undefined {
+  const { month, day, hour } = bound;
+  if (month !== undefined && (Number(month) < 1 || Number(month) > 12)) {
+    return { problem: `month ${month}, but months run 01–12` };
+  }
+  const hourProblem = `hour ${hour}, but the hour is two digits, 00–23`;
+  if (hour !== undefined && hour.length !== 2) return { problem: hourProblem };
+  if (month !== undefined && day !== undefined) {
+    const last = daysInMonth(Number(bound.year), Number(month));
+    if (Number(day) < 1) return { problem: `day ${day}, but days start at 01`, rollover: 'day' };
+    if (Number(day) > last) {
+      return {
+        problem: `day ${day}, but ${bound.year}-${month} has ${last} days`,
+        rollover: 'day',
+      };
     }
   }
-  if (bound.hour !== undefined && (bound.hour.length !== 2 || Number(bound.hour) > 23)) {
-    return `hour ${bound.hour}, but the hour is two digits, 00–23`;
-  }
+  if (hour !== undefined && Number(hour) > 23) return { problem: hourProblem, rollover: 'hour' };
   return;
 }
 
@@ -135,30 +152,72 @@ export function lacksUtcOffset(value: string): boolean {
   return bound !== undefined && bound.offset === undefined;
 }
 
+/** Frequencies whose period is a day or an hour, which every rolled-over day or hour leaves. */
+const DAY_OR_HOUR_FREQUENCIES = new Set(['daily', 'hourly', 'local-hourly']);
+
 /**
- * Why EIA cannot read `value` at `frequency`, or undefined when it can. Each
- * frequency parses one shape strictly and every other leniently, so only that
- * shape is checked, measured against live EIA: `daily` and `weekly` parse
- * `YYYY-MM-DD`, `hourly` parses `YYYY-MM-DDTHH`, and `local-hourly` parses
- * `YYYY-MM-DDTHH±HH` (the offset itself is lenient). In that shape a month
- * outside 01–12, a day the month lacks — February 29 outside a leap year
- * included — or an hour that is not two digits 00–23 draws HTTP 500 and never
- * rows. Every other shape and frequency rolls over or reads leniently
- * (`2024-13` is 2025-01 at monthly, `2024-02-30` at hourly reads as a day), and
- * an out-of-range quarter draws EIA's own 400.
+ * Frequencies whose period is a week-ending date. A day the month lacks names
+ * no day to select from (and draws HTTP 500 in the strict `YYYY-MM-DD` shape);
+ * an hour 24–99 rolls a real day forward by at most four days, which selects
+ * the period the named day selects unless a period date falls in between — a
+ * matter of the route's weekly calendar, which this module does not know.
  */
-export function impossiblePeriod(value: string, frequency: string): string | undefined {
+const WEEK_FREQUENCIES = new Set(['weekly', 'four-week-average']);
+
+/**
+ * Why EIA would not read `value` as the period it names at `frequency`, or
+ * undefined when it would — measured against live EIA in every bound shape at
+ * every frequency. A month outside 01–12 names no period, and EIA's reading of
+ * it flips with the side and the frequency (`2024-13` is 2025-01 as a monthly
+ * start, 2024-12 as a monthly end); an hour that is not two digits (`T5`,
+ * `T005`) draws HTTP 500. Both are refused at any frequency, and with none
+ * known (`frequency` undefined). A day the month lacks — February 29 outside a
+ * leap year included — or an hour 24–99 rolls over as `Date.UTC` does
+ * (`2024-02-30` is March 1, `T24` the next day's 00), or draws HTTP 500 in the
+ * one shape each frequency parses strictly. It is refused when the rollover
+ * leaves the period the bound's year, month, and day name, which it always
+ * does at daily, hourly, and local-hourly, and goes through when it stays
+ * inside it: `2024-02-30` at quarterly or annual, `2024-01-15T99` at monthly.
+ * At weekly and four-week-average a day the month lacks is refused and an hour
+ * 24–99 is left to EIA (`WEEK_FREQUENCIES`): start `2024-02-01T24` selects the
+ * same week as `2024-02-01` on a route whose weeks end on Fridays. With no
+ * frequency known, or one this module does not model, the rollover is left to
+ * EIA. An out-of-range UTC offset reads leniently and an out-of-range quarter
+ * draws EIA's own 400, so neither is checked.
+ */
+export function impossiblePeriod(value: string, frequency: string | undefined): string | undefined {
   const bound = lexBound(value);
-  if (!bound || bound.day === undefined) return;
-  const strict =
-    frequency === 'daily' || frequency === 'weekly'
-      ? bound.hour === undefined
-      : frequency === 'hourly'
-        ? bound.hour !== undefined && bound.offset === undefined
-        : frequency === 'local-hourly'
-          ? bound.hour !== undefined && bound.offset !== undefined
-          : false;
-  return strict ? impossibleComponent(bound) : undefined;
+  const impossible = bound && impossibleComponent(bound);
+  if (!impossible) return;
+  if (impossible.rollover === undefined) return impossible.problem;
+  if (frequency === undefined) return;
+  if (DAY_OR_HOUR_FREQUENCIES.has(frequency)) return impossible.problem;
+  if (WEEK_FREQUENCIES.has(frequency)) {
+    return impossible.rollover === 'day' ? impossible.problem : undefined;
+  }
+  return rollsOutOfPeriod(bound, frequency) ? impossible.problem : undefined;
+}
+
+/**
+ * Whether the day and hour of `bound` roll it out of the period its year and
+ * month select at a frequency coarser than a day — false at a frequency this
+ * module does not model. Both periods come from `Date.UTC`, so its reading of
+ * a two-digit year as 19xx applies to each alike.
+ */
+function rollsOutOfPeriod(bound: LexedBound, frequency: string): boolean {
+  const year = Number(bound.year);
+  const month = Number(bound.month);
+  const periodAt = (epochMs: number) => {
+    const date = new Date(epochMs);
+    return selectedPeriod(
+      { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: 1, precision: 'month' },
+      'start',
+      frequency,
+    );
+  };
+  const named = periodAt(Date.UTC(year, month - 1, 1));
+  const read = periodAt(Date.UTC(year, month - 1, Number(bound.day), Number(bound.hour ?? 0)));
+  return named !== undefined && read !== undefined && named.key !== read.key;
 }
 
 const pad = (n: number, width = 2) => String(n).padStart(width, '0');

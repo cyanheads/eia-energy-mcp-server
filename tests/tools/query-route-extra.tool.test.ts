@@ -809,7 +809,7 @@ describe('queryRouteTool — additional coverage', () => {
     expect(result.dataset).toBe('df_STAGED');
     // The note names the real staged count, not the preview count.
     expect(result.canvas_preview_note).toContain('40 rows staged as df_STAGED');
-    expect(result.canvas_preview_note).not.toContain('EIA_CANVAS_MAX_ROWS');
+    expect(result.canvas_preview_note).not.toContain('staging row cap');
   });
 
   it('names the cap in the note when accumulation was capped short of total', async () => {
@@ -833,7 +833,9 @@ describe('queryRouteTool — additional coverage', () => {
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.canvas_preview_note).toContain('25 rows staged as df_CAPPED');
-    expect(result.canvas_preview_note).toContain('EIA_CANVAS_MAX_ROWS');
+    expect(result.canvas_preview_note).toContain(
+      'Accumulation stopped at the staging row cap (25,000)',
+    );
     expect(result.canvas_preview_note).toContain('113,460');
     expect(result.canvas_preview_note).toContain('re-query with offset 25');
     // Never claims the canvas holds the full dataset.
@@ -865,7 +867,7 @@ describe('queryRouteTool — additional coverage', () => {
     expect(result.canvas_preview_note).toContain('1–5,100 of 20,000');
     expect(result.canvas_preview_note).toContain('offset 5,100');
     // The cap did not bind — the note must not claim it did.
-    expect(result.canvas_preview_note).not.toContain('EIA_CANVAS_MAX_ROWS');
+    expect(result.canvas_preview_note).not.toContain('staging row cap');
   });
 
   it('says time ran out, on both surfaces, when the call deadline ended staging', async () => {
@@ -894,7 +896,7 @@ describe('queryRouteTool — additional coverage', () => {
     expect(note).toContain('Re-query with offset 5,100 and stage: true');
     // Neither a failed page nor the row cap.
     expect(note).not.toContain('Staging stopped before the end');
-    expect(note).not.toContain('EIA_CANVAS_MAX_ROWS');
+    expect(note).not.toContain('staging row cap');
     expect(text).toContain(note as string);
   });
 
@@ -1013,7 +1015,7 @@ describe('queryRouteTool — additional coverage', () => {
         true,
       );
       const cap =
-        'Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (25,000), so the staged rows are 1–25,000 of 113,460. Narrow with filters, start, or end — or re-query with offset 25,000 — to reach the rest.';
+        'Accumulation stopped at the staging row cap (25,000), so the staged rows are 1–25,000 of 113,460. Narrow with filters, start, or end — or re-query with offset 25,000 — to reach the rest.';
       expect(note).toContain(`${POINTER_TAIL} ${cap}`);
     });
 
@@ -1043,7 +1045,9 @@ describe('queryRouteTool — additional coverage', () => {
         ctx,
       );
 
-      expect(result.canvas_preview_note).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+      expect(result.canvas_preview_note).toContain(
+        'staging rows for SQL is unavailable on this deployment',
+      );
       expect(result.canvas_preview_note).not.toContain('eia_dataframe');
     });
   });
@@ -1098,7 +1102,7 @@ describe('queryRouteTool — additional coverage', () => {
       expect(sc.dataset).toBe('df_XYZ');
       expect(sc.next_offset).toBe(2);
       expect(sc.canvas_preview_note).toBe(
-        `${pointer(5)} Showing 2 of 5 rows inline. Continue the inline page at next_offset 2. ${PAGE_WITHOUT_STAGING}`,
+        `${pointer(5)} Showing rows 1–2 of 5 inline. Continue the inline page at next_offset 2. ${PAGE_WITHOUT_STAGING}`,
       );
       expect(text).toContain(`> ${sc.canvas_preview_note as string}`);
     });
@@ -1115,7 +1119,7 @@ describe('queryRouteTool — additional coverage', () => {
       const { sc, text } = await stageCall({ length: 2 });
 
       expect(sc.canvas_preview_note).toBe(
-        `${pointer(4)} Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (4), so the staged rows are 1–4 of 9. Narrow with filters, start, or end — or re-query with offset 4 — to reach the rest. Showing 2 of 9 rows inline. Continue the inline page at next_offset 2. ${PAGE_WITHOUT_STAGING}`,
+        `${pointer(4)} Accumulation stopped at the staging row cap (4), so the staged rows are 1–4 of 9. Narrow with filters, start, or end — or re-query with offset 4 — to reach the rest. Showing rows 1–2 of 9 inline. Continue the inline page at next_offset 2. ${PAGE_WITHOUT_STAGING}`,
       );
       expect(text).toContain(sc.canvas_preview_note as string);
     });
@@ -1128,7 +1132,7 @@ describe('queryRouteTool — additional coverage', () => {
 
       expect(sc).not.toHaveProperty('next_offset');
       expect(sc.canvas_preview_note).toBe(
-        `${pointer(2)} The staged rows are 4–5 of 5. Showing 2 of 5 rows inline.`,
+        `${pointer(2)} The staged rows are 4–5 of 5. Showing rows 4–5 of 5 inline, the last page.`,
       );
       expect(text).toContain(sc.canvas_preview_note as string);
       expect(text).not.toContain(PAGE_WITHOUT_STAGING);
@@ -1159,7 +1163,7 @@ describe('queryRouteTool — additional coverage', () => {
       expect(sc).not.toHaveProperty('dataset');
       expect(sc.next_offset).toBe(2);
       expect(sc.canvas_preview_note).toBe(
-        'Staging failed, so no dataframe was created — re-run with stage: true to try again, or page through with offset. Showing 2 of 5 rows inline. Continue the inline page at next_offset 2.',
+        'Staging failed, so no dataframe was created — re-run with stage: true to try again, or page through with offset. Showing rows 1–2 of 5 inline. Continue the inline page at next_offset 2.',
       );
       expect(text).toContain(sc.canvas_preview_note as string);
       expect(text).not.toContain(PAGE_WITHOUT_STAGING);
@@ -1176,6 +1180,201 @@ describe('queryRouteTool — additional coverage', () => {
       expect(sc).not.toHaveProperty('canvas_preview_note');
       expect(sc.notice).toMatch(/^Offset 9 is past the last row/);
       expect(text).not.toContain(PAGE_WITHOUT_STAGING);
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // #104 — the note names where the inline page sits in the matching set,
+  // says when it is the last page, and past offset 0 points stage: true at
+  // offset 0, since a stage starts at offset.
+  // ------------------------------------------------------------------
+
+  describe('the inline page row range (#104)', () => {
+    const TOTAL = 55;
+    const INCOMPLETE_RETURN = {
+      warning: 'incomplete return',
+      description: 'The API can only return 5000 rows in JSON format.',
+    };
+    const STAGE_FROM_START =
+      'Re-run with stage: true to stage the matching rows for SQL with eia_dataframe_query';
+    const STAGE_FROM_ZERO =
+      'Re-run with stage: true and offset 0 to stage the matching rows for SQL with eia_dataframe_query';
+    const CANVAS_OFF = 'staging rows for SQL is unavailable on this deployment';
+    const pointer = (rowCount: number) =>
+      `${rowCount} rows staged as df_RANGE — call eia_dataframe_describe for its column names, then eia_dataframe_query to run SQL over it.`;
+
+    /** Rows offset+1 through offset+count of the matching set, numbered by period. */
+    const pageRows = (offset: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({ period: String(offset + i + 1), value: '1' }));
+
+    /** A configured canvas; nothing registers unless the call asks to stage. */
+    const canvasConfigured = () => registeringBridge('df_RANGE', TOTAL);
+
+    /** EIA's answer for `length` rows at `offset` of TOTAL, every row from offset on accumulated. */
+    function answerPage(offset: number, length: number) {
+      const remaining = Math.max(0, TOTAL - offset);
+      mockQuery.mockResolvedValue({
+        ...BASE_RESPONSE,
+        total: TOTAL,
+        data: pageRows(offset, Math.min(length, remaining)),
+        warnings: [INCOMPLETE_RETURN],
+        accumulated: { rows: pageRows(offset, remaining), capped: false, cap: 25_000 },
+      });
+    }
+
+    /** Both surfaces exactly as the caller receives them; the note is one `> ` line of content[]. */
+    async function pageCall(input: Record<string, unknown>) {
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        ...input,
+      });
+      expect(result.isError).not.toBe(true);
+      const sc = result.structuredContent as Record<string, unknown>;
+      const text = (result.content ?? []).map((b) => (b as { text?: string }).text ?? '').join('');
+      const note = sc.canvas_preview_note as string | undefined;
+      if (note !== undefined) expect(text.split('\n')).toContain(`> ${note}`);
+      return { sc, note, text };
+    }
+
+    it.each([
+      [
+        'the first page',
+        0,
+        10,
+        `Showing rows 1–10 of 55 — nothing was staged. ${STAGE_FROM_START}, or page through with offset. Continue the inline page at next_offset 10.`,
+      ],
+      [
+        'a middle page',
+        20,
+        10,
+        `Showing rows 21–30 of 55 — nothing was staged. ${STAGE_FROM_ZERO}, or page through with offset. Continue the inline page at next_offset 30.`,
+      ],
+      [
+        'the last page',
+        50,
+        10,
+        `Showing rows 51–55 of 55, the last page — nothing was staged. ${STAGE_FROM_ZERO}.`,
+      ],
+    ])('places %s when nothing was staged', async (_page, offset, length, expected) => {
+      canvasConfigured();
+      answerPage(offset, length);
+
+      const { sc, note } = await pageCall({ offset, length });
+
+      expect(note).toBe(expected);
+      expect(sc.next_offset).toBe(offset + length < TOTAL ? offset + length : undefined);
+      expect(sc).not.toHaveProperty('truncation_warning');
+    });
+
+    it.each([
+      [
+        'a middle page',
+        20,
+        `Showing rows 21–30 of 55 — ${CANVAS_OFF}, so page through with offset. Continue the inline page at next_offset 30.`,
+      ],
+      ['the last page', 50, `Showing rows 51–55 of 55, the last page — ${CANVAS_OFF}.`],
+    ])('places %s where no canvas is configured', async (_page, offset, expected) => {
+      answerPage(offset, 10);
+
+      const { sc, note } = await pageCall({ offset, length: 10 });
+
+      expect(note).toBe(expected);
+      expect(sc).not.toHaveProperty('truncation_warning');
+    });
+
+    it('drops the paging advice from both unstaged notes on the last page', async () => {
+      answerPage(50, 10);
+      const withoutCanvas = await pageCall({ offset: 50, length: 10 });
+      canvasConfigured();
+      const withCanvas = await pageCall({ offset: 50, length: 10 });
+
+      for (const { sc, note } of [withoutCanvas, withCanvas]) {
+        expect(sc).not.toHaveProperty('next_offset');
+        expect(note).not.toContain('page through with offset');
+        expect(note).not.toContain('Continue the inline page');
+      }
+    });
+
+    it.each([
+      [
+        'the last page',
+        50,
+        `${pointer(5)} The staged rows are 51–55 of 55. Showing rows 51–55 of 55 inline, the last page.`,
+      ],
+      [
+        'a middle page',
+        20,
+        `${pointer(35)} The staged rows are 21–55 of 55. Showing rows 21–30 of 55 inline. Continue the inline page at next_offset 30. Page the inline rows with stage left off — another stage: true call stages a new table.`,
+      ],
+    ])(
+      'names the inline range of %s beside a registered stage',
+      async (_page, offset, expected) => {
+        registeringBridge('df_RANGE', TOTAL - offset);
+        answerPage(offset, 10);
+
+        const { sc, note } = await pageCall({ offset, length: 10, stage: true });
+
+        expect(sc.dataset).toBe('df_RANGE');
+        expect(note).toBe(expected);
+      },
+    );
+
+    const FAILED = 'Staging failed, so no dataframe was created — re-run with';
+
+    it.each([
+      [
+        'the first page',
+        0,
+        10,
+        `${FAILED} stage: true to try again, or page through with offset. Showing rows 1–10 of 55 inline. Continue the inline page at next_offset 10.`,
+      ],
+      [
+        'a middle page',
+        20,
+        10,
+        `${FAILED} stage: true and offset 0 to try again, or page through with offset. Showing rows 21–30 of 55 inline. Continue the inline page at next_offset 30.`,
+      ],
+      [
+        'the last page',
+        50,
+        10,
+        `${FAILED} stage: true and offset 0 to try again. Showing rows 51–55 of 55 inline, the last page.`,
+      ],
+      ['a page holding the whole set', 0, 100, `${FAILED} stage: true to try again.`],
+    ])('places %s beside a failed stage', async (_page, offset, length, expected) => {
+      bridgeAnswering({ status: 'failed', message: 'appender failed' });
+      answerPage(offset, length);
+
+      const { sc, note } = await pageCall({ offset, length, stage: true });
+
+      expect(sc).not.toHaveProperty('dataset');
+      expect(note).toBe(expected);
+      expect(sc.next_offset).toBe(offset + length < TOTAL ? offset + length : undefined);
+      expect(sc).not.toHaveProperty('truncation_warning');
+    });
+
+    it('keeps the notice and no note on an offset past total', async () => {
+      canvasConfigured();
+      answerPage(60, 10);
+
+      const { sc } = await pageCall({ offset: 60, length: 10 });
+
+      expect(sc).not.toHaveProperty('canvas_preview_note');
+      expect(sc).not.toHaveProperty('next_offset');
+      expect(sc.notice).toBe(
+        'Offset 60 is past the last row — total is 55. Reduce offset below total to page through the matching rows.',
+      );
+    });
+
+    it('writes no note when one page holds the whole matching set', async () => {
+      canvasConfigured();
+      answerPage(0, 100);
+
+      const { sc } = await pageCall({ offset: 0, length: 100 });
+
+      expect(sc.returned_count).toBe(TOTAL);
+      expect(sc).not.toHaveProperty('canvas_preview_note');
+      expect(sc).not.toHaveProperty('next_offset');
     });
   });
 
@@ -1211,11 +1410,11 @@ describe('queryRouteTool — additional coverage', () => {
       const input = queryRouteTool.input.parse({ route: 'electricity/retail-sales', length: 2 });
       const result = await queryRouteTool.handler(input, ctx);
 
-      expect(result.canvas_preview_note).toContain('Showing 2 of 113,460 rows');
+      expect(result.canvas_preview_note).toContain('Showing rows 1–2 of 113,460');
       expect(result.canvas_preview_note).toContain('stage: true');
-      // The canvas is already on — sending the caller after a server env var
-      // would name a change that fixes nothing.
-      expect(result.canvas_preview_note).not.toContain('CANVAS_PROVIDER_TYPE');
+      // The canvas is already on — calling staging unavailable would hide a
+      // lever one argument away.
+      expect(result.canvas_preview_note).not.toContain('unavailable on this deployment');
       expect((queryRouteTool.format!(result)[0] as { text: string }).text).toContain('stage: true');
     });
 
@@ -1232,7 +1431,9 @@ describe('queryRouteTool — additional coverage', () => {
 
       // stage: true is not the lever here — it is already set and there is
       // still nothing to register into.
-      expect(result.canvas_preview_note).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+      expect(result.canvas_preview_note).toContain(
+        'staging rows for SQL is unavailable on this deployment',
+      );
       expect(result.canvas_preview_note).not.toContain('stage: true');
       expect(result.dataset).toBeUndefined();
     });
@@ -1662,7 +1863,7 @@ describe('queryRouteTool — page size (#96)', () => {
     expect(sc).toMatchObject({ returned_count: 100, returnedCount: 100, next_offset: 100 });
     const note = sc.canvas_preview_note as string;
     expect(note).toBe(
-      'Showing 100 of 26,000 rows — enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full result for SQL, or page through with offset. Continue the inline page at next_offset 100.',
+      'Showing rows 1–100 of 26,000 — staging rows for SQL is unavailable on this deployment, so page through with offset. Continue the inline page at next_offset 100.',
     );
     expect(text).toContain(note);
     expect(text).toContain('**Next offset:** 100');
@@ -1743,7 +1944,7 @@ describe('queryRouteTool — page size (#96)', () => {
     expect(sc.next_offset).toBe(100);
 
     expect(sc.canvas_preview_note).toBe(
-      '500 rows staged as df_WIDE — call eia_dataframe_describe for its column names, then eia_dataframe_query to run SQL over it. Accumulation stopped at the EIA_CANVAS_MAX_ROWS cap (500), so the staged rows are 1–500 of 26,000. Narrow with filters, start, or end — or re-query with offset 500 — to reach the rest. Showing 100 of 26,000 rows inline. Continue the inline page at next_offset 100. Page the inline rows with stage left off — another stage: true call stages a new table.',
+      '500 rows staged as df_WIDE — call eia_dataframe_describe for its column names, then eia_dataframe_query to run SQL over it. Accumulation stopped at the staging row cap (500), so the staged rows are 1–500 of 26,000. Narrow with filters, start, or end — or re-query with offset 500 — to reach the rest. Showing rows 1–100 of 26,000 inline. Continue the inline page at next_offset 100. Page the inline rows with stage left off — another stage: true call stages a new table.',
     );
     expect(text).toContain(sc.canvas_preview_note as string);
   });

@@ -4,12 +4,16 @@
  * lifetime — EIA's taxonomy is stable between API releases and restarting the
  * server is the appropriate refresh mechanism. The Fuse.js index is built once
  * after the tree is populated, then grown with two further entry classes that
- * both carry a `filter_hint`: named series (`NAMED_SERIES_FACETS` — STEO and
- * SEDS series names), and facet values (fuel types, sectors, coal ranks, RTO
- * respondents, and the `series` and `product` values of the daily and weekly
- * petroleum and natural-gas routes) so natural-language queries naming a value
- * — "wind", "Henry Hub", "Electric Reliability Council of Texas" — resolve to
- * the route that exposes it.
+ * both carry a `filter_hint`: named series (`NAMED_SERIES_FACETS` — STEO, SEDS,
+ * and Monthly Energy Review series names), and facet values (fuel types,
+ * sectors, coal ranks, RTO respondents, and the `series` and `product` values
+ * of the daily and weekly petroleum and natural-gas routes) so natural-language
+ * queries naming a value — "wind", "Henry Hub", "Electric Reliability Council
+ * of Texas" — resolve to the route that exposes it. A leaf's route entry also
+ * carries its data-column aliases in `terms`, a search key of its own, so a
+ * query naming a measure ("nameplate capacity") reaches the route publishing it;
+ * a balancing-authority value carries its code and ISO/RTO acronyms there
+ * (`balancing-authorities.ts`), so "ERCOT" reaches `ERCO`.
  *
  * Completeness is tracked, not assumed. A node whose warm-time metadata fetch
  * failed is held as an incomplete stub — never classified as a leaf, listed by
@@ -31,19 +35,28 @@
  */
 
 import Fuse, { type IFuseOptions } from 'fuse.js';
+import { balancingAuthorityAcronyms } from './balancing-authorities.js';
 import type { Facet, RawFrequency, RawRouteNode, SearchIndexEntry } from './types.js';
 
 /**
  * Facets whose values are named series — descriptive phrases a caller searches
  * by ("Motor gasoline total consumption"), not opaque codes — and are indexed
- * whole although they run past `MAX_INDEXED_FACET_VALUES`. Each is fetched with
- * one `/facet/{facetId}` request by an index pass of its own, keyed here by that
- * pass's name, so a vocabulary that failed to land is named on its own in
- * `getIndexStatus().pendingPasses`.
+ * whole although they run past `MAX_INDEXED_FACET_VALUES`: STEO's and SEDS's
+ * `seriesId`, and the Monthly Energy Review's `msn` on `total-energy`. Each is
+ * fetched with one `/facet/{facetId}` request by an index pass of its own,
+ * keyed here by that pass's name, so a vocabulary that failed to land is named
+ * on its own in `getIndexStatus().pendingPasses`.
+ *
+ * `idTerm` also puts each series ID in the entry's `terms`, so the bare ID
+ * (`TETCBUS`) finds its series — in the description it sits past the start
+ * Fuse scores from, out of reach. Only MER sets it: STEO and SEDS IDs stay in
+ * the description alone, where a bare ID finds nothing (`MGTCB` answers with an
+ * MTBE stocks series).
  */
 export const NAMED_SERIES_FACETS = {
-  steo_series: { route: 'steo', facetId: 'seriesId', label: 'STEO' },
-  seds_series: { route: 'seds', facetId: 'seriesId', label: 'SEDS' },
+  steo_series: { route: 'steo', facetId: 'seriesId', label: 'STEO', idTerm: false },
+  seds_series: { route: 'seds', facetId: 'seriesId', label: 'SEDS', idTerm: false },
+  total_energy_series: { route: 'total-energy', facetId: 'msn', label: 'MER', idTerm: true },
 } as const;
 
 /** An index pass that fetches one named-series facet. */
@@ -170,8 +183,8 @@ const WHOLE_WARM_FACET_IDS = new Set(['series']);
  * above it are opaque-identifier dimensions (mine IDs, plant codes, `duoarea`
  * area codes) that nobody searches by name, and indexing them would swamp the
  * corpus. Two exceptions reach the index whole: the `NAMED_SERIES_FACETS`
- * allowlist (STEO's and SEDS's `seriesId`, each through its own pass), and the
- * warm-time `series` targets in `WHOLE_WARM_FACET_IDS`.
+ * allowlist (STEO's and SEDS's `seriesId` and MER's 984 `msn`, each through its
+ * own pass), and the warm-time `series` targets in `WHOLE_WARM_FACET_IDS`.
  */
 const MAX_INDEXED_FACET_VALUES = 200;
 
@@ -259,18 +272,40 @@ export function frequenciesOf(node: RawRouteNode): RawFrequency[] {
   return raw && typeof raw === 'object' ? Object.values(raw) : [];
 }
 
+/**
+ * The aliases EIA gives a leaf's data columns ("Nameplate Capacity" for
+ * `nameplate-capacity-mw`), whitespace-collapsed and deduplicated. Only the raw
+ * `alias` counts: a column without one contributes nothing, and neither does the
+ * `{ value: [] }` shape. Column IDs stay out — indexed in place of the missing
+ * aliases, `coal/consumption-and-quality`'s `stocks` made the off-target
+ * `stock options` a confident match (0.711). Measured on the live taxonomy, 19
+ * of 232 leaves carry any alias, all under `electricity/`.
+ */
+function columnAliasesOf(node: RawRouteNode): string[] {
+  const aliases = new Set<string>();
+  for (const meta of Object.values(node.data ?? {})) {
+    if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) continue;
+    const alias = normalizeDescription((meta as { alias?: string }).alias);
+    if (alias) aliases.add(alias);
+  }
+  return [...aliases];
+}
+
 /** Build search index entries from a flat node map. */
 function buildEntries(nodeMap: Map<string, RawRouteNode>): SearchIndexEntry[] {
   const entries: SearchIndexEntry[] = [];
   for (const [route, node] of nodeMap) {
     const parts = route.split('/');
     const category: string | undefined = parts.length > 1 ? parts[0] : undefined;
+    const isLeaf = isLeafNode(node);
+    const terms = isLeaf ? columnAliasesOf(node) : [];
     entries.push({
       route,
       name: node.name,
       description: node.description ?? '',
-      isLeaf: isLeafNode(node),
+      isLeaf,
       category,
+      ...(terms.length > 0 && { terms }),
     });
   }
   return entries;
@@ -286,6 +321,19 @@ function buildEntries(nodeMap: Map<string, RawRouteNode>): SearchIndexEntry[] {
  * `includeMatches` moves no score: it reports which keys a match landed in,
  * which `tokenizedScores` reads to count a term a facet value inherits from its
  * route once per route.
+ *
+ * `terms` holds short strings an entry is also searched by (data-column aliases,
+ * MER series IDs, balancing-authority codes and ISO/RTO acronyms). Fuse
+ * penalizes a match by how far into a field it starts
+ * (default `location` 0, `distance` 100), so text appended to `description`
+ * changes nothing — "Gross Generation" at the end of a description never
+ * reaches its route. As its own key, each string is scored from its own start.
+ * The weight is the measured trade: at 0.5 every alias query lands its route
+ * first; at 1.0 the off-target `stock options` turned confident (0.669) on the
+ * aliases of `electricity/electric-power-operational-data` ("Stocks of Fuel").
+ * Fuse multiplies together the score of every string that matched, so a route
+ * with many aliases answering one query (the 35 of
+ * `electricity/state-electricity-profiles/summary`) outscores a route with one.
  */
 const FUSE_OPTIONS: IFuseOptions<SearchIndexEntry> = {
   keys: [
@@ -293,6 +341,7 @@ const FUSE_OPTIONS: IFuseOptions<SearchIndexEntry> = {
     { name: 'description', weight: 1.5 },
     { name: 'route', weight: 1 },
     { name: 'category', weight: 0.5 },
+    { name: 'terms', weight: 0.5 },
   ],
   threshold: 0.4,
   includeScore: true,
@@ -564,7 +613,8 @@ function carriesTerm(entry: SearchIndexEntry, term: string): boolean {
     entry.name.toLowerCase().includes(term) ||
     entry.description.toLowerCase().includes(term) ||
     entry.route.toLowerCase().includes(term) ||
-    (entry.category?.toLowerCase().includes(term) ?? false)
+    (entry.category?.toLowerCase().includes(term) ?? false) ||
+    (entry.terms?.some((t) => t.toLowerCase().includes(term)) ?? false)
   );
 }
 
@@ -587,7 +637,7 @@ function carriesTerm(entry: SearchIndexEntry, term: string): boolean {
  *   and is always unmatched, which is what makes a query naming something absent
  *   fail the bar rather than score on the words it shares with the corpus.
  *   A document is an entry, except where a `filter_hint` entry matches only
- *   outside its own name: its description, route, and category carry text every
+ *   outside its own name and `terms`: its description, route, and category carry text every
  *   entry on its route shares (the route's title and path, or a series label),
  *   so all such matches on one route count as one document. Counted per entry, the series and products of the routes titled
  *   "Weekly …" made `weekly` look nearly as common as `oil` (1,924 entries
@@ -615,7 +665,8 @@ function tokenizedScores(cache: CacheState, terms: string[]): Map<number, number
       if (requireVerbatim && !carriesTerm(entry, term)) continue;
       hits.set(result.refIndex, result.score ?? 1);
       const inherited =
-        entry.filter_hint !== undefined && !result.matches?.some((m) => m.key === 'name');
+        entry.filter_hint !== undefined &&
+        !result.matches?.some((m) => m.key === 'name' || m.key === 'terms');
       documents.add(inherited ? `route\u0000${entry.route}` : `entry\u0000${result.refIndex}`);
     }
     return { hits, weight: Math.log((corpusSize + 1) / (documents.size + 1)) };
@@ -891,12 +942,19 @@ export function listVocabularyFacets(): Array<{
   return targets;
 }
 
-/** One entry per value of `facet`, each pointing back at `route` with a ready-to-use `filter_hint`. */
+/**
+ * One entry per value of `facet`, each pointing back at `route` with a
+ * ready-to-use `filter_hint`. A balancing-authority value also carries its code
+ * and ISO/RTO acronyms in `terms` (`['ERCO', 'ERCOT']`): the code sits at the
+ * end of the description, past where Fuse scores from, and no EIA text carries
+ * the acronym at all.
+ */
 function facetValueEntries(cache: CacheState, route: string, facet: Facet): SearchIndexEntry[] {
   const routeName = cache.nodeMap.get(route)?.name ?? route;
   const parts = route.split('/');
   const category = parts.length > 1 ? parts[0] : undefined;
   const dimension = facet.description || facet.id;
+  const acronyms = balancingAuthorityAcronyms(route, facet.id);
   return facet.values.map((value) => ({
     route,
     name: value.name,
@@ -904,6 +962,7 @@ function facetValueEntries(cache: CacheState, route: string, facet: Facet): Sear
     isLeaf: true,
     category,
     filter_hint: { [facet.id]: value.id },
+    ...(acronyms && { terms: [...new Set([value.id, ...(acronyms.get(value.id) ?? [])])] }),
   }));
 }
 
@@ -938,13 +997,15 @@ export function indexVocabularyFacet(route: string, facet: Facet): number {
 /**
  * Index the values of one `NAMED_SERIES_FACETS` facet, whatever their count.
  * Each value becomes an entry named for the series, pointing at the facet's
- * route with a `filter_hint` on its id. The id also leads the description, which
- * is what tells apart the SEDS pairs that share a name and differ only in unit
- * (`PACCB` in Billion Btu, `PACCP` in thousand barrels) — entries dedupe on route
- * + hint, so both stay. Returns how many entries were added.
+ * route with a `filter_hint` on its id. The id also follows the name in the
+ * description, which is what tells apart the series that share a name — SEDS
+ * pairs differing only in unit (`PACCB` in Billion Btu, `PACCP` in thousand
+ * barrels), and one MER pair — since entries dedupe on route + hint, so both
+ * stay. A facet marked `idTerm` carries the id in `terms` too. Returns how many
+ * entries were added.
  */
 export function indexNamedSeries(pass: NamedSeriesPass, values: Facet['values']): number {
-  const { route, facetId, label } = NAMED_SERIES_FACETS[pass];
+  const { route, facetId, label, idTerm } = NAMED_SERIES_FACETS[pass];
   return addEntriesToIndex(
     values.map((value) => ({
       route,
@@ -955,6 +1016,7 @@ export function indexNamedSeries(pass: NamedSeriesPass, values: Facet['values'])
       isLeaf: true,
       category: route,
       filter_hint: { [facetId]: value.id },
+      ...(idTerm && { terms: [value.id] }),
     })),
   );
 }

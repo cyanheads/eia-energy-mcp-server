@@ -18,10 +18,11 @@ export interface RouteEntry {
 export interface RawRouteNode {
   /**
    * Present on leaf nodes. Two shapes exist in the wild:
-   *   Standard: `{ colId: { alias: string, units: string }, ... }`
+   *   Standard: `{ colId: { alias?, units? }, ... }` — either key can be
+   *     absent, and some routes spell the unit key `unit`
    *   Value-array: `{ value: [] }` — time-series routes with a single unnamed column
    */
-  data?: Record<string, { alias: string; units: string } | unknown[]>;
+  data?: Record<string, { alias?: string; unit?: string; units?: string } | unknown[]>;
   defaultDateFormat?: string;
   defaultFrequency?: string;
   description?: string;
@@ -84,7 +85,10 @@ export interface RawFacetResponse {
 
 /** Normalized facet with all values populated. */
 export interface Facet {
-  /** True only when the upstream total proves every filterable value is cached. */
+  /**
+   * True only when the upstream total proves every filterable value is cached
+   * and the list is not one EIA publishes partial (`PARTIAL_FACET_LISTS`).
+   */
   complete?: boolean;
   description: string;
   /**
@@ -101,6 +105,14 @@ export interface Facet {
 export interface DataColumn {
   alias: string;
   id: string;
+  /**
+   * Set on the `value` column built from `{ value: [] }` metadata, which names
+   * no column. Its rows carry the unit in a route-level `units` or `unit`
+   * field rather than `value-units`; a column the metadata names, `value`
+   * included, carries any per-row unit in `{id}-units`.
+   */
+  synthesized?: true;
+  /** Empty when the metadata names no unit for the column. */
   units: string;
 }
 
@@ -207,14 +219,26 @@ export interface SearchIndexEntry {
   description: string;
   /**
    * Pre-built filter hint for routes that require a specific facet value to
-   * query. Present on named-series entries — STEO and SEDS, `{ seriesId }` —
-   * and facet-value entries (`{ <facetId>: <valueId> }`) so callers can pass
-   * it straight to eia_query_route without parsing the description string.
+   * query. Present on named-series entries — STEO and SEDS `{ seriesId }`, MER
+   * `{ msn }` — and facet-value entries (`{ <facetId>: <valueId> }`) so callers
+   * can pass it straight to eia_query_route without parsing the description
+   * string.
    */
   filter_hint?: Record<string, string>;
   isLeaf: boolean;
   name: string;
   route: string;
+  /**
+   * Short strings the entry is also searched by — the data-column aliases of a
+   * leaf's route entry ("Nameplate Capacity"), an MER series' `msn` ID, and a
+   * balancing-authority value's code and ISO/RTO acronyms (`ERCO`, `ERCOT`).
+   * Fuse scores each string on its own, so a match is not buried by the
+   * position penalty that a code or alias appended to `description` takes, and
+   * it is the entry's own match, never text inherited from its route. Absent
+   * when there is nothing to add. Search-only: `eia_search_routes` never
+   * returns it.
+   */
+  terms?: string[];
 }
 
 /**

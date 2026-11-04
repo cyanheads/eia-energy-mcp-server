@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
 import * as canvasBridge from '@/services/canvas-bridge/canvas-bridge.js';
@@ -277,7 +277,9 @@ describe('queryRouteTool', () => {
       // The note is the account of the gap the advisory duplicated — its
       // fixed "5000 rows" text also misdescribes a 3-row request.
       expect(result.canvas_preview_note).toContain('113,460');
-      expect(result.canvas_preview_note).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+      expect(result.canvas_preview_note).toContain(
+        'staging rows for SQL is unavailable on this deployment',
+      );
       expect((queryRouteTool.format!(result)[0] as { text: string }).text).not.toContain(
         '5000 rows in JSON format',
       );
@@ -409,10 +411,10 @@ describe('queryRouteTool', () => {
     expect(result.notice).toContain('Reduce offset');
     // The canvas-disabled advice must not fire on a past-the-end page.
     expect(result.canvas_preview_note).toBeUndefined();
-    expect(JSON.stringify(result)).not.toContain('CANVAS_PROVIDER_TYPE');
+    expect(JSON.stringify(result)).not.toContain('unavailable on this deployment');
   });
 
-  it('does not emit "enable DataCanvas" advice when a bridge is present', async () => {
+  it('does not emit the canvas-off advice when a bridge is present', async () => {
     // The gap has to be real and the rows have to reach the canvas, or the
     // branch under test is never taken: a row-less page is answered by the
     // notice above regardless of whether a bridge exists, so asserting the
@@ -445,7 +447,7 @@ describe('queryRouteTool', () => {
     const result = await queryRouteTool.handler(input, ctx);
 
     const rendered = (queryRouteTool.format!(result)[0] as { text: string }).text;
-    expect(rendered).not.toContain('CANVAS_PROVIDER_TYPE');
+    expect(rendered).not.toContain('unavailable on this deployment');
     expect(rendered).toContain('240 rows staged as df_STAGED');
   });
 
@@ -482,7 +484,148 @@ describe('queryRouteTool', () => {
     const result = await queryRouteTool.handler(input, ctx);
 
     expect(result.canvas_preview_note).toContain('5,000');
-    expect(result.canvas_preview_note).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+    expect(result.canvas_preview_note).toContain(
+      'staging rows for SQL is unavailable on this deployment',
+    );
+  });
+
+  // Agent-facing text describes staging by its behavior, not the server's configuration.
+  it('names no server setting in its field descriptions or error contract', () => {
+    const fields = [
+      ...Object.values(queryRouteTool.input.shape),
+      ...Object.values(queryRouteTool.output.shape),
+    ];
+    const texts = [
+      ...fields.map((field) => field.description ?? ''),
+      ...(queryRouteTool.errors ?? []).flatMap((entry) => [entry.when, entry.recovery]),
+    ];
+    expect(texts.join('\n')).toContain('staging row cap this server sets');
+    for (const text of texts) expect(text).not.toMatch(/CANVAS_PROVIDER_TYPE|EIA_CANVAS_MAX_ROWS/);
+  });
+
+  /**
+   * The notes a call returns name no server setting either: a caller cannot
+   * change one, and on the `.mcpb` bundle, which pins the canvas off, naming
+   * the setting that enables it is a recipe that cannot work. One case per
+   * canvas_preview_note branch, each pinned to its own wording so the branch
+   * under test is the one taken.
+   */
+  describe('runtime notes name no server setting', () => {
+    const rows = (count: number) =>
+      Array.from({ length: count }, (_, i) => ({ period: String(i), value: '1' }));
+    const bridgeAnswering = (outcome: Record<string, unknown>) =>
+      vi.mocked(canvasBridge.getCanvasBridge).mockReturnValue({
+        registerDataframe: vi.fn().mockResolvedValue(outcome),
+      } as unknown as ReturnType<typeof canvasBridge.getCanvasBridge>);
+    const registered = (rowCount: number) =>
+      bridgeAnswering({
+        status: 'registered',
+        tableName: 'df_STAGED',
+        rowCount,
+        expiresAt: new Date().toISOString(),
+        columnSchema: [],
+        renamedColumns: [],
+      });
+    const accumulated = (count: number, flags: { capped?: boolean; timedOut?: boolean } = {}) => ({
+      rows: rows(count),
+      capped: flags.capped ?? false,
+      cap: 25000,
+      ...(flags.timedOut && { timedOut: true }),
+    });
+
+    it.each([
+      {
+        branch: 'no canvas, rows remain',
+        setup: () => mockQuery.mockResolvedValue({ ...SAMPLE_DATA_RESPONSE, total: 240 }),
+        input: { length: 2 },
+        expected:
+          'Showing rows 1–2 of 240 — staging rows for SQL is unavailable on this deployment, so page through with offset. Continue the inline page at next_offset 2.',
+      },
+      {
+        branch: 'no canvas, the last page',
+        setup: () => mockQuery.mockResolvedValue({ ...SAMPLE_DATA_RESPONSE, total: 240 }),
+        input: { offset: 238, length: 2 },
+        expected:
+          'Showing rows 239–240 of 240, the last page — staging rows for SQL is unavailable on this deployment.',
+      },
+      {
+        branch: 'no canvas, stage: true',
+        setup: () => mockQuery.mockResolvedValue({ ...SAMPLE_DATA_RESPONSE, total: 240 }),
+        input: { length: 2, stage: true },
+        expected:
+          'Showing rows 1–2 of 240 — staging rows for SQL is unavailable on this deployment, so page through with offset. Continue the inline page at next_offset 2.',
+      },
+      {
+        branch: 'the cap reached',
+        setup: () => {
+          registered(25000);
+          mockQuery.mockResolvedValue({
+            ...SAMPLE_DATA_RESPONSE,
+            total: 113460,
+            accumulated: accumulated(25000, { capped: true }),
+          });
+        },
+        input: { length: 2, stage: true },
+        expected:
+          'Accumulation stopped at the staging row cap (25,000), so the staged rows are 1–25,000 of 113,460.',
+      },
+      {
+        branch: 'time ran out',
+        setup: () => {
+          registered(5100);
+          mockQuery.mockResolvedValue({
+            ...SAMPLE_DATA_RESPONSE,
+            total: 20000,
+            accumulated: accumulated(5100, { timedOut: true }),
+          });
+        },
+        input: { length: 2, stage: true },
+        expected: "Staging stopped when the call's time limit ran out",
+      },
+      {
+        branch: 'staging stopped short',
+        setup: () => {
+          registered(5100);
+          mockQuery.mockResolvedValue({
+            ...SAMPLE_DATA_RESPONSE,
+            total: 20000,
+            accumulated: accumulated(5100),
+          });
+        },
+        input: { length: 2, stage: true },
+        expected: 'Staging stopped before the end of the matching set',
+      },
+      {
+        branch: 'staging failed',
+        setup: () => {
+          bridgeAnswering({ status: 'failed', message: 'appender failed' });
+          mockQuery.mockResolvedValue({
+            ...SAMPLE_DATA_RESPONSE,
+            total: 240,
+            accumulated: accumulated(240),
+          });
+        },
+        input: { length: 2, stage: true },
+        expected: 'Staging failed, so no dataframe was created',
+      },
+    ])('on $branch, on both surfaces', async ({ setup, input, expected }) => {
+      setup();
+
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        ...input,
+      });
+
+      expect(result.isError).not.toBe(true);
+      const sc = result.structuredContent as { canvas_preview_note?: string };
+      const text = result.content.map((b) => ('text' in b ? b.text : '')).join('\n');
+      expect(sc.canvas_preview_note).toContain(expected);
+      expect(text).toContain(sc.canvas_preview_note as string);
+      expect(JSON.stringify(sc)).not.toMatch(/CANVAS_PROVIDER_TYPE|EIA_CANVAS_MAX_ROWS/);
+      expect(text).not.toMatch(/CANVAS_PROVIDER_TYPE|EIA_CANVAS_MAX_ROWS/);
+      // Nothing tells the caller to turn on what only the operator controls.
+      expect(sc.canvas_preview_note).not.toMatch(/\benable\b/i);
+    });
   });
 
   it('propagates rate_limited from service', async () => {

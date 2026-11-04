@@ -38,7 +38,11 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { WEAK_MATCH_SCORE } from '../src/mcp-server/tools/definitions/search-routes.tool.js';
-import { getEiaApiService, initEiaApiService } from '../src/services/eia/eia-service.js';
+import {
+  getEiaApiService,
+  initEiaApiService,
+  shutdownEiaApiService,
+} from '../src/services/eia/eia-service.js';
 import {
   getIndexEntries,
   getIndexStatus,
@@ -97,6 +101,11 @@ async function loadCorpus(corpus: string | undefined, snapshot: string | undefin
   console.log('Warming the EIA search corpus — 20–40 s on a healthy upstream…');
   const startedAt = Date.now();
   await getEiaApiService().search('warm', 1, createMockContext());
+  // Scoring reads the index directly, so the service has nothing left to do for
+  // this run. A warm that outlasted the search's wait keeps fetching in the
+  // background; shutting the service down ends it instead of leaving it to hold
+  // the process open.
+  shutdownEiaApiService();
   const status = getIndexStatus();
   console.log(
     `Corpus warmed in ${((Date.now() - startedAt) / 1000).toFixed(1)}s — ${status.size} entries, complete: ${status.complete}`,

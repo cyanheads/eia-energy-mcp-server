@@ -179,6 +179,67 @@ describe('searchRoutesTool — additional coverage', () => {
     expect('filter_hint' in (result.results[0] ?? {})).toBe(false);
   });
 
+  it("never returns an entry's search-only terms, on either surface (#97, #102, #103)", async () => {
+    mockSearch.mockResolvedValue({
+      results: [
+        {
+          entry: {
+            route: 'electricity/operating-generator-capacity',
+            name: 'Inventory of Operable Generators',
+            description: 'Inventory of operable generators in the U.S.',
+            isLeaf: true,
+            category: 'electricity',
+            terms: ['Nameplate Capacity', 'Net Summer Capacity'],
+          },
+          score: 0.09,
+        },
+        {
+          entry: {
+            route: 'total-energy',
+            name: 'Primary Energy Consumption Total in Trillion Btu',
+            description: 'MER series: Primary Energy Consumption Total in Trillion Btu (TETCBUS)',
+            isLeaf: true,
+            category: 'total-energy',
+            filter_hint: { msn: 'TETCBUS' },
+            terms: ['TETCBUS'],
+          },
+          score: 0.3,
+        },
+        {
+          entry: {
+            route: 'electricity/rto/region-data',
+            name: 'Electric Reliability Council of Texas, Inc.',
+            description:
+              'Balancing Authority / Region value of Hourly Demand, Demand Forecast, Generation, and Interchange (electricity/rto/region-data) — filter with respondent="ERCO".',
+            isLeaf: true,
+            category: 'electricity',
+            filter_hint: { respondent: 'ERCO' },
+            terms: ['ERCO', 'ERCOT'],
+          },
+          score: 0.4,
+        },
+      ],
+      hasMore: false,
+      status: settled(6443),
+    });
+
+    const result = await runToolContract(searchRoutesTool, { query: 'nameplate capacity' });
+    const { results } = result.structuredContent as { results: Array<Record<string, unknown>> };
+    expect(results.map((r) => Object.keys(r).sort())).toEqual([
+      ['description', 'isLeaf', 'name', 'route', 'score'],
+      ['description', 'filter_hint', 'isLeaf', 'name', 'route', 'score'],
+      ['description', 'filter_hint', 'isLeaf', 'name', 'route', 'score'],
+    ]);
+    const text = JSON.stringify(result.content);
+    expect(text).not.toContain('Nameplate Capacity');
+    expect(text).not.toContain('ERCOT');
+    expect(text).not.toContain('terms');
+    // The MER hit still carries its query-ready filter.
+    expect(text).toContain(
+      'eia_query_route(route=\\"total-energy\\", filters={\\"msn\\": \\"TETCBUS\\"})',
+    );
+  });
+
   // ------------------------------------------------------------------
   // format() — filter_hint and weak-match rendering
   // ------------------------------------------------------------------

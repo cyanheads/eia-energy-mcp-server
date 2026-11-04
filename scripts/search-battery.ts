@@ -37,7 +37,10 @@ export interface BatteryQuery {
  * SEDS series, which a candidate-gate change must leave standing. Then come the
  * four benchmarks the warm-time `series`, `product`, and `respondent` targets
  * index, and a route named by the title words those targets' entries repeat
- * (#78).
+ * (#78). The last eight reach their route only through what the route-tree text
+ * leaves out: three measures named by a data column's alias (#97), a Monthly
+ * Energy Review series by name and by ID (#103), and two balancing authorities
+ * by the ISO/RTO acronym no EIA text carries (#102).
  */
 export const ON_TARGET: readonly BatteryQuery[] = [
   {
@@ -139,6 +142,46 @@ export const ON_TARGET: readonly BatteryQuery[] = [
     query: 'weekly crude oil stocks',
     route: 'petroleum/stoc/wstk',
     note: 'A route named by its title words ("Weekly Stocks"). Every series and product of a weekly route repeats its title, so `weekly` reads as common unless that inherited text counts once per route (#78).',
+  },
+  {
+    query: 'nameplate capacity',
+    route: 'electricity/operating-generator-capacity',
+    note: 'A measure named only by a data column\'s alias ("Nameplate Capacity"); the route\'s name and description never say it (#97).',
+  },
+  {
+    query: 'gross generation',
+    route: 'electricity/facility-fuel',
+    note: 'A data-column alias ("Gross Generation") that a SEDS capacity-factor series out-read before aliases were indexed (#97).',
+  },
+  {
+    query: 'number of ultimate customers',
+    route: 'electricity/retail-sales',
+    note: 'A data-column alias ("Number of Ultimate Customers"); STEO customer-count series read like it too (#97).',
+  },
+  {
+    query: 'primary energy consumption total',
+    route: 'total-energy',
+    note: 'A Monthly Energy Review series name (TETCBUS), reachable only through the total-energy msn pass; SEDS annual state series compete for it (#103).',
+  },
+  {
+    query: 'total primary energy consumption monthly',
+    route: 'total-energy',
+    note: 'The national monthly question SEDS TENEB answered before MER series were indexed (#103).',
+  },
+  {
+    query: 'TETCBUS',
+    route: 'total-energy',
+    note: 'An MER series ID, which no entry text puts within reach of the phrase path (#103).',
+  },
+  {
+    query: 'ERCOT',
+    route: 'electricity/rto/region-data',
+    note: 'An ISO acronym (respondent ERCO) that no EIA text carries; "PJM Interconnection" answered it before balancing-authority values carried their acronyms (#102). The four RTO leaves tie, so the expected route ranks fourth.',
+  },
+  {
+    query: 'SPP',
+    route: 'electricity/rto/region-data',
+    note: 'An RTO acronym naming two balancing authorities (SWPP, SWPW); a retail-sales sector value answered it before (#102). SWPP leads on all four RTO leaves, then SWPW, so the expected route ranks fourth.',
   },
 ];
 

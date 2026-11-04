@@ -380,6 +380,466 @@ describe('cached facet diagnostics (#81)', () => {
   });
 });
 
+// ------------------------------------------------------------------
+// #100 — EIA's `international` productId, activityId, and unit lists look whole
+// (`totalFacets` equals their length) but hold only the monthly and quarterly
+// vocabulary, while annual rows carry IDs they omit. Those lists never feed the
+// unmatched-value notice, describe says they are partial, and on any route a
+// value a returned row carries is never reported unmatched. The fixtures are
+// EIA's own answers: route metadata, facet lists, and annual 2023 rows.
+// ------------------------------------------------------------------
+
+describe('cached facet diagnostics — lists EIA publishes partial, and returned rows (#100)', () => {
+  const INTL = 'international';
+
+  const listOf = (facets: Array<{ id: string | null; name: string | null }>) => ({
+    response: { totalFacets: facets.length, facets },
+  });
+  const named = (pairs: Array<[string, string]>) => pairs.map(([id, name]) => ({ id, name }));
+
+  const INTL_BODIES = {
+    [INTL]: {
+      response: {
+        id: 'international',
+        name: 'International',
+        description:
+          'Country level production, consumption, imports, exports by energy source (petroleum, natural gas, electricity, renewable, etc.)',
+        frequency: [
+          {
+            id: 'monthly',
+            description: 'One data point for each month.',
+            query: 'M',
+            format: 'YYYY-MM',
+          },
+          {
+            id: 'quarterly',
+            description: 'One data point every 3 months.',
+            query: 'Q',
+            format: 'YYYY-"Q"Q',
+          },
+          {
+            id: 'annual',
+            description: 'One data point for each calendar year.',
+            query: 'A',
+            format: 'YYYY',
+          },
+        ],
+        facets: [
+          { id: 'productId', description: 'Product' },
+          { id: 'activityId', description: 'Activity' },
+          { id: 'countryRegionId', description: 'Country/Region' },
+          { id: 'countryRegionTypeId', description: 'Country/Region Type' },
+          { id: 'dataFlagId', description: 'Data flag ID' },
+          { id: 'unit', description: 'Unit' },
+        ],
+        data: { value: [] },
+        startPeriod: '1949-01',
+        endPeriod: '2026-07',
+        defaultDateFormat: 'YYYY-MM',
+        defaultFrequency: 'monthly',
+      },
+    },
+    [`${INTL}/facet/productId`]: listOf(
+      named([
+        ['5', 'Petroleum and other liquids'],
+        ['53', 'Total petroleum and other liquids'],
+        ['54', 'Refined petroleum products'],
+        ['55', 'Crude oil, NGPL, and other liquids'],
+        ['56', 'Refinery processing gain'],
+        ['57', 'Crude oil including lease condensate'],
+        ['58', 'NGPL'],
+        ['59', 'Other liquids'],
+        ['78', 'OECD imports'],
+        ['781', 'OECD Europe imports, by source'],
+        ['782', 'France imports, by source'],
+        ['783', 'Germany imports, by source'],
+        ['784', 'Italy imports, by source'],
+        ['785', 'Japan imports, by source'],
+        ['786', 'South Korea imports, by source'],
+        ['787', 'U.S. imports, by source'],
+        ['788', 'Canada imports, by source'],
+        ['789', 'United Kingdom imports, by source'],
+      ]),
+    ),
+    [`${INTL}/facet/activityId`]: listOf(
+      named([
+        ['1', 'Production'],
+        ['2', 'Consumption'],
+        ['3', 'Imports'],
+        ['5', 'Stocks, OECD'],
+      ]),
+    ),
+    // EIA lists 268 countries and regions; three keep the list whole here.
+    [`${INTL}/facet/countryRegionId`]: listOf(
+      named([
+        ['USA', 'United States'],
+        ['CHN', 'China'],
+        ['FRA', 'France'],
+      ]),
+    ),
+    [`${INTL}/facet/countryRegionTypeId`]: listOf(
+      named([
+        ['c', 'Country'],
+        ['r', 'Region'],
+      ]),
+    ),
+    // Whole, but with one null ID — complete: false for a reason of its own.
+    [`${INTL}/facet/dataFlagId`]: listOf([
+      ...named([
+        ['1', 'Data are unavailable (permanently)'],
+        ['2', 'Data are unavailable (temporarily)'],
+        ['3', 'The country does not exist during a given statistical time period'],
+        ['4', 'Data are included elsewhere for this time period'],
+        ['5', 'A value exists, but rounds to zero; non-rounded values appear when downloaded'],
+        ['6', 'A value exists, but cannot be published'],
+        ['10', 'Values derived using STEO estimation methodology. Appears as a superscript.'],
+        ['11', 'Data row has been initialized'],
+      ]),
+      { id: null, name: null },
+    ]),
+    [`${INTL}/facet/unit`]: listOf(
+      named([
+        ['MBBL', 'millions barrels'],
+        ['MT', '1000 metric tons'],
+        ['TBPD', 'thousand barrels per day'],
+      ]),
+    ),
+  };
+
+  /** EIA's annual 2023 electricity generation rows for China and the United States. */
+  const generationRow = (countryRegionId: string, countryRegionName: string, value: string) => ({
+    period: '2023',
+    productId: '2',
+    productName: 'Electricity',
+    activityId: '12',
+    activityName: 'Generation',
+    countryRegionId,
+    countryRegionName,
+    countryRegionTypeId: 'c',
+    countryRegionTypeName: 'Country',
+    dataFlagId: null,
+    dataFlagDescription: null,
+    unitName: 'billion kilowatthours',
+    value,
+    unit: 'BKWH',
+  });
+  const GENERATION = {
+    response: {
+      total: '2',
+      frequency: 'annual',
+      dateFormat: 'YYYY',
+      data: [
+        generationRow('CHN', 'China', '9483.2013949'),
+        generationRow('USA', 'United States', '4256.67683208'),
+      ],
+    },
+  };
+
+  const ZZZ =
+    'Filter countryRegionId value "ZZZ" is not in the complete cached vocabulary. The submitted filter was preserved.';
+  const PARTIAL =
+    'EIA lists only part of the values of productId, activityId, unit: the lists hold the IDs of the monthly and quarterly series, and rows at other frequencies can carry IDs they omit. An ID missing from them still filters eia_query_route; a query without that filter returns the IDs rows carry, each beside its label in productName, activityName, unitName.';
+  const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+    result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    _resetServerConfig();
+    _resetEiaApiService();
+    _resetRouteCache();
+    initEiaApiService();
+    seedRouteCache();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    _resetEiaApiService();
+    _resetRouteCache();
+    _resetServerConfig();
+  });
+
+  it('keeps the complete-list notice for a missing country beside product and activity IDs the partial lists omit', async () => {
+    const { paths } = stubApiPaths({ ...INTL_BODIES, [`${INTL}/data`]: GENERATION });
+    await runToolContract(describeRouteTool, { route: INTL });
+    paths.length = 0;
+
+    const result = await runToolContract(queryRouteTool, {
+      route: INTL,
+      filters: { productId: '2', activityId: '12', countryRegionId: ['USA', 'CHN', 'ZZZ'] },
+      frequency: 'annual',
+      columns: ['value'],
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ total: 2, notice: ZZZ });
+    expect(textOf(result)).toContain(`> ${ZZZ}`);
+    expect(textOf(result)).not.toContain('Filter productId');
+    expect(textOf(result)).not.toContain('Filter activityId');
+    // The diagnosis reads only what describe cached.
+    expect(paths).toEqual([`${INTL}/data`]);
+  });
+
+  it('draws no notice for an ID a partial list omits, even when no row carries it', async () => {
+    stubApiPaths({
+      ...INTL_BODIES,
+      [`${INTL}/data`]: { response: { total: '0', frequency: 'annual', data: [] } },
+    });
+    await runToolContract(describeRouteTool, { route: INTL });
+
+    const result = await runToolContract(queryRouteTool, {
+      route: INTL,
+      filters: { productId: '2', unit: 'BKWH', countryRegionId: 'ZZZ' },
+      frequency: 'annual',
+      columns: ['value'],
+    });
+
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice.endsWith(ZZZ)).toBe(true);
+    expect(notice).not.toContain('productId');
+    expect(notice).not.toContain('"BKWH"');
+    expect(textOf(result)).toContain(ZZZ);
+    expect(textOf(result)).not.toContain('Filter unit');
+  });
+
+  it('names the partial lists in the describe notice on both surfaces, and no list that is merely incomplete', async () => {
+    stubApiPaths(INTL_BODIES);
+
+    const result = await runToolContract(describeRouteTool, { route: INTL });
+
+    expect(result.isError).not.toBe(true);
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain(PARTIAL);
+    expect(textOf(result)).toContain(PARTIAL);
+    // dataFlagId carries a null ID, so it is not complete either — but EIA lists it whole.
+    expect(notice).not.toContain('dataFlagId');
+    expect(notice).not.toContain('countryRegion');
+    // The lists themselves are served as EIA sent them.
+    expect(result.structuredContent).toMatchObject({
+      facets: expect.arrayContaining([
+        expect.objectContaining({ id: 'productId', value_count: 18 }),
+        expect.objectContaining({ id: 'unit', value_count: 3 }),
+      ]),
+    });
+  });
+
+  it('never names a value a returned row carries under that facet, on a complete list', async () => {
+    stubApiPaths({
+      [LEAF]: {
+        response: {
+          id: 'retail-sales',
+          facets: [
+            { id: 'stateid', description: 'State' },
+            { id: 'sectorid', description: 'Sector' },
+          ],
+          data: { price: { alias: 'Price', units: 'cents' } },
+        },
+      },
+      [`${LEAF}/facet/stateid`]: {
+        response: {
+          totalFacets: 2,
+          facets: named([
+            ['TX', 'Texas'],
+            ['CA', 'California'],
+          ]),
+        },
+      },
+      [`${LEAF}/facet/sectorid`]: {
+        response: { totalFacets: 1, facets: named([['RES', 'residential']]) },
+      },
+      // EIA returned US rows the cached list does not name; ZZ under another
+      // facet's field proves nothing about stateid.
+      [`${LEAF}/data`]: {
+        response: {
+          total: '2',
+          frequency: 'annual',
+          dateFormat: 'YYYY',
+          data: [
+            { period: '2024', stateid: 'US', sectorid: 'ZZ', price: '12' },
+            { period: '2024', stateid: 'TX', sectorid: 'RES', price: '10' },
+          ],
+        },
+      },
+    });
+    await getEiaApiService().describe(LEAF, createMockContext());
+
+    const result = await runToolContract(queryRouteTool, {
+      route: LEAF,
+      filters: { stateid: ['TX', 'US', 'ZZ', 'us'] },
+      columns: ['price'],
+    });
+
+    const expected =
+      'Filter stateid values "ZZ", "us" are not in the complete cached vocabulary. The submitted filter was preserved.';
+    expect(result.structuredContent).toMatchObject({ notice: expected });
+    expect(textOf(result)).toContain(`> ${expected}`);
+  });
+});
+
+// ------------------------------------------------------------------
+// #98 — a data column whose route metadata names no unit: a named column
+// without a `units` key, or the `value` column synthesized from `{ value: [] }`.
+// The `data` objects are EIA's own; facets are left out of the fixtures.
+// ------------------------------------------------------------------
+
+describe('EiaApiService.describe — data columns the metadata gives no unit (#98)', () => {
+  const UNITLESS_NAMED =
+    'Data columns total-consumption, consumption-for-eg, average-heat-content have no unit in the route metadata. Where an eia_query_route row carries a unit for one of them, it is in total-consumption-units, consumption-for-eg-units, average-heat-content-units, and it can differ by row; a column whose rows carry no such field has no unit.';
+  const UNITLESS_VALUE =
+    'Data column value has no unit in the route metadata; each eia_query_route row carries the unit, which can differ by row, in a field named units or unit.';
+  /** Dates, a county, and coordinates: their rows carry no `{col}-units` field at all. */
+  const UNITLESS_DESCRIPTORS =
+    'Data columns operating-year-month, planned-retirement-year-month, planned-derate-year-month, planned-uprate-year-month, county, longitude, latitude have no unit in the route metadata. Where an eia_query_route row carries a unit for one of them, it is in operating-year-month-units, planned-retirement-year-month-units, planned-derate-year-month-units, planned-uprate-year-month-units, county-units, longitude-units, latitude-units, and it can differ by row; a column whose rows carry no such field has no unit.';
+
+  const ROUTES = {
+    'electricity/facility-fuel': {
+      defaultFrequency: 'monthly',
+      data: {
+        generation: { alias: 'Net Generation', units: 'megawatthours' },
+        'gross-generation': { alias: 'Gross Generation', units: 'megawatthours' },
+        'total-consumption': {
+          alias:
+            'Consumption of Fuels for Electricity Generation and Useful Thermal Output (Physical Units)',
+        },
+        'total-consumption-btu': {
+          alias: 'Consumption of Fuels for Electricity Generation and Useful Thermal Output (BTUs)',
+          units: 'MMBtu',
+        },
+        'consumption-for-eg': {
+          alias: 'Consumption of Fuels for Electricity Generation (Physical Units)',
+        },
+        'consumption-for-eg-btu': {
+          alias: 'Consumption of Fuels for Electricity Generation (BTUs)',
+          units: 'MMBtu',
+        },
+        'average-heat-content': { alias: 'Average Heat Content of Consumed Fuels' },
+      },
+    },
+    'electricity/operating-generator-capacity': {
+      defaultFrequency: 'monthly',
+      data: {
+        'nameplate-capacity-mw': { alias: 'Nameplate Capacity', units: 'MW' },
+        'net-summer-capacity-mw': { alias: 'Net Summer Capacity', units: 'MW' },
+        'net-winter-capacity-mw': { alias: 'Net Winter Capacity', units: 'MW' },
+        'operating-year-month': { alias: 'Operating Date (Year and Month)' },
+        'planned-retirement-year-month': { alias: 'Planned Retirement Date (Year and Month)' },
+        'planned-derate-year-month': { alias: 'Planned Derate Date (Year and Month)' },
+        'planned-derate-summer-cap-mw': {
+          alias: 'Magnitude of Planned Derate (Summer Capacity)',
+          units: 'MW',
+        },
+        'planned-uprate-year-month': { alias: 'Planned Uprate Date (Year and Month)' },
+        'planned-uprate-summer-cap-mw': {
+          alias: 'Magnitude of Planned Uprate (Summer Capacity)',
+          units: 'MW',
+        },
+        county: { alias: 'County' },
+        longitude: { alias: 'Longitude' },
+        latitude: { alias: 'Latitude' },
+      },
+    },
+    steo: { defaultFrequency: 'monthly', data: { value: [] } },
+    'petroleum/pri/spt': { defaultFrequency: 'weekly', data: { value: [] } },
+    'crude-oil-imports': {
+      defaultFrequency: 'monthly',
+      data: { quantity: { units: 'thousand barrels' } },
+    },
+    'co2-emissions/co2-emissions-aggregates': {
+      defaultFrequency: 'annual',
+      data: { value: { units: 'million metric tons of CO2' } },
+    },
+    // The metadata spells the key `unit`, and the rows carry no `inventory-units`.
+    'densified-biomass/inventories-by-region': {
+      defaultFrequency: 'monthly',
+      data: { inventory: { unit: 'tons' } },
+    },
+  } as const;
+
+  function stubRoute(route: keyof typeof ROUTES) {
+    const { defaultFrequency, data } = ROUTES[route];
+    return stubApiPaths({
+      [route]: { response: { id: route.split('/').at(-1), facets: [], data, defaultFrequency } },
+    });
+  }
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    _resetServerConfig();
+    _resetEiaApiService();
+    _resetRouteCache();
+    initEiaApiService();
+    seedRouteCache();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    _resetEiaApiService();
+    _resetRouteCache();
+    _resetServerConfig();
+  });
+
+  it('marks only the column it synthesizes, not a named column called value', async () => {
+    stubRoute('steo');
+    const steo = await getEiaApiService().describe('steo', createMockContext());
+    stubRoute('co2-emissions/co2-emissions-aggregates');
+    const co2 = await getEiaApiService().describe(
+      'co2-emissions/co2-emissions-aggregates',
+      createMockContext(),
+    );
+
+    expect(steo.dataColumns).toEqual([
+      { id: 'value', alias: 'Value', units: '', synthesized: true },
+    ]);
+    expect(co2.dataColumns).toEqual([
+      { id: 'value', alias: 'value', units: 'million metric tons of CO2' },
+    ]);
+  });
+
+  it('reads a unit the metadata writes under a singular unit key', async () => {
+    stubRoute('densified-biomass/inventories-by-region');
+    const meta = await getEiaApiService().describe(
+      'densified-biomass/inventories-by-region',
+      createMockContext(),
+    );
+
+    expect(meta.dataColumns).toEqual([{ id: 'inventory', alias: 'inventory', units: 'tons' }]);
+  });
+
+  it.each([
+    ['electricity/facility-fuel', UNITLESS_NAMED],
+    ['electricity/operating-generator-capacity', UNITLESS_DESCRIPTORS],
+    ['steo', UNITLESS_VALUE],
+    ['petroleum/pri/spt', UNITLESS_VALUE],
+  ] as const)(
+    'on %s names the row field a unit is in, on both surfaces, with no added request',
+    async (route, expected) => {
+      const { paths } = stubRoute(route);
+
+      const result = await runToolContract(describeRouteTool, { route });
+
+      expect(result.isError).not.toBe(true);
+      expect((result.structuredContent as { notice: string }).notice).toContain(expected);
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text).toContain(expected);
+      expect(paths).toEqual([route]);
+    },
+  );
+
+  it.each([
+    'crude-oil-imports',
+    'co2-emissions/co2-emissions-aggregates',
+    'densified-biomass/inventories-by-region',
+  ] as const)('on %s, whose every column names its unit, adds no unit notice', async (route) => {
+    stubRoute(route);
+
+    const result = await runToolContract(describeRouteTool, { route });
+
+    expect(result.isError).not.toBe(true);
+    expect((result.structuredContent as { notice: string }).notice).not.toMatch(/no unit/);
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).not.toMatch(/no unit/);
+  });
+});
+
 describe('EiaApiService.query', () => {
   beforeEach(() => {
     vi.stubEnv('EIA_API_KEY', 'test-key');
@@ -954,6 +1414,26 @@ describe('EiaApiService.query', () => {
         ['hourly', 'end', { start: '2024-02-01T20', end: '2024-02-01T24' }, 'hour 24'],
         ['daily', 'end', { start: '2024-02-25', end: '2024-02-30' }, 'day 30'],
         ['weekly', 'start', { start: '2023-02-29' }, 'day 29, but 2023-02 has 28 days'],
+        /**
+         * #101 — shapes EIA reads leniently: each selected another period than
+         * it names (or none), or drew HTTP 500 for an hour that is not two digits.
+         */
+        ['monthly', 'start', { start: '2024-13' }, 'month 13, but months run 01–12'],
+        ['monthly', 'end', { start: '2024-01', end: '2024-13' }, 'month 13'],
+        ['monthly', 'start', { start: '2024-02-31' }, 'day 31, but 2024-02 has 29 days'],
+        ['monthly', 'start', { start: '2024-01-31T24' }, 'hour 24'],
+        [
+          'monthly',
+          'start',
+          { start: '2024-01-31T5' },
+          'hour 5, but the hour is two digits, 00–23',
+        ],
+        ['quarterly', 'start', { start: '2024-03-32' }, 'day 32, but 2024-03 has 31 days'],
+        ['annual', 'end', { start: '2023', end: '2024-00' }, 'month 00'],
+        ['daily', 'start', { start: '2024-02-01T24' }, 'hour 24'],
+        ['hourly', 'start', { start: '2024-02-30' }, 'day 30'],
+        ['hourly', 'start', { start: '2024-02-01T24+00' }, 'hour 24'],
+        ['hourly', 'end', { start: '2024-02-01T00+00', end: '2024-02-01T5+00' }, 'hour 5'],
       ])(
         'fails %s %s as invalid_period with no request or timer',
         async (frequency, side, bounds, problem) => {
@@ -969,7 +1449,7 @@ describe('EiaApiService.query', () => {
           ).rejects.toMatchObject({
             code: JsonRpcErrorCode.ValidationError,
             message: expect.stringContaining(
-              `At ${frequency} frequency EIA cannot read ${side} ${JSON.stringify(bounds[side])}: it has ${problem}`,
+              `At ${frequency} frequency EIA would not read ${side} ${JSON.stringify(bounds[side])} as written: it has ${problem}`,
             ),
             data: {
               reason: 'invalid_period',
@@ -985,10 +1465,12 @@ describe('EiaApiService.query', () => {
         ['daily', '2024-02-29', '2024-03-05'],
         ['hourly', '2024-02-01T23', '2024-02-02T02'],
         ['local-hourly', '2024-02-01T05-99', '2024-02-02T02-06'],
-        // Shapes EIA reads leniently at these frequencies, answering with rows.
-        ['monthly', '2024-13', '2025-06'],
-        ['hourly', '2024-02-30', '2024-03-02T02'],
-        ['daily', '2024-02-01T24', '2024-03-05'],
+        ['hourly', '2024-02-01T05-99', '2024-02-02T02'],
+        // A day or hour EIA rolls over within the period the bound names.
+        ['monthly', '2024-01-15T99', '2024-06'],
+        ['monthly', '2024-01-01T24', '2024-06'],
+        ['quarterly', '2024-02-30', '2024-Q4'],
+        ['annual', '2024-02-30', '2025'],
       ])('sends a %s start of %s to EIA unchanged', async (frequency, start, end) => {
         const urls: URL[] = [];
         const { fetchMock } = stubDataEndpoint({ total: 1 });
@@ -1067,6 +1549,117 @@ describe('EiaApiService.query', () => {
         expect(fetchMock).not.toHaveBeenCalled();
       });
 
+      // #101 — the lenient shapes are judged at the cached default too.
+      it.each([
+        ['monthly', '2024-01-31T24', true],
+        ['quarterly', '2024-03-32', true],
+        ['quarterly', '2024-02-30', false],
+        ['monthly', '2024-01-15T99', false],
+      ])(
+        "judges start %s %s against the warmed node's default (refused: %s)",
+        async (defaultFrequency, start, refused) => {
+          const route = 'electricity/retail-default';
+          initRouteCache(
+            [
+              {
+                id: 'electricity',
+                name: 'Electricity',
+                routes: [
+                  {
+                    id: 'retail-default',
+                    name: 'Retail default',
+                    defaultFrequency,
+                    frequency: [
+                      { id: defaultFrequency, description: 'Default', query: 'X', format: 'YYYY' },
+                    ],
+                    facets: [],
+                    data: { price: { alias: 'Price', units: 'cents' } },
+                  },
+                ],
+              },
+            ],
+            [],
+          );
+          const { fetchMock } = stubDataEndpoint({ total: 1 });
+          const call = getEiaApiService().query(route, { start }, createMockContext());
+
+          if (refused) {
+            await expect(call).rejects.toMatchObject({
+              message: expect.stringContaining(`At ${defaultFrequency} frequency`),
+              data: { reason: 'invalid_period' },
+            });
+            expect(fetchMock).not.toHaveBeenCalled();
+          } else {
+            await call;
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+          }
+        },
+      );
+
+      /**
+       * With no frequency known — LEAF's seeded node names no default and no
+       * metadata is cached — a month or hour no frequency reads is still
+       * refused; a rolled day or hour, which depends on the frequency, is left
+       * to EIA.
+       */
+      it.each<['start' | 'end', { start?: string; end?: string }, string]>([
+        ['start', { start: '2024-13' }, 'month 13, but months run 01–12'],
+        ['end', { start: '2024-01', end: '2024-00' }, 'month 00, but months run 01–12'],
+        ['start', { start: '2024-01-31T5' }, 'hour 5, but the hour is two digits, 00–23'],
+        ['end', { end: '2024-02-01T005+00' }, 'hour 005, but the hour is two digits, 00–23'],
+      ])(
+        'refuses %s %j with no frequency known, before any request',
+        async (side, bounds, problem) => {
+          vi.useFakeTimers();
+          const { fetchMock } = stubDataEndpoint({ total: 1 });
+
+          await expect(
+            getEiaApiService().query(LEAF, { columns: ['price'], ...bounds }, createMockContext()),
+          ).rejects.toMatchObject({
+            code: JsonRpcErrorCode.ValidationError,
+            message: `EIA would not read ${side} ${JSON.stringify(bounds[side])} as written at any frequency: it has ${problem}.`,
+            data: {
+              reason: 'invalid_period',
+              recovery: { hint: expect.stringContaining('February 29 only in leap years') },
+            },
+          });
+          expect(fetchMock).not.toHaveBeenCalled();
+          expect(vi.getTimerCount()).toBe(0);
+        },
+      );
+
+      it.each(['2024-02-31', '2024-01-31T24', '2024-02-30T05', '2024-02-29', '2024-02-01T05-99'])(
+        'sends a start of %s to EIA unchanged with no frequency known',
+        async (start) => {
+          const urls: URL[] = [];
+          const { fetchMock } = stubDataEndpoint({ total: 1 });
+          const answer = fetchMock.getMockImplementation()!;
+          fetchMock.mockImplementation(async (input: string | URL) => {
+            urls.push(new URL(String(input)));
+            return answer(input);
+          });
+
+          await getEiaApiService().query(LEAF, { columns: ['price'], start }, createMockContext());
+          expect(urls).toHaveLength(1);
+          expect(urls[0]?.searchParams.get('start')).toBe(start);
+          expect(urls[0]?.searchParams.has('frequency')).toBe(false);
+        },
+      );
+
+      it('refuses a month no frequency reads before the warm starts on a cold server', async () => {
+        _resetRouteCache();
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+
+        await expect(
+          getEiaApiService().query(
+            'electricity/uncached',
+            { start: '2024-13' },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({ data: { reason: 'invalid_period' } });
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
       it('fails through eia_query_route naming the bound and the valid range on both surfaces', async () => {
         const { fetchMock } = stubDataEndpoint({ total: 1 });
         const result = await runToolContract(queryRouteTool, {
@@ -1087,10 +1680,47 @@ describe('EiaApiService.query', () => {
         });
         const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
         expect(text).toContain(
-          'At hourly frequency EIA cannot read start "2024-02-01T24": it has hour 24, but the hour is two digits, 00–23.',
+          'At hourly frequency EIA would not read start "2024-02-01T24" as written: it has hour 24, but the hour is two digits, 00–23.',
         );
         expect(text).toContain('February 29 only in leap years');
         expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      // #101 — a leniently read shape is refused through the tool; one rolling within its period answers.
+      it('refuses a rollover out of its period through eia_query_route on both surfaces', async () => {
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+        const result = await runToolContract(queryRouteTool, {
+          route: LEAF,
+          frequency: 'monthly',
+          start: '2024-02-31',
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            message:
+              'At monthly frequency EIA would not read start "2024-02-31" as written: it has day 31, but 2024-02 has 29 days.',
+            data: {
+              reason: 'invalid_period',
+              recovery: { hint: expect.stringContaining('01–12') },
+            },
+          },
+        });
+        const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+        expect(text).toContain('it has day 31, but 2024-02 has 29 days.');
+        expect(text).toContain('reason invalid_period');
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('answers a rollover within its period through eia_query_route', async () => {
+        const { fetchMock } = stubDataEndpoint({ total: 1 });
+        const result = await runToolContract(queryRouteTool, {
+          route: LEAF,
+          frequency: 'quarterly',
+          start: '2024-02-30',
+        });
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({ total: 1, returned_count: 1 });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
       });
     });
 
@@ -2777,6 +3407,7 @@ describe('EiaApiService — facet values in the search index', () => {
       },
       'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
       'electricity/electric-power-operational-data/facet/fueltypeid': {
         response: {
           totalFacets: 2,
@@ -2836,6 +3467,7 @@ describe('EiaApiService — facet values in the search index', () => {
       },
       'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
       'coal/consumption-and-quality/facet/sector': {
         response: { totalFacets: 1, facets: [{ id: 'IND', name: 'industrial' }] },
       },
@@ -3155,6 +3787,7 @@ describe('EiaApiService — a route the warm could not fetch', () => {
       },
       'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
     };
   }
 
@@ -3353,6 +3986,7 @@ describe('EiaApiService — tree-build pacing under recursive fan-out', () => {
     const bodies: Record<string, unknown> = {
       'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
     };
     const stub = (id: string) => ({ id, name: id });
 
@@ -3467,6 +4101,7 @@ describe('EiaApiService — the search wait is bounded', () => {
       },
       'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
     };
     vi.stubGlobal(
       'fetch',
@@ -3995,6 +4630,12 @@ function warmBodies(): Record<string, unknown> {
         facets: [{ id: 'MGTCB', name: 'Motor gasoline total consumption' }],
       },
     },
+    'total-energy/facet/msn': {
+      response: {
+        totalFacets: 1,
+        facets: [{ id: 'TETCBUS', name: 'Primary Energy Consumption Total in Trillion Btu' }],
+      },
+    },
     'electricity/retail-sales/facet/sectorid': {
       response: { totalFacets: 1, facets: [{ id: 'RES', name: 'residential' }] },
     },
@@ -4129,6 +4770,7 @@ describe('EiaApiService — the warm outlives the request that started it (#67)'
       '',
       'steo/facet/seriesId',
       'seds/facet/seriesId',
+      'total-energy/facet/msn',
       'electricity/retail-sales/facet/sectorid',
     ];
     caller.abort(new Error('Connection closed'));
@@ -4509,6 +5151,208 @@ describe('EiaApiService — named-series facets indexed whole (#57)', () => {
 });
 
 // ------------------------------------------------------------------
+// #103 — total-energy is the Monthly Energy Review: 984 named national series
+// in its `msn` facet, past the 200-value bound. A third named-series pass,
+// `total_energy_series`, indexes them whole, each also findable by its bare ID.
+// ------------------------------------------------------------------
+
+describe('EiaApiService — Monthly Energy Review series (#103)', () => {
+  const MSN_PATH = 'total-energy/facet/msn';
+  const TETCBUS = { id: 'TETCBUS', name: 'Primary Energy Consumption Total in Trillion Btu' };
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  /** Run eia_search_routes the way a client reaches it and return both surfaces. */
+  async function searchThroughTool(query: string) {
+    const result = await runToolContract(searchRoutesTool, { query });
+    const structured = result.structuredContent as Record<string, unknown> & {
+      results: Array<Record<string, unknown>>;
+    };
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    return { structured, text };
+  }
+
+  /** How many indexed entries filter on `msn`. */
+  function msnEntries(): number {
+    return getIndexEntries().filter((e) => e.filter_hint?.msn !== undefined).length;
+  }
+
+  it.each(['primary energy consumption total', 'TETCBUS'])(
+    'answers %s with the total-energy series and its msn, on both surfaces',
+    async (query) => {
+      const api = stubHeldApiPaths(warmBodies());
+
+      const { structured, text } = await searchThroughTool(query);
+
+      expect(structured.results[0]).toEqual({
+        route: 'total-energy',
+        name: TETCBUS.name,
+        description: `MER series: ${TETCBUS.name} (TETCBUS)`,
+        score: expect.any(Number),
+        isLeaf: true,
+        filter_hint: { msn: 'TETCBUS' },
+      });
+      expect(structured.results[0]?.score as number).toBeLessThan(WEAK_MATCH_SCORE);
+      expect(structured).toMatchObject({ indexComplete: true });
+      expect(structured.indexGaps).toBeUndefined();
+      expect(text).toContain(
+        'Query with: `eia_query_route(route="total-energy", filters={"msn": "TETCBUS"})`',
+      );
+      // One request fetches the whole facet.
+      expect(api.paths.filter((p) => p === MSN_PATH)).toHaveLength(1);
+    },
+  );
+
+  it('fetches the msn facet alongside the other passes, not after them', async () => {
+    const api = stubHeldApiPaths(warmBodies());
+    const releases = ['steo/facet/seriesId', 'seds/facet/seriesId', MSN_PATH].map((path) =>
+      api.hold(path),
+    );
+
+    const search = getEiaApiService().search('wind', 5, createMockContext());
+    // All three named-series requests are in flight at once; one queued behind
+    // a held sibling hangs here.
+    await Promise.all(['steo/facet/seriesId', 'seds/facet/seriesId', MSN_PATH].map(api.requested));
+    for (const release of releases) release();
+
+    expect((await search).status.complete).toBe(true);
+  });
+
+  it('names total_energy_series alone in indexGaps when its fetch fails, and keeps everything else', async () => {
+    const bodies = warmBodies();
+    delete bodies[MSN_PATH];
+    stubHeldApiPaths(bodies);
+
+    const { structured, text } = await searchThroughTool('wind');
+
+    expect(structured).toMatchObject({ indexComplete: false, indexGaps: ['total_energy_series'] });
+    expect(text).toContain('**indexGaps:** total_energy_series');
+    // The tree, the STEO and SEDS passes, and the facet pass all landed around the gap.
+    expect(getNode('electricity/retail-sales')).toMatchObject({ id: 'retail-sales' });
+    expect(getIndexStatus().incompleteRoutes).toEqual([]);
+    expect(searchRoutes('Brent crude oil spot price', 5)[0]?.entry.filter_hint).toEqual({
+      seriesId: 'BREPUUS',
+    });
+    expect(searchRoutes('motor gasoline total consumption', 5)[0]?.entry.filter_hint).toEqual({
+      seriesId: 'MGTCB',
+    });
+    expect(structured.results[0]?.filter_hint).toEqual({ energy_source_code: 'WND' });
+    expect(msnEntries()).toBe(0);
+  });
+
+  it('retries only the msn request on later searches until it lands', async () => {
+    const bodies = warmBodies();
+    const msn = bodies[MSN_PATH];
+    delete bodies[MSN_PATH];
+    const api = stubHeldApiPaths(bodies);
+    await getEiaApiService().search('wind', 5, createMockContext());
+
+    // Still failing: one request, for the msn facet only, and the gap stays.
+    const beforeRetry = api.paths.length;
+    const retried = await getEiaApiService().search('wind', 5, createMockContext());
+    expect(api.paths.slice(beforeRetry)).toEqual([MSN_PATH]);
+    expect(retried.status.pendingPasses).toEqual(['total_energy_series']);
+
+    bodies[MSN_PATH] = msn;
+    const beforeLanding = api.paths.length;
+    const landed = await getEiaApiService().search('TETCBUS', 5, createMockContext());
+    expect(api.paths.slice(beforeLanding)).toEqual([MSN_PATH]);
+    expect(landed.status.complete).toBe(true);
+    expect(landed.results[0]?.entry.filter_hint).toEqual({ msn: 'TETCBUS' });
+
+    // Landed for good: nothing more to fetch.
+    const beforeSettled = api.paths.length;
+    await getEiaApiService().search('wind', 5, createMockContext());
+    expect(api.paths.length).toBe(beforeSettled);
+  });
+
+  /**
+   * A 200 without the facet envelope is a failed read, as a route body without
+   * its envelope is `upstream_invalid_response`: the pass stays pending and is
+   * named in indexGaps, never settled as landed with no series in it.
+   */
+  it.each([
+    ['an empty object', {}],
+    ['an envelope without facets', { response: { totalFacets: 984 } }],
+  ])('names total_energy_series in indexGaps when a 200 carries %s', async (_case, body) => {
+    const bodies = warmBodies();
+    bodies[MSN_PATH] = body;
+    const api = stubHeldApiPaths(bodies);
+
+    const { structured } = await searchThroughTool('wind');
+    expect(structured).toMatchObject({ indexComplete: false, indexGaps: ['total_energy_series'] });
+    expect(msnEntries()).toBe(0);
+
+    // The next search retries it, and it lands once EIA sends the list.
+    bodies[MSN_PATH] = { response: { totalFacets: 1, facets: [TETCBUS] } };
+    const before = api.paths.length;
+    const landed = await getEiaApiService().search('TETCBUS', 5, createMockContext());
+    expect(api.paths.slice(before)).toEqual([MSN_PATH]);
+    expect(landed.status.complete).toBe(true);
+    expect(landed.results[0]?.entry.filter_hint).toEqual({ msn: 'TETCBUS' });
+  });
+
+  it('lands a 200 whose envelope counts no values and carries no list as an empty facet', async () => {
+    const bodies = warmBodies();
+    bodies[MSN_PATH] = { response: { totalFacets: 0 } };
+    stubHeldApiPaths(bodies);
+
+    const { structured } = await searchThroughTool('wind');
+    expect(structured).toMatchObject({ indexComplete: true });
+    expect(msnEntries()).toBe(0);
+  });
+
+  it('indexes all 984 series through the pass, and describe adds none of them', async () => {
+    const values = Array.from({ length: 984 }, (_, i) =>
+      i === 0 ? TETCBUS : { id: `MSN${i}US`, name: `MER series ${i} in Trillion Btu` },
+    );
+    const totalEnergy = {
+      id: 'total-energy',
+      name: 'Total Energy',
+      facets: [{ id: 'msn', description: 'MSN' }],
+      frequency: [{ id: 'monthly', description: 'Monthly', query: 'M', format: 'YYYY-MM' }],
+      data: { value: [] },
+    };
+    const bodies = warmBodies();
+    const root = bodies[''] as { response: { routes: unknown[] } };
+    stubHeldApiPaths({
+      ...bodies,
+      '': { response: { routes: [...root.response.routes, totalEnergy] } },
+      'total-energy': { response: totalEnergy },
+      [MSN_PATH]: { response: { totalFacets: 984, facets: values } },
+    });
+
+    const { status } = await getEiaApiService().search('wind', 5, createMockContext());
+    expect(status.complete).toBe(true);
+    expect(msnEntries()).toBe(984);
+
+    const meta = await getEiaApiService().describe('total-energy', createMockContext());
+    // Describe caches the whole list, and folds none of it into the index: 984
+    // is past the bound every described facet keeps.
+    expect(meta.facets.find((f) => f.id === 'msn')?.values).toHaveLength(984);
+    expect(msnEntries()).toBe(984);
+    expect(getIndexStatus().size).toBe(status.size);
+  });
+});
+
+// ------------------------------------------------------------------
 // #78 — the benchmarks analysts ask for first (Henry Hub, WTI, Cushing, ERCOT)
 // live in `series`, `product`, and RTO `respondent` values, which reached the
 // index only once someone described the owning route. The warm-time facet pass
@@ -4642,6 +5486,7 @@ describe('EiaApiService — benchmark series, products, and respondents at warm 
       },
       'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
       [`${SPT}/facet/series`]: {
         response: {
           totalFacets: 2,
@@ -4740,6 +5585,7 @@ describe('EiaApiService — benchmark series, products, and respondents at warm 
         `${WSTK}/facet/series`,
         'seds/facet/seriesId',
         'steo/facet/seriesId',
+        'total-energy/facet/msn',
       ].sort(),
     );
     // Never fetched: the monthly leaf's series and product, any duoarea or process,
@@ -4803,6 +5649,21 @@ describe('EiaApiService — benchmark series, products, and respondents at warm 
       filter_hint: { respondent: 'ERCO' },
     });
     expect(ercot.results[0]?.score).toBeLessThan(WEAK_MATCH_SCORE);
+  });
+
+  it('resolves an ISO/RTO acronym to its balancing authority on the first search (#102)', async () => {
+    stubHeldApiPaths(benchmarkBodies());
+    const ctx = createMockContext();
+
+    for (const [query, code] of [
+      ['ERCOT', 'ERCO'],
+      ['CAISO', 'CISO'],
+    ] as const) {
+      const { results, status } = await getEiaApiService().search(query, 5, ctx);
+      expect(status.complete).toBe(true);
+      expect(results[0]?.entry).toMatchObject({ route: RTO, filter_hint: { respondent: code } });
+      expect(results[0]?.score).toBeLessThan(0.1);
+    }
   });
 
   it('answers a benchmark query on both surfaces of the tool', async () => {
@@ -4923,6 +5784,7 @@ describe('eia_search_routes — truthful truncation over a real index (#56, #70,
     ({ fetchMock } = stubApiPaths({
       'steo/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
     }));
   });
 
@@ -5128,6 +5990,7 @@ describe('eia_search_routes — a query spelling a route path (#73)', () => {
         response: { totalFacets: STEO_RETAIL_SERIES.length, facets: STEO_RETAIL_SERIES },
       },
       'seds/facet/seriesId': { response: { totalFacets: 0, facets: [] } },
+      'total-energy/facet/msn': { response: { totalFacets: 0, facets: [] } },
       'electricity/retail-sales/facet/sectorid': {
         response: { totalFacets: 1, facets: [{ id: 'RES', name: 'residential' }] },
       },

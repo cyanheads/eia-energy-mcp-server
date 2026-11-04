@@ -3,9 +3,11 @@
  * @module tests/services/route-cache.test
  */
 
+import { readFileSync } from 'node:fs';
 import Fuse from 'fuse.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WEAK_MATCH_SCORE } from '@/mcp-server/tools/definitions/search-routes.tool.js';
+import { balancingAuthorityAcronyms } from '@/services/eia/balancing-authorities.js';
 import {
   _resetRouteCache,
   addEntriesToIndex,
@@ -447,7 +449,7 @@ describe('route-cache', () => {
       expect(getIndexStatus()).toEqual({
         complete: false,
         incompleteRoutes: [],
-        pendingPasses: ['facet_values', 'steo_series', 'seds_series'],
+        pendingPasses: ['facet_values', 'steo_series', 'seds_series', 'total_energy_series'],
         size: 0,
       });
     });
@@ -457,15 +459,20 @@ describe('route-cache', () => {
       expect(getIndexStatus().complete).toBe(false);
 
       markIndexPassSettled('steo_series');
-      expect(getIndexStatus().pendingPasses).toEqual(['facet_values', 'seds_series']);
+      expect(getIndexStatus().pendingPasses).toEqual([
+        'facet_values',
+        'seds_series',
+        'total_energy_series',
+      ]);
       expect(getIndexStatus().complete).toBe(false);
 
       markIndexPassSettled('facet_values');
-      // Each named-series facet settles on its own: STEO landing says nothing about SEDS.
-      expect(getIndexStatus().pendingPasses).toEqual(['seds_series']);
+      markIndexPassSettled('seds_series');
+      // Each named-series facet settles on its own: STEO and SEDS landing say nothing about MER.
+      expect(getIndexStatus().pendingPasses).toEqual(['total_energy_series']);
       expect(getIndexStatus().complete).toBe(false);
 
-      markIndexPassSettled('seds_series');
+      markIndexPassSettled('total_energy_series');
       expect(getIndexStatus()).toEqual({
         complete: true,
         incompleteRoutes: [],
@@ -478,6 +485,7 @@ describe('route-cache', () => {
       initRouteCache([{ id: 'coal', name: 'Coal', incomplete: true }], []);
       markIndexPassSettled('steo_series');
       markIndexPassSettled('seds_series');
+      markIndexPassSettled('total_energy_series');
       markIndexPassSettled('facet_values');
 
       const status = getIndexStatus();
@@ -975,6 +983,250 @@ describe('route-cache', () => {
         'STEO series: Brent crude oil spot price (BREPUUS)',
       );
     });
+
+    describe('total-energy msn (#103)', () => {
+      /** Verbatim live values, the pair among them sharing one name. */
+      const MER: Facet['values'] = [
+        { id: 'TETCBUS', name: 'Primary Energy Consumption Total in Trillion Btu' },
+        { id: 'TEAJBUS', name: 'Primary Energy Stock Change and Other in Trillion Btu' },
+        {
+          id: 'BMACBUS',
+          name: 'Total Biomass Energy Consumed by the Transportation Sector in Trillion Btu',
+        },
+        {
+          id: 'REACBUS',
+          name: 'Total Biomass Energy Consumed by the Transportation Sector in Trillion Btu',
+        },
+      ];
+
+      it('indexes an MER series on total-energy with an msn filter hint and its id in terms', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        expect(indexNamedSeries('total_energy_series', MER)).toBe(4);
+
+        const [hit] = searchRoutes('primary energy consumption total', 5);
+        expect(hit?.entry).toEqual({
+          route: 'total-energy',
+          name: 'Primary Energy Consumption Total in Trillion Btu',
+          description: 'MER series: Primary Energy Consumption Total in Trillion Btu (TETCBUS)',
+          isLeaf: true,
+          category: 'total-energy',
+          filter_hint: { msn: 'TETCBUS' },
+          terms: ['TETCBUS'],
+        });
+        expect(hit?.score).toBeLessThan(WEAK_MATCH_SCORE);
+      });
+
+      it('finds an MER series by its bare id, which a STEO or SEDS id does not reach', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        indexNamedSeries('total_energy_series', MER);
+        indexNamedSeries('seds_series', [
+          { id: 'MGTCB', name: 'Motor gasoline total consumption' },
+        ]);
+
+        const [hit] = searchRoutes('TETCBUS', 5);
+        expect(hit?.entry.filter_hint).toEqual({ msn: 'TETCBUS' });
+        expect(hit?.score).toBeLessThan(0.05);
+        // The SEDS id sits in its description alone, past where Fuse scores from.
+        expect(searchRoutes('MGTCB', 5).map((r) => r.entry.filter_hint)).not.toContainEqual({
+          seriesId: 'MGTCB',
+        });
+      });
+
+      it('keeps the same-name pair as two entries told apart by id', () => {
+        initRouteCache(SAMPLE_TREE, []);
+        indexNamedSeries('total_energy_series', MER);
+        const name = 'Total Biomass Energy Consumed by the Transportation Sector in Trillion Btu';
+        expect(
+          searchRoutes(name, 5)
+            .filter((r) => r.entry.name === name)
+            .map((r) => r.entry.filter_hint),
+        ).toEqual([{ msn: 'BMACBUS' }, { msn: 'REACBUS' }]);
+      });
+    });
+  });
+});
+
+/**
+ * #97 — a leaf's data columns name measures its route's own text never says:
+ * electricity/operating-generator-capacity is "Inventory of Operable
+ * Generators", and "Nameplate Capacity" is the alias of its
+ * `nameplate-capacity-mw` column. The raw aliases ride on the route entry as
+ * `terms`, a search key of their own; nothing else gains them.
+ */
+describe('data-column aliases (#97)', () => {
+  /** A column EIA publishes without an alias — the coal, nuclear, and crude-import shape. */
+  const unaliased = (units: string) => ({ units }) as unknown as { alias: string; units: string };
+
+  const TREE: RawRouteNode[] = [
+    {
+      id: 'electricity',
+      name: 'Electricity',
+      description: 'EIA electricity survey data',
+      routes: [
+        {
+          id: 'operating-generator-capacity',
+          name: 'Inventory of Operable Generators',
+          description:
+            'Inventory of operable generators in the U.S. Source: Forms EIA-860, EIA-860M',
+          frequency: [],
+          facets: [{ id: 'energy_source_code', description: 'Energy Source' }],
+          data: {
+            'nameplate-capacity-mw': { alias: 'Nameplate Capacity', units: 'MW' },
+            // Live aliases carry stray whitespace; this pair collapses to one.
+            'net-summer-capacity-mw': { alias: 'Net Summer Capacity ', units: 'MW' },
+            'net-summer-capacity-rounded': { alias: 'Net  Summer Capacity', units: 'MW' },
+            latitude: unaliased('degrees'),
+          },
+        },
+        {
+          id: 'rto',
+          name: 'Electric Power Operations (Daily and Hourly)',
+          description: 'Hourly and daily electricity operations',
+          routes: [
+            {
+              id: 'region-data',
+              name: 'Hourly Demand, Demand Forecast, Generation, and Interchange',
+              description: 'Hourly demand by balancing authority',
+              frequency: [],
+              facets: [{ id: 'respondent', description: 'Balancing Authority' }],
+              data: {
+                value: {
+                  alias: 'Demand, Demand Forecast, Net Generation, or Interchange',
+                  units: 'MWh',
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'coal',
+      name: 'Coal',
+      description: 'EIA coal energy data',
+      routes: [
+        {
+          id: 'consumption-and-quality',
+          name: 'Consumption and Quality',
+          description: 'Coal consumption and quality data by state and sector',
+          frequency: [],
+          facets: [{ id: 'sector', description: 'Sector' }],
+          data: { stocks: unaliased('short tons'), price: unaliased('dollars per short ton') },
+        },
+      ],
+    },
+    {
+      id: 'total-energy',
+      name: 'Total Energy',
+      description: 'Monthly Energy Review',
+      frequency: [],
+      facets: [{ id: 'msn', description: 'MSN' }],
+      data: { value: [] },
+    },
+    { id: 'nuclear-outages', name: 'Nuclear Outages', incomplete: true },
+  ];
+
+  /** Every indexed entry for `route` that carries no filter hint — its route entry. */
+  function routeEntry(route: string): SearchIndexEntry | undefined {
+    return getIndexEntries().find((e) => e.route === route && e.filter_hint === undefined);
+  }
+
+  beforeEach(() => {
+    _resetRouteCache();
+    initRouteCache(TREE, []);
+  });
+
+  it("carries a leaf's raw column aliases on its route entry, trimmed, collapsed, and once each", () => {
+    expect(routeEntry('electricity/operating-generator-capacity')?.terms).toEqual([
+      'Nameplate Capacity',
+      'Net Summer Capacity',
+    ]);
+    expect(routeEntry('electricity/rto/region-data')?.terms).toEqual([
+      'Demand, Demand Forecast, Net Generation, or Interchange',
+    ]);
+  });
+
+  it('gives no terms to a leaf without aliases, a category, or an unfetched stub', () => {
+    // Columns without an alias contribute neither their IDs nor anything else,
+    // and the `{ value: [] }` shape never becomes the synthesized "Value".
+    for (const route of [
+      'coal/consumption-and-quality',
+      'total-energy',
+      'electricity',
+      'electricity/rto',
+      'nuclear-outages',
+    ]) {
+      expect(routeEntry(route), route).toBeDefined();
+      expect(routeEntry(route), route).not.toHaveProperty('terms');
+    }
+    const everyTerm = getIndexEntries().flatMap((e) => e.terms ?? []);
+    for (const id of ['nameplate-capacity-mw', 'latitude', 'stocks', 'price', 'value', 'Value']) {
+      expect(everyTerm, id).not.toContain(id);
+    }
+  });
+
+  it('gives no aliases to the facet values and named series that point at an aliased route', () => {
+    indexFacetValues('electricity/operating-generator-capacity', [
+      {
+        id: 'energy_source_code',
+        description: 'Energy Source',
+        values: [{ id: 'SUN', name: 'Solar' }],
+      },
+    ]);
+    indexNamedSeries('steo_series', [{ id: 'COPRPUS', name: 'Crude oil production' }]);
+    indexNamedSeries('seds_series', [{ id: 'MGTCB', name: 'Motor gasoline total consumption' }]);
+
+    const hinted = getIndexEntries().filter((e) => e.filter_hint !== undefined);
+    expect(hinted).toHaveLength(3);
+    for (const entry of hinted) expect(entry, entry.name).not.toHaveProperty('terms');
+  });
+
+  it('ranks the route first for a measure named only by its column alias', () => {
+    // Neither the route's name nor its description says "nameplate".
+    expect(searchRoutes('nameplate capacity', 5, 'phrase')[0]?.entry.route).toBe(
+      'electricity/operating-generator-capacity',
+    );
+    const [top] = searchRoutes('nameplate capacity', 5);
+    expect(top?.entry.route).toBe('electricity/operating-generator-capacity');
+    expect(top?.entry.filter_hint).toBeUndefined();
+    expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
+  });
+
+  it('counts an alias as carrying a short query term verbatim', () => {
+    // "net" is short enough that the term path requires it verbatim; the
+    // route's name, description, and path never carry it, its "Net Summer
+    // Capacity" alias does. The phrase path reads "net capacity" as a weak
+    // fuzzy run of that alias; the term path, reading "net" from the alias,
+    // matches both words and answers with confidence.
+    const route = 'electricity/operating-generator-capacity';
+    const [phrase] = searchRoutes('net capacity', 5, 'phrase');
+    expect(phrase?.entry.route).toBe(route);
+    expect(phrase?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
+    const [top] = searchRoutes('net capacity', 5);
+    expect(top?.entry.route).toBe(route);
+    expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
+  });
+
+  it('rebuilds the terms of a leaf whose metadata arrives on repair', () => {
+    replaceNode('nuclear-outages', {
+      id: 'nuclear-outages',
+      name: 'Nuclear Outages',
+      description: 'EIA nuclear outages survey data',
+      routes: [
+        {
+          id: 'us-nuclear-outages',
+          name: 'U.S. Nuclear Outages',
+          description: 'Daily U.S. nuclear outages',
+          frequency: [],
+          facets: [],
+          data: { capacity: { alias: 'Licensed Capacity', units: 'megawatts' } },
+        },
+      ],
+    });
+    expect(routeEntry('nuclear-outages')).not.toHaveProperty('terms');
+    expect(routeEntry('nuclear-outages/us-nuclear-outages')?.terms).toEqual(['Licensed Capacity']);
+    // Every other route entry keeps its terms through the rebuild.
+    expect(routeEntry('electricity/operating-generator-capacity')?.terms).toHaveLength(2);
   });
 });
 
@@ -985,24 +1237,32 @@ describe('route-cache', () => {
  * 7.5.0, and the tokenized candidate gate, whose term weights are document
  * frequencies over the whole corpus. Both are pinned here.
  *
- * The fixture carries the verbatim name and description of twenty live EIA
- * routes rather than the two the phrase path alone needed. That size is load
- * bearing: term weights are `log(N / df)`, so a handful of entries makes every
- * term look equally rare and the gate behaves nothing like it does over the real
- * 5,459-entry corpus. At this size it does — `electricity price residential`
- * reproduces the reported bug under the phrase path (no candidate at all) and
- * resolves under the tokenized one, which is the whole change in miniature.
+ * The fixture carries the verbatim name, description, and data-column aliases
+ * of twenty live EIA routes rather than the two the phrase path alone needed.
+ * That size is load bearing: term weights are `log(N / df)`, so a handful of
+ * entries makes every term look equally rare and the gate behaves nothing like
+ * it does over the real 6,443-entry corpus. At this size it does — `electricity
+ * price residential` reproduces the reported bug under the phrase path (no
+ * candidate at all) and resolves under the tokenized one, which is the whole
+ * change in miniature.
  *
  * Scores are pinned exactly. A fuse.js upgrade, a `FUSE_OPTIONS` edit, or a
  * change to the gate's constants all move them, and all three invalidate
  * `WEAK_MATCH_SCORE` — which is measured against the live corpus by
  * `scripts/eval-search.ts`, not against this fixture. Re-run that script when
- * these numbers move; do not simply re-pin them.
+ * these numbers move; do not simply re-pin them. The `terms` key (#97) moved
+ * every one of them at once: Fuse normalizes key weights against their sum.
  */
 describe('weak-match calibration against the live Fuse scale', () => {
-  /** A queryable leaf carrying one live route's real name and description. */
-  function leaf(id: string, name: string, description: string): RawRouteNode {
-    return { id, name, description, frequency: [], facets: [], data: {} };
+  /**
+   * A queryable leaf carrying one live route's real name, description, and
+   * column aliases. Only an alias is indexed, so the column IDs are stand-ins.
+   */
+  function leaf(id: string, name: string, description: string, aliases: string[] = []) {
+    const data = Object.fromEntries(
+      aliases.map((alias, i) => [`column-${i}`, { alias, units: '' }]),
+    );
+    return { id, name, description, frequency: [], facets: [], data } satisfies RawRouteNode;
   }
 
   const LIVE_FIXTURE: RawRouteNode[] = [
@@ -1015,21 +1275,67 @@ describe('weak-match calibration against the live Fuse scale', () => {
           'retail-sales',
           'Electricity Sales to Ultimate Customers',
           'Electricity sales to ultimate customer by state and sector (number of customers, average price, revenue, and megawatthours of sales). Sources: Forms EIA-826, EIA-861, EIA-861M',
+          [
+            'Revenue from Sales to Ultimate Customers',
+            'Megawatt-hours Sold to Ultimate Customers',
+            'Average Price of Electricity to Ultimate Customers',
+            'Number of Ultimate Customers',
+          ],
         ),
         leaf(
           'electric-power-operational-data',
           'Electric Power Operations (Annual and Monthly)',
           'Monthly and annual electric power operations by state, sector, and energy source. Source: Form EIA-923',
+          [
+            'Utility Scale Electricity Net Generation',
+            'Consumption of Fuels for Electricity Generation and Useful Thermal Output (Physical Units)',
+            'Consumption of Fuels for Electricity Generation (Physical Units)',
+            'Consumption of Fuels for Useful Thermal Output (Physical Units)',
+            'Consumption of Fuels for Electricity Generation and Useful Thermal Output (BTUs)',
+            'Consumption of Fuels for Electricity Generation (BTUs)',
+            'Consumption of Fuels for Useful Thermal Output (BTUs)',
+            'Stocks of Fuel (Physical Units)',
+            'Receipts of Fuel (Physical Units)',
+            'Receipts of Fuel (BTUs)',
+            'Average Cost of Fuels (per Physical Unit)',
+            'Average Cost of Fuels (per BTU)',
+            'Average Sulfur Content of Consumed Fuel',
+            'Average Ash Content of Consumed Fuel',
+            'Average Heat Content of Consumed Fuels',
+          ],
         ),
         leaf(
           'operating-generator-capacity',
           'Inventory of Operable Generators',
           'Inventory of operable generators in the U.S. Source: Forms EIA-860, EIA-860M',
+          [
+            'Nameplate Capacity',
+            'Net Summer Capacity',
+            'Net Winter Capacity',
+            'Operating Date (Year and Month)',
+            'Planned Retirement Date (Year and Month)',
+            'Planned Derate Date (Year and Month)',
+            'Magnitude of Planned Derate (Summer Capacity)',
+            'Planned Uprate Date (Year and Month)',
+            'Magnitude of Planned Uprate (Summer Capacity)',
+            'County',
+            'Longitude',
+            'Latitude',
+          ],
         ),
         leaf(
           'facility-fuel',
           'Electric Power Operations for Individual Power Plants (Annual and Monthly)',
           'Annual and monthly electric power operations for individual power plants, by energy source and prime mover Source: Form EIA-923',
+          [
+            'Net Generation',
+            'Gross Generation',
+            'Consumption of Fuels for Electricity Generation and Useful Thermal Output (Physical Units)',
+            'Consumption of Fuels for Electricity Generation and Useful Thermal Output (BTUs)',
+            'Consumption of Fuels for Electricity Generation (Physical Units)',
+            'Consumption of Fuels for Electricity Generation (BTUs)',
+            'Average Heat Content of Consumed Fuels',
+          ],
         ),
       ],
     },
@@ -1118,7 +1424,7 @@ describe('weak-match calibration against the live Fuse scale', () => {
   it('scores the description-advertised query below the weak-match threshold', () => {
     const [top] = searchRoutes('electricity retail sales by state', 5);
     expect(top?.entry.route).toBe('electricity/retail-sales');
-    expect(top?.score).toBeCloseTo(0.5522, 4);
+    expect(top?.score).toBeCloseTo(0.5622, 4);
     expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
   });
 
@@ -1126,24 +1432,52 @@ describe('weak-match calibration against the live Fuse scale', () => {
     // Answerability is a property of the corpus, not of the query. Against the
     // live taxonomy this query is on-target — electricity/operating-generator-capacity
     // carries solar nameplate capacity by state, and `scripts/search-battery.ts`
-    // labels it so. This fixture indexes that route's name and description and
-    // none of its facet values, so nothing here holds the answer, which is what
-    // makes the query a scale probe rather than a relevance one.
+    // labels it so. This fixture indexes that route's name, description, and
+    // column aliases and none of its facet values, so nothing here holds the
+    // answer, which is what makes the query a scale probe rather than a
+    // relevance one.
     const [top] = searchRoutes('solar capacity by state', 5);
     expect(top?.entry.route).toBe('coal/reserves-capacity');
-    expect(top?.score).toBeCloseTo(0.9474, 4);
+    expect(top?.score).toBeCloseTo(0.9521, 4);
     expect(top?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
   });
 
   it('leaves the phrase path scoring exactly where it did', () => {
     // The tokenized gate is additive: it can only better an entry's score, so
     // the phrase path's own numbers are the baseline every change is read
-    // against. These are the scores this tool shipped with before the gate.
+    // against. They move only with Fuse's scale: the `terms` key raised them
+    // from 0.7314 and 0.9474, the scores this tool shipped with before the gate.
     expect(searchRoutes('electricity retail sales by state', 5, 'phrase')[0]?.score).toBeCloseTo(
-      0.7314,
+      0.7525,
       4,
     );
-    expect(searchRoutes('solar capacity by state', 5, 'phrase')[0]?.score).toBeCloseTo(0.9474, 4);
+    expect(searchRoutes('solar capacity by state', 5, 'phrase')[0]?.score).toBeCloseTo(0.9521, 4);
+  });
+
+  it.each([
+    ['nameplate capacity', 'electricity/operating-generator-capacity', 0.0938],
+    ['gross generation', 'electricity/facility-fuel', 0.0915],
+    ['number of ultimate customers', 'electricity/retail-sales', 0.158],
+  ])(
+    'ranks %s, named only by a column alias, on its route below the threshold (#97)',
+    (query, route, score) => {
+      // A whole-alias match on the `terms` key alone, so the score is Fuse's and
+      // the same as over the live corpus.
+      const [top] = searchRoutes(query, 5);
+      expect(top?.entry.route).toBe(route);
+      expect(top?.entry.filter_hint).toBeUndefined();
+      expect(top?.score).toBeCloseTo(score, 4);
+      expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
+    },
+  );
+
+  it('keeps an off-target query that brushes a column alias above the threshold (#97)', () => {
+    // "Stocks of Fuel (Physical Units)" is the alias the off-target query reaches.
+    // At a `terms` weight of 1.0 the live corpus scored it 0.669, confident.
+    const [top] = searchRoutes('stock options', 5);
+    expect(top?.entry.route).toBe('electricity/electric-power-operational-data');
+    expect(top?.score).toBeCloseTo(0.7841, 4);
+    expect(top?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
   });
 
   describe('with facet values in the index', () => {
@@ -1181,14 +1515,14 @@ describe('weak-match calibration against the live Fuse scale', () => {
       expect(top?.entry.filter_hint).toBeUndefined();
       // The four sector values inherit "Electricity Sales to Ultimate Customers"
       // from their route; that text weighs as one document for all four.
-      expect(top?.score).toBeCloseTo(0.5621, 4);
+      expect(top?.score).toBeCloseTo(0.5714, 4);
       expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
     });
 
     it('still flags a query with no real match as weak', () => {
       const [top] = searchRoutes('solar capacity by state', 5);
       expect(top?.entry.route).toBe('coal/reserves-capacity');
-      expect(top?.score).toBeCloseTo(0.9474, 4);
+      expect(top?.score).toBeCloseTo(0.9521, 4);
       expect(top?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
     });
 
@@ -1216,7 +1550,7 @@ describe('weak-match calibration against the live Fuse scale', () => {
       const [top] = searchRoutes('electricity price residential', 5);
       expect(top?.entry.route).toBe('electricity/retail-sales');
       expect(top?.entry.filter_hint).toEqual({ sectorid: 'RES' });
-      expect(top?.score).toBeCloseTo(0.3476, 4);
+      expect(top?.score).toBeCloseTo(0.31, 4);
       expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
     });
 
@@ -1267,14 +1601,14 @@ describe('weak-match calibration against the live Fuse scale', () => {
     });
 
     it.each([
-      ['Henry Hub', 'natural-gas/pri/fut', { series: 'RNGWHHD' }, 0.4176],
-      ['WTI crude spot price', 'petroleum/pri/spt', { product: 'EPCWTI' }, 0.5621],
-      ['Cushing', 'petroleum/pri/spt', { series: 'RWTC' }, 0.3985],
+      ['Henry Hub', 'natural-gas/pri/fut', { series: 'RNGWHHD' }, 0.4521],
+      ['WTI crude spot price', 'petroleum/pri/spt', { product: 'EPCWTI' }, 0.5695],
+      ['Cushing', 'petroleum/pri/spt', { series: 'RWTC' }, 0.4332],
       [
         'Electric Reliability Council of Texas',
         'electricity/rto/region-data',
         { respondent: 'ERCO' },
-        0.3239,
+        0.3588,
       ],
     ])('ranks %s on its benchmark entry below the threshold', (query, route, hint, score) => {
       const [top] = searchRoutes(query, 5);
@@ -1287,9 +1621,9 @@ describe('weak-match calibration against the live Fuse scale', () => {
     it('leaves the route-shaped and unanswerable probes on their side of the threshold', () => {
       const [advertised] = searchRoutes('electricity retail sales by state', 5);
       expect(advertised?.entry.route).toBe('electricity/retail-sales');
-      expect(advertised?.score).toBeCloseTo(0.5617, 4);
+      expect(advertised?.score).toBeCloseTo(0.5716, 4);
       const [unanswerable] = searchRoutes('solar capacity by state', 5);
-      expect(unanswerable?.score).toBeCloseTo(0.9474, 4);
+      expect(unanswerable?.score).toBeCloseTo(0.9521, 4);
       expect(unanswerable?.score).toBeGreaterThan(WEAK_MATCH_SCORE);
     });
   });
@@ -1450,6 +1784,38 @@ describe('tokenized candidate gate', () => {
     expect(results[0]?.entry.filter_hint).toBeUndefined();
     expect(results[0]?.score).toBeLessThan(WEAK_MATCH_SCORE);
     expect(results[1]?.entry.route).toBe('petroleum/stoc/cu');
+  });
+
+  /**
+   * `terms` is an entry's own text, like its name — an alias, a series ID, an
+   * acronym — never text it inherits from its route. Thirty values of one route
+   * carrying a word in `terms` are thirty documents for it, exactly as when the
+   * word is in their names; the same word in the route text they share is one.
+   */
+  it('counts a word a hinted entry carries in terms once per entry, as it counts its name', () => {
+    function probeScore(where: 'name' | 'terms' | 'description'): number | undefined {
+      const values = Array.from({ length: 30 }, (_, i) => ({
+        ...entry(
+          'grid/region',
+          where === 'name' ? `Zephyr ${i}` : `Region ${i}`,
+          `${where === 'description' ? 'Zephyr ' : ''}Region value of Grid Regions (grid/region).`,
+        ),
+        filter_hint: { respondent: `R${i}` },
+        ...(where === 'terms' && { terms: ['Zephyr'] }),
+      }));
+      _resetRouteCache();
+      initRouteCache(
+        [],
+        [entry('probe/route', 'Zephyr Report', 'Tonnage by state.'), ...values, ...filler(60)],
+      );
+      return searchRoutes('zephyr tonnage', 5).find((r) => r.entry.route === 'probe/route')?.score;
+    }
+
+    const asName = probeScore('name');
+    expect(asName).toBeDefined();
+    expect(probeScore('terms')).toBe(asName);
+    // The control: inherited, the word weighs as one document and the probe's score moves.
+    expect(probeScore('description')).not.toBeCloseTo(asName as number, 3);
   });
 });
 
@@ -1714,5 +2080,232 @@ describe('equal-score ordering', () => {
       expect(first?.entry.filter_hint).toBeUndefined();
       expect(second?.entry.filter_hint).toEqual({ fueltype: 'WND' });
     }
+  });
+});
+
+/**
+ * #102 — grid analysts name the ISOs and RTOs by acronym (ERCOT, CAISO, SPP);
+ * EIA names their balancing authorities by code (ERCO, CISO, SWPP) and full
+ * name, and no EIA text carries the acronym. A balancing-authority facet value
+ * carries `[code, ...acronyms]` in `terms`, so either spelling reaches it. The
+ * value lists are EIA's own, captured live in `tests/fixtures`.
+ */
+describe('balancing-authority acronyms (#102)', () => {
+  const CAPTURED = JSON.parse(
+    readFileSync(new URL('../fixtures/balancing-authority-facets.json', import.meta.url), 'utf8'),
+  ) as Array<{ route: string; facet: string; description: string; values: Facet['values'] }>;
+
+  /** One captured value list, as the facet `eia_describe_route` caches. */
+  function captured(route: string, facet: string): Facet {
+    const list = CAPTURED.find((l) => l.route === route && l.facet === facet);
+    if (!list) throw new Error(`no captured list for ${route} ${facet}`);
+    return { id: list.facet, description: list.description, values: list.values };
+  }
+
+  const hourly = [{ id: 'hourly', description: 'Hourly', query: 'H', format: 'YYYY-MM-DDTHH' }];
+  const annual = [{ id: 'annual', description: 'Annual', query: 'A', format: 'YYYY' }];
+  function leaf(id: string, name: string, frequency = hourly): RawRouteNode {
+    return { id, name, description: `${name} data`, frequency, facets: [], data: {} };
+  }
+
+  const TREE: RawRouteNode[] = [
+    {
+      id: 'electricity',
+      name: 'Electricity',
+      description: 'EIA electricity survey data',
+      routes: [
+        {
+          id: 'rto',
+          name: 'Electric Power Operations (Daily and Hourly)',
+          description: 'Hourly and daily electric power operations',
+          routes: [
+            leaf('region-data', 'Hourly Demand, Demand Forecast, Generation, and Interchange'),
+            leaf('fuel-type-data', 'Hourly Generation by Energy Source'),
+            leaf('interchange-data', 'Hourly Interchange by Neighboring Balancing Authority'),
+            leaf('region-sub-ba-data', 'Hourly Demand by Subregion'),
+          ],
+        },
+        leaf('operating-generator-capacity', 'Inventory of Operable Generators', annual),
+        leaf('retail-sales', 'Electricity Sales to Ultimate Customers', annual),
+      ],
+    },
+    {
+      id: 'densified-biomass',
+      name: 'Densified Biomass',
+      description: 'EIA densified biomass survey data',
+      routes: [leaf('wood-pellet-plants', 'Wood Pellet Plants', annual)],
+    },
+  ];
+
+  const REGION = 'electricity/rto/region-data';
+  const FUEL = 'electricity/rto/fuel-type-data';
+  const INTERCHANGE = 'electricity/rto/interchange-data';
+  const SUB_BA = 'electricity/rto/region-sub-ba-data';
+  const OGC = 'electricity/operating-generator-capacity';
+  const RETAIL = 'electricity/retail-sales';
+  const PELLETS = 'densified-biomass/wood-pellet-plants';
+
+  /** The `terms` of the entry filtering `route` on `facetId=id`. */
+  function termsOf(route: string, facetId: string, id: string): string[] | undefined {
+    const entry = getIndexEntries().find(
+      (e) => e.route === route && e.filter_hint?.[facetId] === id,
+    );
+    if (!entry) throw new Error(`no entry for ${route} ${facetId}=${id}`);
+    return entry.terms;
+  }
+
+  beforeEach(() => {
+    _resetRouteCache();
+    initRouteCache(TREE, []);
+  });
+
+  it('gives each warm-time respondent its code and ISO/RTO acronyms as terms, once each', () => {
+    indexVocabularyFacet(REGION, captured(REGION, 'respondent'));
+    expect(termsOf(REGION, 'respondent', 'ERCO')).toEqual(['ERCO', 'ERCOT']);
+    expect(termsOf(REGION, 'respondent', 'CISO')).toEqual(['CISO', 'CAISO']);
+    expect(termsOf(REGION, 'respondent', 'NYIS')).toEqual(['NYIS', 'NYISO']);
+    expect(termsOf(REGION, 'respondent', 'SWPP')).toEqual(['SWPP', 'SPP']);
+    expect(termsOf(REGION, 'respondent', 'SWPW')).toEqual(['SWPW', 'SPP']);
+    expect(termsOf(REGION, 'respondent', 'ISNE')).toEqual(['ISNE', 'ISO-NE']);
+    // An acronym that is the code itself adds nothing.
+    expect(termsOf(REGION, 'respondent', 'MISO')).toEqual(['MISO']);
+    expect(termsOf(REGION, 'respondent', 'PJM')).toEqual(['PJM']);
+    // A balancing authority or region with no ISO/RTO acronym keeps its code.
+    expect(termsOf(REGION, 'respondent', 'BANC')).toEqual(['BANC']);
+    expect(termsOf(REGION, 'respondent', 'CAL')).toEqual(['CAL']);
+  });
+
+  it('gives the same terms on every balancing-authority facet a describe folds in', () => {
+    indexFacetValues(INTERCHANGE, [captured(INTERCHANGE, 'fromba'), captured(INTERCHANGE, 'toba')]);
+    indexFacetValues(SUB_BA, [captured(SUB_BA, 'parent')]);
+    indexFacetValues(OGC, [captured(OGC, 'balancing_authority_code')]);
+
+    expect(termsOf(INTERCHANGE, 'fromba', 'ERCO')).toEqual(['ERCO', 'ERCOT']);
+    expect(termsOf(INTERCHANGE, 'toba', 'SWPW')).toEqual(['SWPW', 'SPP']);
+    // A Canadian neighbor on toba only, with no acronym in the table.
+    expect(termsOf(INTERCHANGE, 'toba', 'IESO')).toEqual(['IESO']);
+    expect(termsOf(SUB_BA, 'parent', 'CISO')).toEqual(['CISO', 'CAISO']);
+    // The legacy CAISO code, listed beside CISO on the generator inventory.
+    expect(termsOf(OGC, 'balancing_authority_code', 'CA')).toEqual(['CA', 'CAISO']);
+    expect(termsOf(OGC, 'balancing_authority_code', 'CISO')).toEqual(['CISO', 'CAISO']);
+  });
+
+  it('gives no terms to a state code that shares a balancing-authority code, or to a non-grid respondent', () => {
+    indexFacetValues(RETAIL, [captured(RETAIL, 'stateid')]);
+    indexFacetValues(PELLETS, [captured(PELLETS, 'respondent')]);
+    // CA is California on stateid, never CAISO.
+    expect(termsOf(RETAIL, 'stateid', 'CA')).toBeUndefined();
+    // The pellet-plant survey's respondents are plants, named by their IDs.
+    const plants = getIndexEntries().filter((e) => e.route === PELLETS && e.filter_hint);
+    expect(plants).toHaveLength(161);
+    for (const entry of plants) expect(entry, entry.name).not.toHaveProperty('terms');
+  });
+
+  describe('ranking, before any describe', () => {
+    beforeEach(() => {
+      indexVocabularyFacet(REGION, captured(REGION, 'respondent'));
+      indexVocabularyFacet(FUEL, captured(FUEL, 'respondent'));
+    });
+
+    it.each([
+      ['ERCOT', 'ERCO'],
+      ['CAISO', 'CISO'],
+      ['NYISO', 'NYIS'],
+      ['MISO', 'MISO'],
+      ['ISO-NE', 'ISNE'],
+      ['PJM', 'PJM'],
+      ['ERCO', 'ERCO'],
+      ['CISO', 'CISO'],
+      ['NYIS', 'NYIS'],
+      ['SWPP', 'SWPP'],
+      ['ISNE', 'ISNE'],
+    ])('ranks %s on the %s respondent first, under 0.1', (query, code) => {
+      const [top] = searchRoutes(query, 5);
+      expect(top?.entry.route).toMatch(/^electricity\/rto\//);
+      expect(top?.entry.filter_hint).toEqual({ respondent: code });
+      expect(top?.score).toBeLessThan(0.1);
+    });
+
+    it('ranks SPP on one of its two balancing authorities first', () => {
+      const results = searchRoutes('SPP', 5);
+      expect(['SWPP', 'SWPW']).toContain(results[0]?.entry.filter_hint?.respondent);
+      expect(results[0]?.score).toBeLessThan(0.1);
+      // Both reach the top four — two codes on two leaves.
+      expect(new Set(results.slice(0, 4).map((r) => r.entry.filter_hint?.respondent))).toEqual(
+        new Set(['SWPP', 'SWPW']),
+      );
+    });
+
+    it.each([
+      ['Electric Reliability Council of Texas', 'ERCO'],
+      ['ISO New England', 'ISNE'],
+    ])('still ranks the full name %s on %s first', (query, code) => {
+      const [top] = searchRoutes(query, 5);
+      expect(top?.entry.filter_hint).toEqual({ respondent: code });
+      expect(top?.score).toBeLessThan(WEAK_MATCH_SCORE);
+    });
+
+    it('ranks region-data in the top 2 and its ERCO entry in the top 5 for an acronym beside a measure', () => {
+      const results = searchRoutes('ERCOT hourly demand', 10);
+      expect(results.slice(0, 2).map((r) => r.entry.route)).toContain(REGION);
+      const erco = results.findIndex(
+        (r) => r.entry.route === REGION && r.entry.filter_hint?.respondent === 'ERCO',
+      );
+      expect(erco).toBeGreaterThanOrEqual(0);
+      expect(erco).toBeLessThan(5);
+    });
+
+    /**
+     * A query is caller text of any length, and the short terms of a
+     * multi-term query are now also checked against each hit's `terms`
+     * (`carriesTerm`). `spp` beside `hourly` reaches that check: no SWPP or
+     * SWPW name, description, or route carries it, only the acronym does. The
+     * corpus is the tree plus the respondents the table maps, small enough to
+     * keep the run short. One search per trial on a fresh index, so no
+     * remembered ranking answers a later trial; an absolute bound at each
+     * size, then the 320k/5k ratio.
+     */
+    it.each([
+      ['repeated openers with no closer', (n: number) => '('.repeat(n), false],
+      [
+        'one long line ending in a newline',
+        (n: number) => `${'spp hourly '.repeat(n / 11)}\n`,
+        true,
+      ],
+      ['line breaks throughout', (n: number) => 'spp\r\n  hourly  '.repeat(n / 15), true],
+      ['a digit run', (n: number) => '1'.repeat(n), false],
+    ])(
+      'keeps one search over acronym terms within its thread-CPU bound at every query length (%s)',
+      (_name, shape, reachesAcronym) => {
+        const respondents = captured(REGION, 'respondent');
+        const mapped = {
+          ...respondents,
+          values: respondents.values.filter((v) =>
+            balancingAuthorityAcronyms(REGION, 'respondent')?.has(v.id),
+          ),
+        };
+        const costs: number[] = [];
+        let top: string | undefined;
+        for (let n = 5_000; n <= 320_000; n *= 2) {
+          const query = shape(n);
+          let best = Number.POSITIVE_INFINITY;
+          for (let trial = 0; trial < 3; trial++) {
+            _resetRouteCache();
+            initRouteCache(TREE, []);
+            indexVocabularyFacet(REGION, mapped);
+            const start = process.threadCpuUsage();
+            const results = searchRoutes(query, 10);
+            const used = process.threadCpuUsage(start);
+            best = Math.min(best, (used.user + used.system) / 1000);
+            top = results[0]?.entry.filter_hint?.respondent;
+          }
+          expect(best, `${n} characters`).toBeLessThan(100);
+          costs.push(best);
+        }
+        if (reachesAcronym) expect(['SWPP', 'SWPW']).toContain(top);
+        const [first, last] = [costs[0] as number, costs.at(-1) as number];
+        expect(last / Math.max(first, 0.05)).toBeLessThan(256);
+      },
+    );
   });
 });

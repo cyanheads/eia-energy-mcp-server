@@ -13,7 +13,10 @@ import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route
 import { searchRoutesTool } from '@/mcp-server/tools/definitions/search-routes.tool.js';
 import * as eiaService from '@/services/eia/eia-service.js';
 
-vi.mock('@/services/eia/eia-service.js', () => ({
+vi.mock('@/services/eia/eia-service.js', async (importOriginal) => ({
+  // The table of lists EIA publishes partial is read as written; only the service is faked.
+  partialFacetLists: (await importOriginal<typeof import('@/services/eia/eia-service.js')>())
+    .partialFacetLists,
   getEiaApiService: vi.fn(),
   initEiaApiService: vi.fn(),
   _resetEiaApiService: vi.fn(),
@@ -149,7 +152,7 @@ describe('describeRouteTool — additional coverage', () => {
       route: 'steo',
       description: 'Short-Term Energy Outlook',
       facets: [],
-      dataColumns: [{ id: 'value', alias: 'Value', units: '' }],
+      dataColumns: [{ id: 'value', alias: 'Value', units: '', synthesized: true }],
       frequencies: [{ id: 'monthly', description: 'Monthly', query: 'monthly', format: 'YYYY-MM' }],
       dateRange: { start: '2000-01', end: '2024-12' },
       defaultFrequency: 'monthly',
