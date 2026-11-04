@@ -19,7 +19,7 @@ import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 export const dataframeDropTool = tool('eia_dataframe_drop', {
   title: 'Drop EIA Dataframe',
   description:
-    'Drop a canvas dataframe by name. Idempotent — returns dropped=false when nothing matched. Use to free canvas resources ahead of the per-dataframe expiry when an analysis is complete. In normal operation, expiry cleanup (default 24 h, extended by every query that references the dataframe) is sufficient and this tool is unnecessary. Only available when EIA_DATAFRAME_DROP_ENABLED=true and a DataCanvas is configured.',
+    'Drop a canvas dataframe by name. Idempotent — returns dropped=false when nothing matched. Use to free canvas resources ahead of the per-dataframe expiry when an analysis is complete. In normal operation, expiry cleanup (default 24 h, extended by every query that references the dataframe) is sufficient and this tool is unnecessary. Only available when the server operator has enabled it and a DataCanvas is configured.',
   annotations: {
     readOnlyHint: false,
     idempotentHint: true,
@@ -32,7 +32,8 @@ export const dataframeDropTool = tool('eia_dataframe_drop', {
       reason: 'canvas_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'DataCanvas service is not configured for this deployment.',
-      recovery: 'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable dataframes.',
+      recovery:
+        'Dataframes are turned off on this deployment; page eia_query_route results inline with offset instead, or ask the server operator to enable DataCanvas.',
     },
     {
       reason: 'canvas_drop_failed',

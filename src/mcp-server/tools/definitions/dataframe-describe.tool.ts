@@ -23,7 +23,8 @@ export const dataframeDescribeTool = tool('eia_dataframe_describe', {
       reason: 'canvas_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'DataCanvas service is not configured for this deployment.',
-      recovery: 'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable dataframes.',
+      recovery:
+        'Dataframes are turned off on this deployment; page eia_query_route results inline with offset instead, or ask the server operator to enable DataCanvas.',
     },
   ],
 
