@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-14 · ⚠️ Breaking
+
+The route tools refuse EIA endpoint paths ({route}/data, {route}/facet, seriesid/{id}) as route_not_found, and eia_dataframe_query refuses system-catalog names as aliases, CTE names, and register_as names. Concurrent first stagings share one canvas per tenant, and STEO and SEDS series IDs are search terms.
+
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-11-03
 
 eia_search_routes finds a route by its data-column alias, a Monthly Energy Review series by name or ID, and a balancing authority by ISO/RTO acronym; eia_query_route refuses an impossible month, day, or hour before any request; eia_describe_route says where a unitless column's unit is.
