@@ -139,6 +139,37 @@ describe('dataframeQueryTool — additional coverage', () => {
       expect(entry).toBeDefined();
       expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
     });
+
+    /**
+     * The gate refuses DuckDB's internal metadata views by name as whole words
+     * anywhere in a statement, while a duckdb_ prefix is refused only as a call;
+     * every surface stating the denied set says so.
+     */
+    it('states the denied set the gate enforces, aliases, CTEs, and register_as names included', () => {
+      const shape = dataframeQueryTool.input.shape as { register_as: { description?: string } };
+      const contract = dataframeQueryTool.errors?.find((e) => e.reason === 'system_catalog_access');
+      for (const text of [dataframeQueryTool.description, contract?.when]) {
+        expect(text).not.toContain('duckdb_*');
+        for (const name of ['information_schema', 'pg_catalog', 'sqlite_master', 'pg_class']) {
+          expect(text).toContain(name);
+        }
+        expect(text).toContain('duckdb_<name>()');
+        expect(text).toMatch(/CTE name/);
+        expect(text).toContain('register_as');
+      }
+      expect(dataframeQueryTool.description).toContain('pragma_database_list');
+      expect(dataframeQueryTool.description).toMatch(/whole words anywhere in the statement/);
+      // A register_as name so spelled is refused, never staged.
+      expect(dataframeQueryTool.description).toContain(
+        'A register_as name spelled like one of them is refused',
+      );
+      expect(dataframeQueryTool.description).not.toContain('stages a table');
+      expect(shape.register_as.description).toMatch(
+        /spelled like a denied system catalog .* is refused as system_catalog_access/,
+      );
+      expect(shape.register_as.description).not.toContain('it stages');
+      expect(contract?.recovery).toContain('register_as name');
+    });
   });
 
   // ------------------------------------------------------------------

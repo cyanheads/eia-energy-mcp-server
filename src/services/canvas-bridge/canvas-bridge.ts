@@ -4,13 +4,15 @@
  * canvas identifier shape (EIA's hyphenated keys — {col}-units companions, and
  * data and label columns such as respondent-name — fail the gate), derives
  * all-nullable column schemas (EIA data values are all strings), and tracks
- * provenance in ctx.state. Expiry is the canvas's:
+ * provenance in ctx.state. Every call reaches the tenant's one canvas through
+ * the framework's `acquireShared`, which serializes the mint per tenant.
+ * Expiry is the canvas's:
  * every table is registered with the framework's per-table sliding TTL, which
  * the canvas extends whenever a query references the table and whose sweeper
  * drops it once the window lapses. Every path that reads or writes provenance
  * first reconciles it against the canvas's live table list, so an entry never
  * outlives the table it describes. Errors thrown below `query()` are re-thrown
- * carrying the calling tool's declared recovery hint.
+ * with the calling tool's declared recovery after the framework's own hint.
  * Registration and drop report their outcome as a value rather than a throw, so
  * a tool can keep a valid inline response beside a failed stage, and fail a
  * drop with its own declared reason. A caller abort is never folded into an
@@ -20,13 +22,16 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import {
+  assertNoSystemCatalogs,
+  CANVAS_IDENTIFIER_REGEX,
   type CanvasInstance,
   type ColumnSchema,
   type DataCanvas,
   inferSchemaFromRows,
   type QueryResult,
+  SQL_GATE_REASONS,
 } from '@cyanheads/mcp-ts-core/canvas';
-import { McpError } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 
@@ -175,20 +180,60 @@ export function sanitizeRowsForCanvas(rows: Record<string, unknown>[]): {
 }
 
 /**
- * Re-throw a framework canvas error carrying the calling definition's declared
- * recovery hint. This deliberately replaces provider hints with EIA tool names
- * and preserves the direct bridge-call contract covered by service tests.
- * The framework fills absent hints at the tool boundary, but keeps an existing
- * provider hint; this override ensures the server-specific guidance wins.
- * Reasons the calling definition does not declare pass through untouched.
+ * Re-throw a framework canvas error with the calling definition's declared
+ * recovery after the framework's own hint. The framework derives its hint from
+ * the engine's error class (a parse error's syntax fix, a PIVOT's IN list, a
+ * bare name to qualify), so it leads; the declared recovery follows with what
+ * only this server knows — its tool names, register_as, VARCHAR values — and
+ * stands alone when the framework gave none. Done here rather than left to the
+ * tool boundary, which keeps a hint already present, so direct bridge calls
+ * carry the same hint. Reasons the calling definition does not declare pass
+ * through untouched.
  */
 function withContractRecovery(ctx: Context, error: unknown): unknown {
   if (!(error instanceof McpError)) return error;
   const reason = error.data?.reason;
   if (typeof reason !== 'string') return error;
-  const recovery = ctx.recoveryFor(reason);
-  if (!('recovery' in recovery)) return error;
-  return new McpError(error.code, error.message, { ...error.data, ...recovery }, { cause: error });
+  const declared = ctx.recoveryFor(reason);
+  if (!('recovery' in declared)) return error;
+  const prior = error.data?.recovery;
+  const derived =
+    typeof prior === 'object' && prior !== null && 'hint' in prior && typeof prior.hint === 'string'
+      ? prior.hint
+      : undefined;
+  const hint =
+    derived === undefined ? declared.recovery.hint : `${derived} ${declared.recovery.hint}`;
+  return new McpError(
+    error.code,
+    error.message,
+    { ...error.data, recovery: { hint } },
+    { cause: error },
+  );
+}
+
+/**
+ * Refuse, as `system_catalog_access`, a `register_as` name spelled like a
+ * system catalog the SQL gate denies: the gate refuses that name as a whole
+ * word in any case wherever a statement uses it, so no query could select from
+ * a table so named. A name that only contains one (`pg_tables_2024`) is
+ * admitted, and a name outside the canvas identifier shape is left to the
+ * canvas, whose identifier gate names that fault.
+ */
+function assertSelectableTableName(ctx: Context, name: string): void {
+  if (!CANVAS_IDENTIFIER_REGEX.test(name)) return;
+  try {
+    assertNoSystemCatalogs(name);
+  } catch (error) {
+    if (!(error instanceof McpError)) throw error;
+    const catalog = String(error.data?.catalog);
+    throw withContractRecovery(
+      ctx,
+      validationError(
+        `Cannot register a dataframe as ${name}: it is spelled like the system catalog ${catalog}, and every statement naming a system catalog is refused, so no query could select from it.`,
+        { reason: SQL_GATE_REASONS.systemCatalogAccess, catalog },
+      ),
+    );
+  }
 }
 
 export class CanvasBridge {
@@ -291,6 +336,7 @@ export class CanvasBridge {
     sql: string,
     options: BridgeQueryOptions = {},
   ): Promise<{ result: QueryResult; meta?: DataframeEntry }> {
+    if (options.registerAs !== undefined) assertSelectableTableName(ctx, options.registerAs);
     const instance = await this.acquireSharedCanvas(ctx);
     const ttlMs = getServerConfig().datasetTtlSeconds * 1000;
     // Only the register_as branch writes provenance; a plain SELECT skips the
@@ -363,14 +409,22 @@ export class CanvasBridge {
    * canvas sweeper removes tables without telling the bridge, so a caller who
    * only stages and queries would otherwise accumulate provenance for tables
    * that stopped existing hours ago.
+   *
+   * Provenance is read before the canvas listing. Provenance is written only
+   * after its table's registration resolves, so every entry read first names a
+   * table the later listing holds unless it is really gone; listed the other
+   * way round, a table committing during the listing could have its
+   * provenance read and deleted while it stays queryable.
    */
   private async reconcile(ctx: Context, instance: CanvasInstance): Promise<DataframeEntry[]> {
+    const stored: Array<{ key: string; meta: DataframeMeta }> = [];
+    for await (const entry of this.iterateMeta(ctx)) stored.push(entry);
     const expiryByTable = new Map(
       (await instance.describe()).map((table) => [table.name, table.expiresAt]),
     );
 
     const entries: DataframeEntry[] = [];
-    for await (const { key, meta } of this.iterateMeta(ctx)) {
+    for (const { key, meta } of stored) {
       if (!expiryByTable.has(meta.tableName)) {
         await ctx.state.delete(key);
         ctx.log.debug('Dropped provenance for a dataframe the canvas no longer holds', {
@@ -398,23 +452,18 @@ export class CanvasBridge {
   }
 
   /**
-   * The tenant's one canvas. A stored id the canvas no longer knows (expired or
-   * swept) is replaced by a fresh canvas; any other failure propagates with the
-   * id kept, since forgetting a live canvas orphans every table on it.
+   * The tenant's one canvas, through the framework's shared acquire: one
+   * resolution per tenant runs at a time, so concurrent first calls converge on
+   * the canvas the first one mints. A stored id the canvas no longer knows
+   * (idle, swept, or past the absolute cap, where the stored id expires with
+   * it) is replaced by a fresh canvas; any other failure propagates with the id
+   * kept, since forgetting a live canvas orphans every table on it. A cold
+   * describe, query, or drop mints too, keeping its answer (an empty list,
+   * `missing_table`, `absent`), and provenance a replaced canvas leaves behind
+   * is dropped by the next `reconcile`, so nothing runs on replacement.
    */
-  private async acquireSharedCanvas(ctx: Context): Promise<CanvasInstance> {
-    const stored = await ctx.state.get<string>(CANVAS_ID_KEY);
-    if (stored) {
-      try {
-        return await this.canvas.acquire(stored, ctx);
-      } catch (error) {
-        if (!(error instanceof McpError && error.data?.reason === 'canvas_not_found')) throw error;
-        await ctx.state.delete(CANVAS_ID_KEY);
-      }
-    }
-    const instance = await this.canvas.acquire(undefined, ctx);
-    await ctx.state.set(CANVAS_ID_KEY, instance.canvasId);
-    return instance;
+  private acquireSharedCanvas(ctx: Context): Promise<CanvasInstance> {
+    return this.canvas.acquireShared(ctx, { stateKey: CANVAS_ID_KEY });
   }
 
   private mintTableName(): string {

@@ -100,7 +100,7 @@ function makeMockCanvas() {
     describe: vi.fn().mockResolvedValue([]),
   };
   const mockCanvas = {
-    acquire: vi.fn().mockResolvedValue(mockInstance),
+    acquireShared: vi.fn().mockResolvedValue(mockInstance),
   };
   return { mockCanvas, mockInstance };
 }
@@ -133,7 +133,7 @@ describe('CanvasBridge', () => {
       });
 
       expect(result).toEqual({ status: 'skipped' });
-      expect(mockCanvas.acquire).not.toHaveBeenCalled();
+      expect(mockCanvas.acquireShared).not.toHaveBeenCalled();
     });
 
     it('registers a table and returns metadata with correct shape', async () => {
@@ -248,7 +248,7 @@ describe('CanvasBridge', () => {
 
     it('reports failed when the canvas cannot be acquired', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
-      mockCanvas.acquire.mockRejectedValue(new Error('capacity exhausted'));
+      mockCanvas.acquireShared.mockRejectedValue(new Error('capacity exhausted'));
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
 
@@ -416,6 +416,29 @@ describe('CanvasBridge', () => {
       expect(await ctx.state.get('eia-df-meta/df_SWEPT')).toBeNull();
     });
 
+    // A table that commits after the canvas's listing has begun, and whose
+    // provenance lands before the bridge reads provenance, is not in that
+    // listing. Reading provenance first leaves its entry for the next pass.
+    it('keeps provenance for a table registered while the canvas listing is in flight', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test' });
+      const meta = storedMeta('df_NEW');
+      mockInstance.describe.mockImplementation(async () => {
+        await ctx.state.set('eia-df-meta/df_NEW', meta);
+        return [];
+      });
+
+      expect(await bridge.describe(ctx)).toEqual([]);
+      expect(await ctx.state.get('eia-df-meta/df_NEW')).toEqual(meta);
+
+      // The next pass sees the table and lists it.
+      mockInstance.describe.mockResolvedValue([
+        { name: 'df_NEW', kind: 'table', rowCount: 5, columns: [], expiresAt: 'later' },
+      ]);
+      expect((await bridge.describe(ctx)).map((e) => e.tableName)).toEqual(['df_NEW']);
+    });
+
     it('orders entries newest first', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
       mockInstance.describe.mockResolvedValue([
@@ -492,6 +515,68 @@ describe('CanvasBridge', () => {
       expect(await ctx.state.get('eia-df-meta/df_SWEPT')).toBeNull();
     });
 
+    /**
+     * The SQL gate refuses a system catalog's name as a whole word in any case,
+     * so a table registered under one could never be selected from. The name is
+     * refused before any canvas work; a name that only contains one is not.
+     */
+    describe('register_as spelled like a system catalog', () => {
+      it.each([
+        ['pg_tables', 'pg_tables'],
+        ['PG_Tables', 'pg_tables'],
+        ['duckdb_tables', 'duckdb_tables'],
+        ['sqlite_master', 'sqlite_master'],
+        ['pragma_database_list', 'pragma_database_list'],
+        ['information_schema', 'information_schema'],
+        ['pg_catalog', 'pg_catalog'],
+      ])(
+        'refuses %s as system_catalog_access before touching the canvas',
+        async (name, catalog) => {
+          const { mockCanvas, mockInstance } = makeMockCanvas();
+          const bridge = new CanvasBridge(mockCanvas as never);
+          const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+          const declared = dataframeQueryTool.errors?.find(
+            (e) => e.reason === 'system_catalog_access',
+          );
+
+          await expect(
+            bridge.query(ctx, 'SELECT 1 AS v', { registerAs: name }),
+          ).rejects.toMatchObject({
+            code: JsonRpcErrorCode.ValidationError,
+            message: expect.stringContaining(`Cannot register a dataframe as ${name}`),
+            data: {
+              reason: 'system_catalog_access',
+              catalog,
+              recovery: { hint: declared?.recovery },
+            },
+          });
+          expect(mockCanvas.acquireShared).not.toHaveBeenCalled();
+          expect(mockInstance.query).not.toHaveBeenCalled();
+          expect((await ctx.state.list('eia-df-meta/')).items).toEqual([]);
+        },
+      );
+
+      it.each([
+        'pg_tables_2024',
+        'my_duckdb_tables',
+        'duckdb_x',
+        // Not an identifier: the canvas's identifier gate names that fault.
+        'pg_tables-x',
+      ])('passes %s through to the canvas', async (name) => {
+        const { mockCanvas, mockInstance } = makeMockCanvas();
+        mockInstance.query.mockResolvedValue({ columns: ['v'], rows: [], rowCount: 1 });
+        const bridge = new CanvasBridge(mockCanvas as never);
+        const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+
+        await bridge.query(ctx, 'SELECT 1 AS v', { registerAs: name });
+
+        expect(mockInstance.query).toHaveBeenCalledWith(
+          'SELECT 1 AS v',
+          expect.objectContaining({ registerAs: name }),
+        );
+      });
+    });
+
     // Regression for #34: the framework throws below the bridge with a reason
     // but no usable data.recovery, and the framework renders content[]'s
     // `Recovery:` line from data.recovery.hint alone — so the contract's hint
@@ -529,21 +614,105 @@ describe('CanvasBridge', () => {
       });
     });
 
-    it('overrides the framework hint that names methods no client can call', async () => {
-      const { mockCanvas, mockInstance } = makeMockCanvas();
-      mockInstance.query.mockRejectedValue(
-        new McpError(JsonRpcErrorCode.NotFound, 'Canvas table does not exist.', {
-          reason: 'missing_table',
-          recovery: { hint: 'Re-stage the table via registerTable() or call describe().' },
-        }),
-      );
-      const bridge = new CanvasBridge(mockCanvas as never);
-      const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+    /**
+     * Every reason the bridge rewrites, beside each hint mcp-ts-core 0.13.22
+     * puts on it (register_as_clash carries none). Several are derived from the
+     * engine's error class, so the framework's hint leads and the declared
+     * recovery follows it with what only this server knows.
+     */
+    it.each([
+      [
+        'missing_table',
+        JsonRpcErrorCode.NotFound,
+        "Re-run the tool that produced this table to stage it again, or list the currently staged tables with this server's dataframe-describe tool.",
+      ],
+      [
+        'non_select_statement',
+        JsonRpcErrorCode.ValidationError,
+        'Rewrite as a single SELECT — this surface is read-only and cannot create, alter, or drop tables.',
+      ],
+      [
+        'non_select_statement',
+        JsonRpcErrorCode.ValidationError,
+        'A PIVOT runs as one SELECT only when it lists its values, as ON column IN (value, ...): list them, or rewrite as a single SELECT — this surface is read-only and cannot create, alter, or drop tables.',
+      ],
+      [
+        'invalid_sql',
+        JsonRpcErrorCode.ValidationError,
+        "Correct the column or function the message names; list the staged columns with this server's dataframe-describe tool.",
+      ],
+      [
+        'invalid_sql',
+        JsonRpcErrorCode.ValidationError,
+        'Fix the SQL syntax the message names and send a single read-only SELECT. Put AS before an alias that is a SQL keyword, or double-quote it.',
+      ],
+      [
+        'invalid_sql',
+        JsonRpcErrorCode.ValidationError,
+        "Correct the function, type, collation, or schema name the message reports missing — list the staged tables with this server's dataframe-describe tool.",
+      ],
+      [
+        'invalid_sql',
+        JsonRpcErrorCode.ValidationError,
+        'Correct the argument value the message names — a pattern, format string, or other constant the function cannot accept.',
+      ],
+      [
+        'invalid_sql',
+        JsonRpcErrorCode.ValidationError,
+        "Send a read-only SELECT over the staged tables — list them with this server's dataframe-describe tool. This surface reads no files and cannot create, alter, or drop anything.",
+      ],
+      [
+        'system_catalog_access',
+        JsonRpcErrorCode.ValidationError,
+        "Query only the staged dataframe tables; use this server's dataframe-describe tool to list them.",
+      ],
+      [
+        'denied_function',
+        JsonRpcErrorCode.ValidationError,
+        'Remove the function the message names — only the staged tables are queryable.',
+      ],
+      [
+        'denied_function',
+        JsonRpcErrorCode.ValidationError,
+        'Qualify a column named current_schema with its table (<table>.current_schema), or remove the reference — the current_schema() function is not available.',
+      ],
+      [
+        'multi_statement',
+        JsonRpcErrorCode.ValidationError,
+        'Send exactly one SELECT statement; split multi-statement SQL into separate calls.',
+      ],
+      [
+        'sql_read_only',
+        JsonRpcErrorCode.ValidationError,
+        "Send a read-only SELECT over the staged tables — list them with this server's dataframe-describe tool. This surface reads no files and cannot create, alter, or drop anything.",
+      ],
+    ] as const)(
+      'keeps the framework %s hint and follows it with the declared recovery: %#',
+      async (reason, code, frameworkHint) => {
+        const { mockCanvas, mockInstance } = makeMockCanvas();
+        mockInstance.query.mockRejectedValue(
+          new McpError(code, `upstream message for ${reason}`, {
+            reason,
+            extra: 'kept',
+            recovery: { hint: frameworkHint },
+          }),
+        );
+        const bridge = new CanvasBridge(mockCanvas as never);
+        const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
+        const declared = dataframeQueryTool.errors?.find((e) => e.reason === reason);
+        expect(declared).toBeDefined();
 
-      await expect(bridge.query(ctx, 'SELECT * FROM df_GONE')).rejects.toMatchObject({
-        data: { recovery: { hint: expect.stringContaining('eia_dataframe_describe') } },
-      });
-    });
+        await expect(bridge.query(ctx, 'SELECT 1')).rejects.toMatchObject({
+          code,
+          message: `upstream message for ${reason}`,
+          data: {
+            reason,
+            extra: 'kept',
+            recovery: { hint: `${frameworkHint} ${declared?.recovery}` },
+          },
+        });
+      },
+    );
 
     it('passes through an undeclared reason untouched', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
@@ -621,7 +790,7 @@ describe('CanvasBridge', () => {
 
     it('reports failed and keeps provenance when no canvas can be acquired', async () => {
       const { mockCanvas } = makeMockCanvas();
-      mockCanvas.acquire.mockRejectedValue(new Error('capacity exhausted'));
+      mockCanvas.acquireShared.mockRejectedValue(new Error('capacity exhausted'));
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
       const meta = storedMeta('df_HAS_META');
@@ -635,45 +804,71 @@ describe('CanvasBridge', () => {
     });
   });
 
+  /**
+   * #109 — the tenant's canvas is the framework's shared acquire under the
+   * bridge's own key; replacing a dead id and serializing the mint are the
+   * framework's (real-canvas coverage in canvas-execution.tool.test.ts).
+   */
   describe('shared canvas', () => {
-    it('replaces a stored canvas the registry no longer knows', async () => {
+    it('acquires through acquireShared under eia-canvas-id on every path', async () => {
       const { mockCanvas, mockInstance } = makeMockCanvas();
-      mockCanvas.acquire
-        .mockRejectedValueOnce(
-          new McpError(JsonRpcErrorCode.NotFound, 'Canvas not found.', {
-            reason: 'canvas_not_found',
-          }),
-        )
-        .mockResolvedValueOnce({ ...mockInstance, canvasId: 'canvas-new' });
+      mockInstance.registerTable.mockResolvedValue({ tableName: 'df_ONE', rowCount: 1 });
+      mockInstance.query.mockResolvedValue({ columns: ['x'], rows: [], rowCount: 0 });
+      mockInstance.drop.mockResolvedValue(false);
       const bridge = new CanvasBridge(mockCanvas as never);
       const ctx = createMockContext({ tenantId: 'test' });
-      await ctx.state.set('eia-canvas-id', 'canvas-old');
 
+      await bridge.registerDataframe(ctx, {
+        rows: [{ period: '2024-01', value: '9.13' }],
+        sourceTool: 'eia_query_route',
+        queryParams: {},
+      });
       await bridge.describe(ctx);
+      await bridge.query(ctx, 'SELECT 1 AS x');
+      await bridge.drop(ctx, 'df_ONE');
 
-      expect(mockCanvas.acquire).toHaveBeenLastCalledWith(undefined, ctx);
-      expect(await ctx.state.get('eia-canvas-id')).toBe('canvas-new');
+      expect(mockCanvas.acquireShared.mock.calls).toEqual(
+        Array.from({ length: 4 }, () => [ctx, { stateKey: 'eia-canvas-id' }]),
+      );
     });
 
-    // #60 — forgetting a live canvas over any other failure orphans every
-    // table on it: the next call mints a new canvas and reconcile then deletes
-    // all provenance.
-    it('keeps the stored canvas id when acquiring it fails for another reason', async () => {
-      const { mockCanvas } = makeMockCanvas();
-      mockCanvas.acquire.mockRejectedValueOnce(new Error('registry shutting down'));
+    // #60 — the bridge keeps no canvas id of its own to forget, so an acquire
+    // failure reaches the caller and nothing is written.
+    it('propagates an acquire failure from describe and query, writing nothing', async () => {
+      const { mockCanvas, mockInstance } = makeMockCanvas();
+      const thrown = new Error('registry shutting down');
+      mockCanvas.acquireShared.mockRejectedValue(thrown);
       const bridge = new CanvasBridge(mockCanvas as never);
-      const ctx = createMockContext({ tenantId: 'test' });
-      await ctx.state.set('eia-canvas-id', 'canvas-live');
+      const ctx = createMockContext({ errors: dataframeQueryTool.errors, tenantId: 'test' });
       const meta = storedMeta('df_KEPT');
       await ctx.state.set('eia-df-meta/df_KEPT', meta);
 
-      expect(await bridge.drop(ctx, 'df_KEPT')).toEqual({
-        status: 'failed',
-        message: 'registry shutting down',
-      });
-      expect(mockCanvas.acquire).toHaveBeenCalledTimes(1);
-      expect(await ctx.state.get('eia-canvas-id')).toBe('canvas-live');
-      expect(await ctx.state.get('eia-df-meta/df_KEPT')).toEqual(meta);
+      await expect(bridge.describe(ctx)).rejects.toBe(thrown);
+      await expect(bridge.query(ctx, 'SELECT 1', { registerAs: 'df_NEW' })).rejects.toBe(thrown);
+      expect(mockInstance.query).not.toHaveBeenCalled();
+      expect((await ctx.state.list('eia-df-meta/')).items).toEqual([
+        { key: 'eia-df-meta/df_KEPT', value: meta },
+      ]);
+    });
+
+    // A call cancelled while queued for the canvas is a cancellation, never a
+    // failed outcome, on the two paths that otherwise report one.
+    it('rethrows an acquire cancelled by the caller from register and drop', async () => {
+      const { mockCanvas } = makeMockCanvas();
+      const controller = new AbortController();
+      controller.abort();
+      mockCanvas.acquireShared.mockRejectedValue(controller.signal.reason);
+      const bridge = new CanvasBridge(mockCanvas as never);
+      const ctx = createMockContext({ tenantId: 'test', signal: controller.signal });
+
+      await expect(
+        bridge.registerDataframe(ctx, {
+          rows: [{ period: '2024-01', value: '9.13' }],
+          sourceTool: 'eia_query_route',
+          queryParams: {},
+        }),
+      ).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(bridge.drop(ctx, 'df_ANY')).rejects.toMatchObject({ name: 'AbortError' });
     });
   });
 });

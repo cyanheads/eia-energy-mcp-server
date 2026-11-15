@@ -57,7 +57,7 @@ function renderQueryResult(result: DataframeQueryResult): string {
 export const dataframeQueryTool = tool('eia_dataframe_query', {
   title: 'Query EIA Dataframes',
   description:
-    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route calls that passed stage: true — a query that staged nothing leaves no table to select from. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, file reads (read_* functions or a quoted file path), engine-setting functions (current_setting), and SQL built from a string (query_table) are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh expiry. Every dataframe named in the statement has its expiry extended by the query. Inline rows stop at preview; a result cut short says how to reach the rest, including paging a register_as table with LIMIT/OFFSET and no ORDER BY, which keeps the order the preview showed.',
+    'Run a single-statement SELECT against canvas dataframes registered by eia_query_route calls that passed stage: true — a query that staged nothing leaves no table to select from. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Reference dataframes by the df_<id> handles returned by eia_query_route or listed by eia_dataframe_describe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, file reads (read_* functions or a quoted file path), engine-setting functions (current_setting), and SQL built from a string (query_table) are rejected. System catalogs are denied: information_schema, pg_catalog, and the DuckDB internal metadata views (duckdb_tables, duckdb_columns, and the other duckdb_ views; sqlite_master and the other sqlite_ views; pragma_database_list; pg_class, pg_tables, and the other pg_ views) are refused as whole words anywhere in the statement outside string literals and comments, column aliases and CTE names included, as is any duckdb_<name>() call. A register_as name spelled like one of them is refused, since no statement could select from a table so named. EIA data values are VARCHAR — use CAST(col AS DOUBLE) for arithmetic and aggregation. Optional register_as chains results as a new dataframe with a fresh expiry. Every dataframe named in the statement has its expiry extended by the query. Inline rows stop at preview; a result cut short says how to reach the rest, including paging a register_as table with LIMIT/OFFSET and no ORDER BY, which keeps the order the preview showed.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -74,15 +74,15 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'SQL contains more than one statement.',
-      recovery: 'Send one SELECT per eia_dataframe_query call; use register_as to chain results.',
+      recovery:
+        'Chain the statements with register_as: each eia_dataframe_query call can stage its result as a dataframe the next call selects from.',
     },
     {
       reason: 'sql_read_only',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'SQL attempts a write, external file access, or another operation refused by the read-only gate.',
-      recovery:
-        'Query staged dataframes with a read-only SELECT; use register_as to persist results.',
+      when: "SQL names a file instead of a staged table (a quoted path such as 'data.csv'), or the engine refuses it as a write.",
+      recovery: 'To persist a result, pass register_as instead of writing to the canvas.',
     },
     {
       reason: 'canvas_unavailable',
@@ -95,8 +95,9 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       reason: 'system_catalog_access',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'SQL references a denied system catalog (information_schema, pg_catalog, sqlite_master, duckdb_*).',
-      recovery: 'Query only df_<id> tables — list them with eia_dataframe_describe.',
+      when: 'SQL names a denied system catalog — information_schema, pg_catalog, a DuckDB internal metadata view (duckdb_tables, sqlite_master, pg_class, pg_tables, …), or a duckdb_<name>() call — anywhere in the statement outside string literals and comments, a column alias or CTE name included, or register_as is spelled like one.',
+      recovery:
+        'If the name the message reports is a column alias, CTE, or register_as name of yours, rename it: a name spelled like a system catalog is refused wherever it appears.',
     },
     {
       reason: 'missing_table',
@@ -104,15 +105,14 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       code: JsonRpcErrorCode.NotFound,
       when: 'SQL references a df_<id> table that is not staged — mistyped, already dropped, or past its expiry.',
       recovery:
-        'Call eia_dataframe_describe to list the staged handles, or re-run eia_query_route with stage: true to stage the data again.',
+        'eia_query_route with stage: true restages a route table; the eia_dataframe_query register_as call that chained a table restages that one.',
     },
     {
       reason: 'non_select_statement',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The statement is not a single read-only SELECT — writes, DDL, DROP, COPY, PRAGMA, and ATTACH are rejected.',
-      recovery:
-        'Rewrite the statement as one SELECT; to persist a result, pass register_as instead of writing to the canvas.',
+      when: 'The statement is not a single read-only SELECT — writes, DDL, DROP, COPY, PRAGMA, ATTACH, and a PIVOT without an IN list are rejected.',
+      recovery: 'To persist a result, pass register_as instead of writing to the canvas.',
     },
     {
       reason: 'invalid_sql',
@@ -120,7 +120,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'DuckDB could not parse or bind the statement — a syntax error, or a column or alias that does not exist on the referenced dataframe.',
       recovery:
-        'Correct the statement and retry — eia_dataframe_describe reports the exact column names of every staged dataframe, where any hyphen in a preview column name is an underscore (price-units is price_units, respondent-name is respondent_name).',
+        'A hyphen in a preview column name is an underscore in the staged table (price-units is price_units, respondent-name is respondent_name), and EIA values are VARCHAR: CAST(col AS DOUBLE) before arithmetic or aggregation.',
     },
     {
       reason: 'register_as_clash',
@@ -144,7 +144,7 @@ export const dataframeQueryTool = tool('eia_dataframe_query', {
       .min(1)
       .optional()
       .describe(
-        'When set, persist the result as a new dataframe with a fresh expiry. Use to chain analyses without re-running upstream queries. The name must be unused — reusing a staged name is rejected, and the fix is a different name, not dropping the existing dataframe. eia_dataframe_describe lists the names already taken.',
+        'When set, persist the result as a new dataframe with a fresh expiry. Use to chain analyses without re-running upstream queries. The name must be unused — reusing a staged name is rejected, and the fix is a different name, not dropping the existing dataframe. eia_dataframe_describe lists the names already taken. A name spelled like a denied system catalog (information_schema, pg_tables, duckdb_tables, sqlite_master, and the rest the tool description lists), in any case, is refused as system_catalog_access; a longer name that only contains one, such as pg_tables_2024, is accepted.',
       ),
     preview: countSchema('preview', 0, MAX_ROW_LIMIT)
       .optional()
