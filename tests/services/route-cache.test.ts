@@ -905,7 +905,7 @@ describe('route-cache', () => {
       expect(indexNamedSeries('seds_series', series(3))).toBe(0);
     });
 
-    it('indexes a SEDS series on the seds route with a seriesId filter hint', () => {
+    it('indexes a SEDS series on the seds route with a seriesId filter hint and its id in terms', () => {
       initRouteCache(SAMPLE_TREE, []);
       expect(
         indexNamedSeries('seds_series', [
@@ -922,6 +922,7 @@ describe('route-cache', () => {
         isLeaf: true,
         category: 'seds',
         filter_hint: { seriesId: 'MGTCB' },
+        terms: ['MGTCB'],
       });
     });
 
@@ -974,14 +975,86 @@ describe('route-cache', () => {
       const byId = new Map(
         searchRoutes('crude oil', 10).map((r) => [r.entry.filter_hint?.seriesId, r.entry]),
       );
-      expect(byId.get('COPRPUS')).toMatchObject({
+      expect(byId.get('COPRPUS')).toEqual({
         route: 'steo',
+        name: 'Crude oil production',
+        isLeaf: true,
         category: 'steo',
         description: 'STEO series: Crude oil production (COPRPUS) — U.S. crude oil production',
+        filter_hint: { seriesId: 'COPRPUS' },
+        terms: ['COPRPUS'],
       });
       expect(byId.get('BREPUUS')?.description).toBe(
         'STEO series: Brent crude oil spot price (BREPUUS)',
       );
+    });
+
+    /**
+     * #107 — every named series carries its ID in `terms`, so a bare STEO or
+     * SEDS ID reaches its own entry. The competitors are the live entries each
+     * ID answered with before: an MER series whose `msn` starts with it, and,
+     * for `PETCV`, the `petroleum` category.
+     */
+    describe('bare series IDs (#107)', () => {
+      const STEO: Facet['values'] = [
+        { id: 'PATCPUSX', name: 'Total Petroleum and Other Liquids Product Supplied' },
+        { id: 'NGMPPUS', name: 'Natural Gas Total Marketed Production' },
+        { id: 'NGMPPAK', name: 'Natural Gas Alaska Marketed Production' },
+        { id: 'NGMPPM', name: 'Natural Gas Permian Marketed Production' },
+      ];
+      const SEDS: Facet['values'] = [
+        { id: 'MGTCB', name: 'Motor gasoline total consumption' },
+        { id: 'PETCV', name: 'Primary energy total expenditures' },
+        { id: 'NGMPP', name: 'Natural gas marketed production' },
+        { id: 'NGMPB', name: 'Natural gas marketed production' },
+      ];
+      const MER: Facet['values'] = [
+        { id: 'TETCBUS', name: 'Primary Energy Consumption Total in Trillion Btu' },
+        { id: 'MGTCBUS', name: 'Motor Gasoline Product Supplied in Trillion Btu' },
+        {
+          id: 'PATCPUS',
+          name: 'Petroleum Products Supplied/Consumption, United States in Thousand Barrels per Day',
+        },
+        { id: 'NGMPPUS', name: 'Natural Gas Marketed Production (Wet) in Billion Cubic Feet' },
+      ];
+
+      function indexAll(): void {
+        initRouteCache(SAMPLE_TREE, []);
+        indexNamedSeries('steo_series', STEO);
+        indexNamedSeries('seds_series', SEDS);
+        indexNamedSeries('total_energy_series', MER);
+      }
+
+      it.each([
+        ['MGTCB', 'seds', { seriesId: 'MGTCB' }],
+        ['PETCV', 'seds', { seriesId: 'PETCV' }],
+        ['PATCPUSX', 'steo', { seriesId: 'PATCPUSX' }],
+        ['TETCBUS', 'total-energy', { msn: 'TETCBUS' }],
+        ['MGTCBUS', 'total-energy', { msn: 'MGTCBUS' }],
+      ])('answers %s with its own %s entry first', (id, route, hint) => {
+        indexAll();
+        const [hit] = searchRoutes(id, 5);
+        expect(hit?.entry).toMatchObject({ route, filter_hint: hint });
+        expect(hit?.score).toBeLessThan(0.05);
+      });
+
+      it('returns every entry of an ID two vocabularies share ahead of every other hit', () => {
+        indexAll();
+        const results = searchRoutes('NGMPPUS', 10);
+        expect(results.slice(0, 2).map((r) => [r.entry.route, r.entry.filter_hint])).toEqual([
+          ['steo', { seriesId: 'NGMPPUS' }],
+          ['total-energy', { msn: 'NGMPPUS' }],
+        ]);
+        // The SEDS series whose ID NGMPPUS extends, and the STEO siblings, rank behind both.
+        const third = results[2];
+        expect(third?.score).toBeGreaterThan(results[1]?.score ?? 1);
+      });
+
+      it('keeps each of a same-name SEDS pair reachable by its own ID', () => {
+        indexAll();
+        expect(searchRoutes('NGMPB', 5)[0]?.entry.filter_hint).toEqual({ seriesId: 'NGMPB' });
+        expect(searchRoutes('NGMPP', 5)[0]?.entry.filter_hint).toEqual({ seriesId: 'NGMPP' });
+      });
     });
 
     describe('total-energy msn (#103)', () => {
@@ -1016,20 +1089,13 @@ describe('route-cache', () => {
         expect(hit?.score).toBeLessThan(WEAK_MATCH_SCORE);
       });
 
-      it('finds an MER series by its bare id, which a STEO or SEDS id does not reach', () => {
+      it('finds an MER series by its bare id', () => {
         initRouteCache(SAMPLE_TREE, []);
         indexNamedSeries('total_energy_series', MER);
-        indexNamedSeries('seds_series', [
-          { id: 'MGTCB', name: 'Motor gasoline total consumption' },
-        ]);
 
         const [hit] = searchRoutes('TETCBUS', 5);
         expect(hit?.entry.filter_hint).toEqual({ msn: 'TETCBUS' });
         expect(hit?.score).toBeLessThan(0.05);
-        // The SEDS id sits in its description alone, past where Fuse scores from.
-        expect(searchRoutes('MGTCB', 5).map((r) => r.entry.filter_hint)).not.toContainEqual({
-          seriesId: 'MGTCB',
-        });
       });
 
       it('keeps the same-name pair as two entries told apart by id', () => {
@@ -1177,8 +1243,12 @@ describe('data-column aliases (#97)', () => {
     indexNamedSeries('seds_series', [{ id: 'MGTCB', name: 'Motor gasoline total consumption' }]);
 
     const hinted = getIndexEntries().filter((e) => e.filter_hint !== undefined);
-    expect(hinted).toHaveLength(3);
-    for (const entry of hinted) expect(entry, entry.name).not.toHaveProperty('terms');
+    // A named series carries its own ID (#107), never its route's column aliases.
+    expect(hinted.map((e) => [e.name, e.terms])).toEqual([
+      ['Solar', undefined],
+      ['Crude oil production', ['COPRPUS']],
+      ['Motor gasoline total consumption', ['MGTCB']],
+    ]);
   });
 
   it('ranks the route first for a measure named only by its column alias', () => {

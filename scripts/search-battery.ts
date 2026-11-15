@@ -37,10 +37,11 @@ export interface BatteryQuery {
  * SEDS series, which a candidate-gate change must leave standing. Then come the
  * four benchmarks the warm-time `series`, `product`, and `respondent` targets
  * index, and a route named by the title words those targets' entries repeat
- * (#78). The last eight reach their route only through what the route-tree text
+ * (#78). The last ten reach their route only through what the route-tree text
  * leaves out: three measures named by a data column's alias (#97), a Monthly
- * Energy Review series by name and by ID (#103), and two balancing authorities
- * by the ISO/RTO acronym no EIA text carries (#102).
+ * Energy Review series by name and by ID (#103), two balancing authorities by
+ * the ISO/RTO acronym no EIA text carries (#102), and a STEO and a SEDS series
+ * by ID (#107).
  */
 export const ON_TARGET: readonly BatteryQuery[] = [
   {
@@ -182,6 +183,16 @@ export const ON_TARGET: readonly BatteryQuery[] = [
     query: 'SPP',
     route: 'electricity/rto/region-data',
     note: 'An RTO acronym naming two balancing authorities (SWPP, SWPW); a retail-sales sector value answered it before (#102). SWPP leads on all four RTO leaves, then SWPW, so the expected route ranks fourth.',
+  },
+  {
+    query: 'PATCPUSX',
+    route: 'steo',
+    note: 'A STEO series ID ("Total Petroleum and Other Liquids Product Supplied"); MER PATCPUS answered it before STEO entries carried their IDs in terms (#107).',
+  },
+  {
+    query: 'MGTCB',
+    route: 'seds',
+    note: 'A five-character SEDS series ID ("Motor gasoline total consumption"); MER MGTCBUS answered it before SEDS entries carried their IDs in terms (#107). Short IDs are where an ID term could fuzzy-match an unrelated query, which the off-target battery measures.',
   },
 ];
 

@@ -230,13 +230,13 @@ export interface SearchIndexEntry {
   route: string;
   /**
    * Short strings the entry is also searched by — the data-column aliases of a
-   * leaf's route entry ("Nameplate Capacity"), an MER series' `msn` ID, and a
-   * balancing-authority value's code and ISO/RTO acronyms (`ERCO`, `ERCOT`).
-   * Fuse scores each string on its own, so a match is not buried by the
-   * position penalty that a code or alias appended to `description` takes, and
-   * it is the entry's own match, never text inherited from its route. Absent
-   * when there is nothing to add. Search-only: `eia_search_routes` never
-   * returns it.
+   * leaf's route entry ("Nameplate Capacity"), a named series' ID (STEO and
+   * SEDS `seriesId`, MER `msn`), and a balancing-authority value's code and
+   * ISO/RTO acronyms (`ERCO`, `ERCOT`). Fuse scores each string on its own, so
+   * a match is not buried by the position penalty that a code or alias
+   * appended to `description` takes, and it is the entry's own match, never
+   * text inherited from its route. Absent when there is nothing to add.
+   * Search-only: `eia_search_routes` never returns it.
    */
   terms?: string[];
 }

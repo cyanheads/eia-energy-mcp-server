@@ -47,16 +47,16 @@ import type { Facet, RawFrequency, RawRouteNode, SearchIndexEntry } from './type
  * keyed here by that pass's name, so a vocabulary that failed to land is named
  * on its own in `getIndexStatus().pendingPasses`.
  *
- * `idTerm` also puts each series ID in the entry's `terms`, so the bare ID
- * (`TETCBUS`) finds its series — in the description it sits past the start
- * Fuse scores from, out of reach. Only MER sets it: STEO and SEDS IDs stay in
- * the description alone, where a bare ID finds nothing (`MGTCB` answers with an
- * MTBE stocks series).
+ * Every entry also carries its series ID in `terms`, so the bare ID finds its
+ * series (`TETCBUS`, `PATCPUSX`, `MGTCB`): in the description it sits past the
+ * start Fuse scores from, out of reach, so a short ID like `MGTCB` would
+ * otherwise match a longer ID's term (`MGTCBUS`) first. An ID two
+ * vocabularies share (`NGMPPUS`, in STEO and MER) reaches both entries.
  */
 export const NAMED_SERIES_FACETS = {
-  steo_series: { route: 'steo', facetId: 'seriesId', label: 'STEO', idTerm: false },
-  seds_series: { route: 'seds', facetId: 'seriesId', label: 'SEDS', idTerm: false },
-  total_energy_series: { route: 'total-energy', facetId: 'msn', label: 'MER', idTerm: true },
+  steo_series: { route: 'steo', facetId: 'seriesId', label: 'STEO' },
+  seds_series: { route: 'seds', facetId: 'seriesId', label: 'SEDS' },
+  total_energy_series: { route: 'total-energy', facetId: 'msn', label: 'MER' },
 } as const;
 
 /** An index pass that fetches one named-series facet. */
@@ -323,8 +323,8 @@ function buildEntries(nodeMap: Map<string, RawRouteNode>): SearchIndexEntry[] {
  * route once per route.
  *
  * `terms` holds short strings an entry is also searched by (data-column aliases,
- * MER series IDs, balancing-authority codes and ISO/RTO acronyms). Fuse
- * penalizes a match by how far into a field it starts
+ * STEO, SEDS, and MER series IDs, balancing-authority codes and ISO/RTO
+ * acronyms). Fuse penalizes a match by how far into a field it starts
  * (default `location` 0, `distance` 100), so text appended to `description`
  * changes nothing — "Gross Generation" at the end of a description never
  * reaches its route. As its own key, each string is scored from its own start.
@@ -1001,11 +1001,11 @@ export function indexVocabularyFacet(route: string, facet: Facet): number {
  * description, which is what tells apart the series that share a name — SEDS
  * pairs differing only in unit (`PACCB` in Billion Btu, `PACCP` in thousand
  * barrels), and one MER pair — since entries dedupe on route + hint, so both
- * stay. A facet marked `idTerm` carries the id in `terms` too. Returns how many
- * entries were added.
+ * stay. The id rides in `terms` too, where a bare-ID query reaches it. Returns
+ * how many entries were added.
  */
 export function indexNamedSeries(pass: NamedSeriesPass, values: Facet['values']): number {
-  const { route, facetId, label, idTerm } = NAMED_SERIES_FACETS[pass];
+  const { route, facetId, label } = NAMED_SERIES_FACETS[pass];
   return addEntriesToIndex(
     values.map((value) => ({
       route,
@@ -1016,7 +1016,7 @@ export function indexNamedSeries(pass: NamedSeriesPass, values: Facet['values'])
       isLeaf: true,
       category: route,
       filter_hint: { [facetId]: value.id },
-      ...(idTerm && { terms: [value.id] }),
+      terms: [value.id],
     })),
   );
 }

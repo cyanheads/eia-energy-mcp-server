@@ -20,9 +20,9 @@ Some routes to know by name, since search does not reach every phrasing (e.g. "n
 | Natural gas consumption by state and end use | `natural-gas/cons/sum` |
 | Natural gas prices by state and sector | `natural-gas/pri/sum` |
 | WTI, Brent, and product spot prices | `petroleum/pri/spt` |
-| State estimates for every energy source and sector | `seds` |
+| State estimates for every energy source and sector | `seds`, one series per `seriesId` (`MGTCB`); search finds a series by name or by its ID |
 | National monthly totals — primary energy consumption, production, trade, prices (the Monthly Energy Review) | `total-energy`, one series per `msn` (`TETCBUS`); search finds a series by name or by its `msn` |
-| 18-month forecasts | `steo` |
+| 18-month forecasts | `steo`, one series per `seriesId` (`PATCPUSX`); search finds a series by name or by its ID |
 
 ## Identifiers
 
