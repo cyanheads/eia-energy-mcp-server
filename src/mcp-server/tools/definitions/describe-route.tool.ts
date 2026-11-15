@@ -102,7 +102,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       .string()
       .min(1)
       .describe(
-        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales". Full URLs and /data suffixes are not normalized.',
+        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales". A path naming an EIA endpoint is refused: pass the route before its data or facet segment ("petroleum/pri/spt", not "petroleum/pri/spt/data"), with a facet ID in facet rather than in the path ("petroleum/pri/spt/facet/series" is route "petroleum/pri/spt", facet "series"), and give the ID of a seriesid/{id} path to eia_search_routes. Full URLs are not normalized.',
       ),
     facet: z
       .string()
@@ -284,7 +284,7 @@ export const describeRouteTool = tool('eia_describe_route', {
       reason: 'route_not_found',
       thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Route does not exist in the EIA taxonomy.',
+      when: 'Route does not exist in the EIA taxonomy, or names an EIA endpoint rather than a route: a data or facet segment, or a leading seriesid segment.',
       recovery: 'Use eia_browse_routes or eia_search_routes to discover valid leaf route paths.',
     },
     {

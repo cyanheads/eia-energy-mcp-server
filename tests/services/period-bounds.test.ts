@@ -6,7 +6,12 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { impossiblePeriod, invertedRange, lacksUtcOffset } from '@/services/eia/period-bounds.js';
+import {
+  impossiblePeriod,
+  invertedRange,
+  lacksUtcOffset,
+  rolledWeekBound,
+} from '@/services/eia/period-bounds.js';
 
 describe('invertedRange', () => {
   it.each([
@@ -119,6 +124,162 @@ describe('invertedRange', () => {
   });
 });
 
+/**
+ * Each bound and its periods are a live EIA answer unless marked: Friday weeks
+ * on `petroleum/sum/sndw` (`WCESTUS1` weekly, `WPULEUS3` four-week-average),
+ * Monday weeks on `petroleum/pri/gnd`. EIA read every hour 24–99 as the day
+ * plus ⌊hour/24⌋, offset ignored, compared as a date.
+ */
+describe('rolledWeekBound', () => {
+  const FEB_9_16 = ['2024-02-09', '2024-02-16'];
+
+  it('names the read day, the period date it left out, and the date-only start', () => {
+    expect(rolledWeekBound('start', '2024-02-02T24', 'weekly', FEB_9_16)).toBe(
+      'At the effective weekly frequency, EIA read start "2024-02-02T24" as 2024-02-03 (hour 24 carries into the next day), so the range left out any period dated 2024-02-02; pass start "2024-02-02" to include it. The submitted bound was preserved.',
+    );
+  });
+
+  it('names the read day, the period date it took in, and the date-only end', () => {
+    expect(
+      rolledWeekBound('end', '2024-02-08T24', 'weekly', ['2024-01-26', '2024-02-02', '2024-02-09']),
+    ).toBe(
+      'At the effective weekly frequency, EIA read end "2024-02-08T24" as 2024-02-09 (hour 24 carries into the next day), so the range took in any period dated 2024-02-09; pass end "2024-02-08" to leave it out. The submitted bound was preserved.',
+    );
+  });
+
+  // The weekdays place a period date, not a row: a route whose data ends
+  // before that date, or starts after it, has none there, so no row is claimed.
+  it.each([
+    ['end', '2024-02-08T24', ['2024-01-26', '2024-02-02'], 'took in any period dated 2024-02-09'],
+    [
+      'start',
+      '2024-02-02T24',
+      ['2024-02-16', '2024-02-23'],
+      'left out any period dated 2024-02-02',
+    ],
+  ] as const)('speaks of the range for %s %s past the data', (side, value, periods, effect) => {
+    const notice = rolledWeekBound(side, value, 'weekly', periods);
+    expect(notice).toContain(effect);
+    expect(notice).not.toMatch(/period was (left out|added)/);
+  });
+
+  // [side, bound, frequency, periods returned, day EIA read, period date stepped over]
+  it.each<['start' | 'end', string, string, string[], string, string]>([
+    // sndw, Friday weeks
+    ['start', '2024-02-01T48', 'weekly', ['2024-02-09'], '2024-02-03', '2024-02-02'],
+    ['start', '2024-01-30T99', 'weekly', ['2024-02-09'], '2024-02-03', '2024-02-02'],
+    ['end', '2024-02-05T99', 'weekly', ['2024-02-09'], '2024-02-09', '2024-02-09'],
+    ['end', '2024-02-08T47', 'weekly', ['2024-02-09'], '2024-02-09', '2024-02-09'],
+    ['start', '2024-02-02T24', 'four-week-average', FEB_9_16, '2024-02-03', '2024-02-02'],
+    [
+      'end',
+      '2024-02-08T24',
+      'four-week-average',
+      ['2024-02-02', '2024-02-09'],
+      '2024-02-09',
+      '2024-02-09',
+    ],
+    // A UTC offset does not move the read day: +05 and -06 both read as 2024-02-03.
+    ['start', '2024-02-02T24+05', 'weekly', FEB_9_16, '2024-02-03', '2024-02-02'],
+    ['start', '2024-02-02T24-06', 'weekly', FEB_9_16, '2024-02-03', '2024-02-02'],
+    // gnd, Monday weeks
+    ['start', '2024-02-05T24', 'weekly', ['2024-02-12', '2024-02-19'], '2024-02-06', '2024-02-05'],
+    [
+      'end',
+      '2024-02-04T24',
+      'weekly',
+      ['2024-01-22', '2024-01-29', '2024-02-05'],
+      '2024-02-05',
+      '2024-02-05',
+    ],
+    // By the model, across a month and a year end (2024-03-01 and 2025-01-03 are Fridays).
+    ['end', '2024-02-29T24', 'weekly', ['2024-02-23'], '2024-03-01', '2024-03-01'],
+    ['end', '2024-12-31T72', 'weekly', ['2024-12-27'], '2025-01-03', '2025-01-03'],
+  ])('discloses %s %s at %s', (side, value, frequency, periods, read, stepped) => {
+    const notice = rolledWeekBound(side, value, frequency, periods);
+    expect(notice).toContain(`effective ${frequency} frequency`);
+    expect(notice).toContain(`read ${side} ${JSON.stringify(value)} as ${read}`);
+    expect(notice).toContain(
+      side === 'start'
+        ? `left out any period dated ${stepped}; pass start "${value.slice(0, 10)}"`
+        : `took in any period dated ${stepped}; pass end "${value.slice(0, 10)}"`,
+    );
+  });
+
+  it.each([
+    [1, '2024-02-01T24', 'into the next day'],
+    [1, '2024-02-01T47', 'into the next day'],
+    [2, '2024-02-01T48', '2 days forward'],
+    [4, '2024-01-30T99', '4 days forward'],
+  ])('says how far an hour carries (%i days, %s)', (_days, value, carry) => {
+    const hour = value.slice(-2);
+    expect(rolledWeekBound('start', value, 'weekly', [])).toContain(
+      `(hour ${hour} carries ${carry})`,
+    );
+  });
+
+  it.each<[string, 'start' | 'end', string, string, string[]]>([
+    ['sndw', 'start', '2024-02-01T24', 'weekly', ['2024-02-02', '2024-02-09']],
+    ['sndw', 'start', '2024-02-01T47', 'weekly', ['2024-02-02']],
+    ['sndw', 'start', '2024-01-29T99', 'weekly', ['2024-02-02', '2024-02-09', '2024-02-16']],
+    ['sndw', 'end', '2024-02-09T24', 'weekly', ['2024-02-02', '2024-02-09']],
+    ['sndw', 'end', '2024-02-04T99', 'weekly', ['2024-02-02']],
+    ['gnd', 'start', '2024-02-02T24', 'weekly', ['2024-02-05']],
+    ['gnd', 'end', '2024-02-08T24', 'weekly', ['2024-02-05']],
+    ['sndw', 'start', '2024-02-01T24', 'four-week-average', ['2024-02-02', '2024-02-09']],
+    // A real hour is read as its own day.
+    ['sndw', 'start', '2024-02-02T05', 'weekly', ['2024-02-02', '2024-02-09', '2024-02-16']],
+    ['sndw', 'end', '2024-02-08T23', 'weekly', ['2024-01-26', '2024-02-02']],
+    ['sndw', 'start', '2024-02-02T00', 'weekly', ['2024-02-02']],
+    // Bounds this function leaves to the pre-request check or to EIA.
+    ['sndw', 'start', '2024-02-02', 'weekly', ['2024-02-09']],
+    ['sndw', 'start', '2024-02-30T24', 'weekly', ['2024-03-01']],
+    ['sndw', 'start', '2024-02-02T5', 'weekly', ['2024-02-09']],
+    ['sndw', 'start', '2024-13-02T24', 'weekly', ['2024-02-09']],
+    ['sndw', 'start', 'last week', 'weekly', ['2024-02-09']],
+  ])('adds nothing for %s %s %s at %s', (_route, side, value, frequency, periods) => {
+    expect(rolledWeekBound(side, value, frequency, periods)).toBeUndefined();
+  });
+
+  // #101's pre-request check owns every other frequency; an empty answer says nothing either.
+  it.each(['daily', 'hourly', 'local-hourly', 'monthly', 'quarterly', 'annual', 'four-week', ''])(
+    'adds nothing at %s',
+    (frequency) => {
+      expect(rolledWeekBound('start', '2024-02-02T24', frequency, ['2024-02-09'])).toBeUndefined();
+      expect(rolledWeekBound('start', '2024-02-02T24', frequency, [])).toBeUndefined();
+    },
+  );
+
+  /**
+   * With no period to place the week-ending dates — no rows, or none dated —
+   * the notice names EIA's reading and the date-only bound, never a period it
+   * cannot see (sndw start 2024-02-02T24, end 2024-02-08 returned total 0).
+   */
+  it.each<[string, 'start' | 'end', string, Array<string | null | undefined>, string, string]>([
+    ['no rows', 'start', '2024-02-02T24', [], '2024-02-03', '"2024-02-02"'],
+    ['no rows', 'end', '2024-02-05T99', [], '2024-02-09', '"2024-02-05"'],
+    [
+      'no dated period',
+      'start',
+      '2024-02-02T24',
+      [null, undefined, '2024-W05', '2024-02', '2024-02-30', '2024-02-02T05'],
+      '2024-02-03',
+      '"2024-02-02"',
+    ],
+  ])('names EIA’s reading with %s (%s %s)', (_case, side, value, periods, read, dateOnly) => {
+    expect(rolledWeekBound(side, value, 'weekly', periods)).toBe(
+      `At the effective weekly frequency, EIA read ${side} ${JSON.stringify(value)} as ${read} (hour ${value.slice(-2)} carries ${value.endsWith('T24') ? 'into the next day' : '4 days forward'}); pass ${side} ${dateOnly} to have it read as the day it names. The submitted bound was preserved.`,
+    );
+  });
+
+  // Periods of another weekday on the same page still place theirs.
+  it('locates a period date from any weekday the answer carries', () => {
+    expect(
+      rolledWeekBound('start', '2024-02-05T24', 'weekly', ['2024-02-09', '2024-02-12']),
+    ).toContain('left out any period dated 2024-02-05');
+  });
+});
+
 describe('lacksUtcOffset', () => {
   // Each shape EIA answered with HTTP 500 at local-hourly.
   it.each(['2024-02-01T02', '2024-02-01', '2024-02', '2024-Q1', '2024'])('flags %s', (value) => {
@@ -193,10 +354,12 @@ describe('impossiblePeriod', () => {
   /**
    * A weekly period is a week-ending date, so an hour 24–99 that rolls a real
    * day forward selects the period the named day selects unless a period date
-   * falls in between — which depends on the route's weekly calendar. Live EIA
+   * falls in between — which depends on the route's weekly calendar, so it is
+   * sent, and `rolledWeekBound` reads the crossing from the answer. Live EIA
    * (`petroleum/sum/sndw`, Friday periods) answered start 2024-02-01T24 exactly
    * as start 2024-02-01 (from 2024-02-02, 143 rows) and end 2024-02-05T24
-   * exactly as end 2024-02-05 (through 2024-02-02, 2,141 rows).
+   * exactly as end 2024-02-05 (through 2024-02-02, 2,141 rows), while end
+   * 2024-02-05T99, read as 2024-02-09, ran through 2024-02-09.
    */
   it.each([
     ['weekly', '2024-02-01T24'],
@@ -381,10 +544,11 @@ describe('impossiblePeriod', () => {
 
   /**
    * A bound is caller text of any length, and with no frequency known it now
-   * reaches `impossiblePeriod` as well. Thread CPU per batch of calls at
-   * doubling sizes: an absolute bound at each size, then the span ratio, never
-   * a single step. The shapes a pattern could stall on stop below 80k
-   * characters; the digit run carries the full 5k–320k span.
+   * reaches `impossiblePeriod` as well, and `rolledWeekBound` once EIA has
+   * answered. Thread CPU per batch of calls at doubling sizes: an absolute
+   * bound at each size, then the span ratio, never a single step. The shapes a
+   * pattern could stall on stop below 80k characters; the digit run carries
+   * the full 5k–320k span.
    */
   describe('work over caller-sized text', () => {
     /** Thread CPU milliseconds for `reps` runs of `fn`, the least of three trials. */
@@ -414,6 +578,7 @@ describe('impossiblePeriod', () => {
         const ms = cpuMs(() => {
           verdicts.add(impossiblePeriod(text, undefined));
           verdicts.add(impossiblePeriod(text, 'monthly'));
+          verdicts.add(rolledWeekBound('start', text, 'weekly', []));
         }, reps);
         expect(ms, `${reps} checks at ${n} characters`).toBeLessThan(2_000);
         timings.push(ms);

@@ -22,7 +22,7 @@ export const browseRoutesTool = tool('eia_browse_routes', {
       .string()
       .optional()
       .describe(
-        'Route path to browse (e.g. "electricity", "petroleum/pri"). Omit for root. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales", and "/v2/" to root. Full URLs and /data suffixes are not normalized.',
+        'Route path to browse (e.g. "electricity", "petroleum/pri"). Omit for root. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales", and "/v2/" to root. A path naming an EIA endpoint is refused: pass the route before its data or facet segment ("petroleum/pri/spt", not "petroleum/pri/spt/data" or "petroleum/pri/spt/facet/series"), and give the ID of a seriesid/{id} path to eia_search_routes. Full URLs are not normalized.',
       ),
   }),
 
@@ -82,7 +82,7 @@ export const browseRoutesTool = tool('eia_browse_routes', {
       reason: 'route_not_found',
       thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Path does not exist in the EIA taxonomy.',
+      when: 'Path does not exist in the EIA taxonomy, or names an EIA endpoint rather than a route: a data or facet segment, or a leading seriesid segment.',
       recovery: 'Call eia_browse_routes without a path to see valid top-level categories.',
     },
     {

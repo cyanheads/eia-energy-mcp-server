@@ -518,6 +518,66 @@ describe('a cold browse, describe, or query answers within a bounded wait (#74)'
 });
 
 // ------------------------------------------------------------------
+// #108 — before the tree lands, a live browse took EIA's `{route}/data` and
+// `{route}/facet/{id}` answers for leaves, and a live describe or query cached
+// them as route metadata. The refusal comes before the wait on the tree, so a
+// cold call neither starts the warm nor waits out its budget.
+// ------------------------------------------------------------------
+
+describe('a cold call refuses an EIA endpoint path before any request (#108)', () => {
+  it.each([
+    'electricity/retail-sales/data',
+    '/v2/electricity/retail-sales/data/',
+    'electricity/retail-sales/facet',
+    'electricity/retail-sales/facet/stateid',
+    'seriesid/ELEC.SALES.TX-ALL.A',
+  ])('refuses %s from browse, describe, and query at once', async (route) => {
+    const eia = stubEia(coldBodies());
+    const ctx = createMockContext();
+    const calls: Promise<unknown>[] = [
+      getEiaApiService().browse(route, ctx),
+      getEiaApiService().describe(route, ctx),
+      getEiaApiService().query(route, { columns: ['price'] }, ctx),
+    ];
+    for (const call of calls) call.catch(() => undefined);
+    const states = calls.map(tracked);
+
+    // No time passes: each call settles without waiting on the tree.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(states.map((s) => s.settled)).toEqual([true, true, true]);
+    for (const call of calls) {
+      await expect(call).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'route_not_found' },
+      });
+    }
+    expect(eia.fetches).toEqual([]);
+    expect(isRouteCacheReady()).toBe(false);
+  });
+
+  it('names the route before /data on a cold eia_browse_routes call', async () => {
+    const eia = stubEia(coldBodies());
+
+    const result = await runToolContract(browseRoutesTool, {
+      path: 'electricity/retail-sales/data',
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: {
+          reason: 'route_not_found',
+          recovery: {
+            hint: "Resend the same call with route electricity/retail-sales, the route before /data; the server requests EIA's /data endpoint itself.",
+          },
+        },
+      },
+    });
+    expect(eia.fetches).toEqual([]);
+  });
+});
+
+// ------------------------------------------------------------------
 // #75 — browse and search reach EIA through the cold build, whose fetches can
 // fail as rate_limited, so both declare it as describe and query do.
 // ------------------------------------------------------------------

@@ -9,7 +9,9 @@
  * instants. `weekly` periods are dates, compared as days. A bound naming a
  * month, day, or hour that does not exist is never read as written: EIA rolls
  * it into another day or answers HTTP 500, and `impossiblePeriod` names the
- * ones EIA would not answer with the period the bound names.
+ * ones EIA would not answer with the period the bound names. The one rollover
+ * whose period depends on the route — an hour 24–99 at a weekly frequency — is
+ * judged from EIA's answer by `rolledWeekBound`.
  * @module services/eia/period-bounds
  */
 
@@ -160,7 +162,8 @@ const DAY_OR_HOUR_FREQUENCIES = new Set(['daily', 'hourly', 'local-hourly']);
  * no day to select from (and draws HTTP 500 in the strict `YYYY-MM-DD` shape);
  * an hour 24–99 rolls a real day forward by at most four days, which selects
  * the period the named day selects unless a period date falls in between — a
- * matter of the route's weekly calendar, which this module does not know.
+ * matter of the route's weekly calendar, which only the periods EIA answers
+ * with reveal (`rolledWeekBound`).
  */
 const WEEK_FREQUENCIES = new Set(['weekly', 'four-week-average']);
 
@@ -180,10 +183,12 @@ const WEEK_FREQUENCIES = new Set(['weekly', 'four-week-average']);
  * inside it: `2024-02-30` at quarterly or annual, `2024-01-15T99` at monthly.
  * At weekly and four-week-average a day the month lacks is refused and an hour
  * 24–99 is left to EIA (`WEEK_FREQUENCIES`): start `2024-02-01T24` selects the
- * same week as `2024-02-01` on a route whose weeks end on Fridays. With no
- * frequency known, or one this module does not model, the rollover is left to
- * EIA. An out-of-range UTC offset reads leniently and an out-of-range quarter
- * draws EIA's own 400, so neither is checked.
+ * same week as `2024-02-01` on a route whose weeks end on Fridays, and where
+ * the rolled day steps over a week-ending date, `rolledWeekBound` discloses it
+ * once EIA has answered. With no frequency known, or one this module does not
+ * model, the rollover is left to EIA. An out-of-range UTC offset reads
+ * leniently and an out-of-range quarter draws EIA's own 400, so neither is
+ * checked.
  */
 export function impossiblePeriod(value: string, frequency: string | undefined): string | undefined {
   const bound = lexBound(value);
@@ -341,4 +346,74 @@ export function invertedRange(start: string, end: string, frequency: string): st
       ? `A coarse end selects only its first period — pass end ${JSON.stringify(widened)} to cover all of ${end}.`
       : 'Swap start and end.';
   return `Date range is inverted at the effective ${frequency} frequency: start ${JSON.stringify(start)} selects ${from.label}, after end ${JSON.stringify(end)}, which selects ${to.label}. ${fix}`;
+}
+
+/** Days since 1970-01-01; unlike `Date.UTC`, a year before 100 stays that year. */
+function dayNumber(year: number, month: number, day: number): number {
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  return date.getTime() / DAY_MS;
+}
+
+function dayLabel(dayNo: number): string {
+  const date = new Date(dayNo * DAY_MS);
+  return `${pad(date.getUTCFullYear(), 4)}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+}
+
+function weekday(dayNo: number): number {
+  return ((dayNo % 7) + 7) % 7;
+}
+
+/**
+ * The notice for a `weekly` or `four-week-average` bound with an hour 24–99,
+ * which `impossiblePeriod` sends — given the frequency EIA reports and the
+ * `period` of each row it returned — or undefined when there is nothing to
+ * disclose. EIA reads such a bound as its day plus ⌊hour/24⌋, any UTC offset
+ * ignored, and compares that day as a date (measured on Friday- and
+ * Monday-ending routes), so it selects another week than the named day when a
+ * period date falls between them: from the named day to the day before the
+ * read one for a start, which leaves that date out of the range, and from the
+ * day after the named one through the read one for an end, which takes it in.
+ * A route's weekly periods share a weekday and a rollover spans at most four
+ * days, so the weekdays of the returned periods place any period date in that
+ * gap; none there is undefined. Whether the route has a row at that date —
+ * none past either end of its data — only another request could tell, so the
+ * notice speaks of the range. With no dated period to place one from (no rows),
+ * the notice names EIA's reading and the date-only bound alone.
+ */
+export function rolledWeekBound(
+  side: 'start' | 'end',
+  value: string,
+  frequency: string,
+  periods: ReadonlyArray<string | null | undefined>,
+): string | undefined {
+  if (!WEEK_FREQUENCIES.has(frequency)) return;
+  const bound = lexBound(value);
+  if (!bound || impossibleComponent(bound)?.rollover !== 'hour') return;
+  const named = dayNumber(Number(bound.year), Number(bound.month), Number(bound.day));
+  const days = Math.floor(Number(bound.hour) / 24);
+
+  const periodWeekdays = new Set<number>();
+  for (const period of periods) {
+    const date = period ? parseBound(period) : undefined;
+    if (date?.precision === 'day')
+      periodWeekdays.add(weekday(dayNumber(date.year, date.month, date.day)));
+  }
+
+  const dateOnly = `${bound.year}-${bound.month}-${bound.day}`;
+  const carry = days === 1 ? 'into the next day' : `${days} days forward`;
+  const reading = `At the effective ${frequency} frequency, EIA read ${side} ${JSON.stringify(value)} as ${dayLabel(named + days)} (hour ${bound.hour} carries ${carry})`;
+  const preserved = 'The submitted bound was preserved.';
+  if (periodWeekdays.size === 0) {
+    return `${reading}; pass ${side} ${JSON.stringify(dateOnly)} to have it read as the day it names. ${preserved}`;
+  }
+  const first = side === 'start' ? named : named + 1;
+  const gap = Array.from({ length: days }, (_, i) => first + i);
+  const stepped = gap.find((dayNo) => periodWeekdays.has(weekday(dayNo)));
+  if (stepped === undefined) return;
+  const effect =
+    side === 'start'
+      ? `so the range left out any period dated ${dayLabel(stepped)}; pass start ${JSON.stringify(dateOnly)} to include it`
+      : `so the range took in any period dated ${dayLabel(stepped)}; pass end ${JSON.stringify(dateOnly)} to leave it out`;
+  return `${reading}, ${effect}. ${preserved}`;
 }

@@ -14,6 +14,7 @@ import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testi
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetServerConfig } from '@/config/server-config.js';
+import { browseRoutesTool } from '@/mcp-server/tools/definitions/browse-routes.tool.js';
 import { describeRouteTool } from '@/mcp-server/tools/definitions/describe-route.tool.js';
 import { queryRouteTool } from '@/mcp-server/tools/definitions/query-route.tool.js';
 import {
@@ -3208,7 +3209,6 @@ describe('EiaApiService — route path normalization (#53)', () => {
     ['v20/electricity', 'v20/electricity'],
     ['electricity/v2/retail-sales', 'electricity/v2/retail-sales'],
     ['v2/v2/steo', 'v2/steo'],
-    ['v2/steo/data', 'steo/data'],
     ['https://api.eia.gov/v2/steo', 'https:/api.eia.gov/v2/steo'],
   ])('only removes one leading complete v2 segment from %s', async (route, canonical) => {
     const { urls } = stubApiPaths({
@@ -3221,6 +3221,450 @@ describe('EiaApiService — route path normalization (#53)', () => {
     );
     expect(result.route).toBe(canonical);
     expect(urls[0]?.pathname).toBe(`/v2/${canonical}/data/`);
+  });
+});
+
+// ------------------------------------------------------------------
+// #108 — EIA serves endpoints beneath a route: `{route}/data` answers with
+// rows, `{route}/facet` and `{route}/facet/{id}` with facet IDs and values, and
+// `seriesid/{id}` with a series' rows, all in shapes the leaf classifier takes
+// for route metadata. A describe reported the rows as data columns and cached
+// them, a query sent every row index as a data[] column, and a cold browse
+// called each path a leaf. The three route-taking methods refuse such a path
+// where they normalize it, before any request. Every metadata cache write
+// follows an upstream answer, so a refusal that made no request cached nothing.
+// ------------------------------------------------------------------
+
+describe('EiaApiService — EIA endpoint paths are refused (#108)', () => {
+  const SPT = 'petroleum/pri/spt';
+  const SPT_META = {
+    id: 'petroleum',
+    name: 'Spot Prices',
+    description: 'Spot prices',
+    facets: [{ id: 'series', description: 'Series' }],
+    frequency: [{ id: 'daily', description: 'Daily', query: 'D', format: 'YYYY-MM-DD' }],
+    data: { value: { alias: 'Value', units: '$/BBL' } },
+    startPeriod: '1986-01-02',
+    endPeriod: '2025-11-10',
+    defaultFrequency: 'daily',
+    defaultDateFormat: 'YYYY-MM-DD',
+  };
+  const ROWS = {
+    response: {
+      total: '1',
+      dateFormat: 'YYYY-MM-DD',
+      frequency: 'daily',
+      data: [{ period: '2025-09-16', series: 'RWTC', value: '64.89', units: '$/BBL' }],
+    },
+  };
+  /**
+   * What EIA answers at each path, as measured live: every endpoint path comes
+   * back 200 with rows or a value list, and `{route}/data/data` repeats the
+   * rows of `{route}/data`. Every other path answers 404.
+   */
+  const BODIES = {
+    [SPT]: { response: SPT_META },
+    [`${SPT}/facet`]: { response: { totalFacetOptions: 1, facetOptions: ['series'] } },
+    [`${SPT}/facet/series`]: {
+      response: { totalFacets: 1, facets: [{ id: 'RWTC', name: 'WTI' }] },
+    },
+    [`${SPT}/data`]: ROWS,
+    [`${SPT}/data/data`]: ROWS,
+    'seriesid/PET.RWTC.W': {
+      response: {
+        id: 'PET.RWTC.W',
+        total: 1,
+        data: [{ period: '2025-09-12', value: 63.0, units: '$/BBL' }],
+      },
+    },
+  };
+
+  const ROOT_HINT = 'Call eia_browse_routes without a path to see valid top-level categories.';
+  const SPT_DATA_HINT =
+    "Resend the same call with route petroleum/pri/spt, the route before /data; the server requests EIA's /data endpoint itself.";
+  const SPT_FACET_HINT = (facet: string) =>
+    `Pass route petroleum/pri/spt, the route before /facet. To list the values of facet ${facet}, call eia_describe_route with route petroleum/pri/spt and facet ${facet}.`;
+  const SERIES_HINT =
+    'Pass the series ID PET.RWTC.W to eia_search_routes, which resolves it to its route, filters, frequency, and columns.';
+
+  /** Input, the normalized route the message names, the hint, and the values rendered as code. */
+  const REFUSED: Array<[string, string, string, string[]]> = [
+    [`${SPT}/data`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`${SPT}/data/`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`/v2/${SPT}/data`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`${SPT}/data/data`, `${SPT}/data/data`, SPT_DATA_HINT, [`${SPT}/data/data`, SPT]],
+    [
+      'petroleum/pri/data',
+      'petroleum/pri/data',
+      "Resend the same call with route petroleum/pri, the route before /data; the server requests EIA's /data endpoint itself.",
+      ['petroleum/pri/data', 'petroleum/pri'],
+    ],
+    [
+      `${SPT}/facet`,
+      `${SPT}/facet`,
+      'Pass route petroleum/pri/spt, the route before /facet. eia_describe_route with route petroleum/pri/spt lists its facets and their values.',
+      [`${SPT}/facet`, SPT],
+    ],
+    [
+      `${SPT}/facet/series`,
+      `${SPT}/facet/series`,
+      SPT_FACET_HINT('series'),
+      [`${SPT}/facet/series`, SPT, 'series'],
+    ],
+    [
+      `${SPT}/facet/bogus`,
+      `${SPT}/facet/bogus`,
+      SPT_FACET_HINT('bogus'),
+      [`${SPT}/facet/bogus`, SPT, 'bogus'],
+    ],
+    [
+      `${SPT}/facet/series/facet/series`,
+      `${SPT}/facet/series/facet/series`,
+      SPT_FACET_HINT('series'),
+      [`${SPT}/facet/series/facet/series`, SPT, 'series'],
+    ],
+    [
+      'seriesid/PET.RWTC.W',
+      'seriesid/PET.RWTC.W',
+      SERIES_HINT,
+      ['seriesid/PET.RWTC.W', 'PET.RWTC.W'],
+    ],
+    [
+      '/v2/seriesid/PET.RWTC.W/',
+      'seriesid/PET.RWTC.W',
+      SERIES_HINT,
+      ['seriesid/PET.RWTC.W', 'PET.RWTC.W'],
+    ],
+    [
+      'seriesid/PET.RWTC.W/data',
+      'seriesid/PET.RWTC.W/data',
+      SERIES_HINT,
+      ['seriesid/PET.RWTC.W/data', 'PET.RWTC.W'],
+    ],
+    [
+      'seriesid',
+      'seriesid',
+      'Pass a legacy APIv1 series ID such as PET.RWTC.W to eia_search_routes, which resolves it to its route, filters, frequency, and columns.',
+      [],
+    ],
+    ['data', 'data', ROOT_HINT, []],
+    ['facet/series', 'facet/series', ROOT_HINT, []],
+    // Spellings the request URL's parser rewrites into an endpoint path: the
+    // check reads the path EIA would receive, not the string as typed.
+    [`${SPT}/data?frequency=daily`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`${SPT}/data#rows`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    ['petroleum\\pri\\spt\\data', `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`${SPT}/da\tta`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`${SPT}/da\nta`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`${SPT}/ /data`, `${SPT}/data`, SPT_DATA_HINT, [`${SPT}/data`, SPT]],
+    [`${SPT}/%64ata`, `${SPT}/%64ata`, SPT_DATA_HINT, [`${SPT}/%64ata`, SPT]],
+    [
+      'petroleum\\pri\\spt\\facet\\series',
+      `${SPT}/facet/series`,
+      SPT_FACET_HINT('series'),
+      [`${SPT}/facet/series`, SPT, 'series'],
+    ],
+    [
+      `${SPT}/facet?`,
+      `${SPT}/facet`,
+      'Pass route petroleum/pri/spt, the route before /facet. eia_describe_route with route petroleum/pri/spt lists its facets and their values.',
+      [`${SPT}/facet`, SPT],
+    ],
+    ...[
+      './seriesid/PET.RWTC.W',
+      'x/../seriesid/PET.RWTC.W',
+      '%2e/seriesid/PET.RWTC.W',
+      'seriesid\\PET.RWTC.W',
+      'series\tid/PET.RWTC.W',
+    ].map((input): [string, string, string, string[]] => [
+      input,
+      'seriesid/PET.RWTC.W',
+      SERIES_HINT,
+      ['seriesid/PET.RWTC.W', 'PET.RWTC.W'],
+    ]),
+  ];
+
+  /** The tree EIA serves above the spot-price leaf, as the warm leaves it. */
+  function seedSpotTree() {
+    initRouteCache(
+      [
+        {
+          id: 'petroleum',
+          name: 'Petroleum',
+          routes: [{ id: 'pri', name: 'Prices', routes: [{ ...SPT_META, id: 'spt' }] }],
+        },
+      ],
+      [],
+    );
+  }
+
+  beforeEach(() => {
+    vi.stubEnv('EIA_API_KEY', 'test-key');
+    vi.stubEnv('EIA_BASE_URL', 'https://api.eia.gov/v2');
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+    initEiaApiService();
+    seedSpotTree();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    _resetServerConfig();
+    _resetRouteCache();
+    _resetEiaApiService();
+  });
+
+  it.each(REFUSED)(
+    'refuses %s from browse, describe, and query before any request',
+    async (input, route, hint, literals) => {
+      const { fetchMock } = stubApiPaths(BODIES);
+      const ctx = createMockContext();
+      const calls = [
+        () => getEiaApiService().browse(input, ctx),
+        () => getEiaApiService().describe(input, ctx),
+        () => getEiaApiService().query(input, {}, ctx),
+        () => getEiaApiService().query(input, { columns: ['value'] }, ctx),
+      ];
+
+      for (const call of calls) {
+        const err = await call().then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(err).toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          message: `Route ${route} is an EIA API endpoint, not a route in the EIA taxonomy.`,
+          data: { reason: 'route_not_found', recovery: { hint } },
+        });
+        expect(new Set((err as { literals?: readonly string[] }).literals ?? [])).toEqual(
+          new Set(literals),
+        );
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('describes and queries the route before the segment afterwards as a fresh process would', async () => {
+    const { paths, urls } = stubApiPaths(BODIES);
+    const ctx = createMockContext();
+    for (const [input] of REFUSED) {
+      await getEiaApiService()
+        .describe(input, ctx)
+        .catch(() => undefined);
+      await getEiaApiService()
+        .query(input, { columns: ['value'] }, ctx)
+        .catch(() => undefined);
+    }
+    expect(paths).toEqual([]);
+
+    const meta = await getEiaApiService().describe(SPT, ctx);
+    expect(meta.route).toBe(SPT);
+    expect(meta.dataColumns.map((c) => c.id)).toEqual(['value']);
+    expect(meta.facets.map((f) => [f.id, f.values.map((v) => v.id)])).toEqual([
+      ['series', ['RWTC']],
+    ]);
+    expect(paths).toEqual([SPT, `${SPT}/facet/series`]);
+
+    const result = await getEiaApiService().query(
+      SPT,
+      { filters: { series: 'RWTC' }, frequency: 'daily' },
+      ctx,
+    );
+    expect(result).toMatchObject({ route: SPT, total: 1, data: ROWS.response.data });
+    const dataUrl = urls.at(-1);
+    expect(dataUrl?.pathname).toBe(`/v2/${SPT}/data/`);
+    expect(dataUrl?.searchParams.getAll('data[]')).toEqual(['value']);
+  });
+
+  it.each(['../steo', 'petroleum/../../steo', '..'])(
+    'refuses %s, which climbs above the API root, before any request',
+    async (input) => {
+      const { fetchMock } = stubApiPaths(BODIES);
+      const ctx = createMockContext();
+      for (const call of [
+        () => getEiaApiService().browse(input, ctx),
+        () => getEiaApiService().describe(input, ctx),
+        () => getEiaApiService().query(input, { columns: ['value'] }, ctx),
+      ]) {
+        await expect(call()).rejects.toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          message: `Route "${input}" not found in the EIA taxonomy.`,
+          data: { reason: 'route_not_found', recovery: { hint: ROOT_HINT } },
+        });
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    SPT,
+    `/v2/${SPT}/`,
+    'petroleum//pri/spt',
+    'petroleum\\pri\\spt',
+    'petroleum/ /pri/spt',
+    'petroleum/x/../pri/./spt',
+    `${SPT}?frequency=daily`,
+  ])('resolves %s as the route itself', async (input) => {
+    const { paths } = stubApiPaths(BODIES);
+    const ctx = createMockContext();
+
+    expect(await getEiaApiService().browse(input, ctx)).toEqual({
+      path: SPT,
+      children: [],
+      isLeaf: true,
+    });
+    expect((await getEiaApiService().describe(input, ctx)).route).toBe(SPT);
+    expect((await getEiaApiService().query(input, { columns: ['value'] }, ctx)).route).toBe(SPT);
+    expect(paths).toEqual([SPT, `${SPT}/facet/series`, `${SPT}/data`]);
+  });
+
+  // Segment equality, never substring: a segment that only contains an
+  // endpoint name, or a seriesid segment that does not lead, still reaches EIA.
+  it.each([
+    `${SPT}/database`,
+    `${SPT}/facets`,
+    `${SPT}/metadata`,
+    `${SPT}/DATA`,
+    'petroleum/seriesid/PET.RWTC.W',
+    'seriesids/PET.RWTC.W',
+  ])('sends %s to EIA rather than refusing it', async (input) => {
+    const { paths } = stubApiPaths(BODIES);
+    await expect(getEiaApiService().describe(input, createMockContext())).rejects.toMatchObject({
+      data: {
+        reason: 'route_not_found',
+        recovery: {
+          hint: 'Use eia_browse_routes or eia_search_routes to discover valid route paths.',
+        },
+      },
+    });
+    expect(paths).toEqual([input]);
+  });
+
+  describe('through the tools', () => {
+    const text = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+
+    it('eia_query_route with columns names the route to resend on both surfaces', async () => {
+      const { fetchMock } = stubApiPaths(BODIES);
+
+      const result = await runToolContract(queryRouteTool, {
+        route: `${SPT}/data/`,
+        columns: ['value'],
+        filters: { series: 'RWTC' },
+        frequency: 'daily',
+        length: 3,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message:
+            'Route petroleum/pri/spt/data is an EIA API endpoint, not a route in the EIA taxonomy.',
+          data: { reason: 'route_not_found', recovery: { hint: SPT_DATA_HINT } },
+        },
+      });
+      expect(text(result)).toContain(
+        'Error: Route `petroleum/pri/spt/data` is an EIA API endpoint, not a route in the EIA taxonomy.',
+      );
+      expect(text(result)).toContain(
+        "Recovery: Resend the same call with route `petroleum/pri/spt`, the route before /data; the server requests EIA's /data endpoint itself.",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('eia_describe_route names the facet to describe on both surfaces', async () => {
+      const { fetchMock } = stubApiPaths(BODIES);
+
+      const result = await runToolContract(describeRouteTool, { route: `${SPT}/facet/series` });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          data: { reason: 'route_not_found', recovery: { hint: SPT_FACET_HINT('series') } },
+        },
+      });
+      expect(text(result)).toContain(
+        'Recovery: Pass route `petroleum/pri/spt`, the route before /facet. To list the values of facet `series`, call eia_describe_route with route `petroleum/pri/spt` and facet `series`.',
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('eia_browse_routes names eia_search_routes for a series ID on both surfaces', async () => {
+      const { fetchMock } = stubApiPaths(BODIES);
+
+      const result = await runToolContract(browseRoutesTool, { path: 'seriesid/PET.RWTC.W' });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message:
+            'Route seriesid/PET.RWTC.W is an EIA API endpoint, not a route in the EIA taxonomy.',
+          data: { reason: 'route_not_found', recovery: { hint: SERIES_HINT } },
+        },
+      });
+      expect(text(result)).toContain(
+        'Error: Route `seriesid/PET.RWTC.W` is an EIA API endpoint, not a route in the EIA taxonomy.',
+      );
+      expect(text(result)).toContain(
+        'Recovery: Pass the series ID `PET.RWTC.W` to eia_search_routes, which resolves it to its route, filters, frequency, and columns.',
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * A route is caller text of any length, and a refusal now quotes it in the
+   * message and passes it, and the route before the refused segment, as
+   * `literals`, which the framework matches against the message and hint while
+   * rendering `content[]`. Thread CPU of one refusal through eia_browse_routes
+   * at doubling sizes: an absolute bound at each size before the next, then the
+   * 320k/5k growth, least over pairs that time 5k again beside 320k.
+   */
+  describe('work over caller-sized text', () => {
+    /** Thread CPU milliseconds of one refusal, the least of five. */
+    async function cpuMs(path: string): Promise<number> {
+      let best = Number.POSITIVE_INFINITY;
+      for (let trial = 0; trial < 5; trial++) {
+        const start = process.threadCpuUsage();
+        const result = await runToolContract(browseRoutesTool, { path });
+        const used = process.threadCpuUsage(start);
+        expect(result.structuredContent).toMatchObject({
+          error: { data: { reason: 'route_not_found' } },
+        });
+        best = Math.min(best, (used.user + used.system) / 1000);
+      }
+      return best;
+    }
+
+    it.each([
+      ['a long digit run before /data', (n: number) => `${'1'.repeat(n)}/data`],
+      ['many segments before /data', (n: number) => `${'a/'.repeat(n / 2)}data`],
+      [
+        'many segments around /facet',
+        (n: number) => `${'a/'.repeat(n / 4)}facet/${'a/'.repeat(n / 4)}`,
+      ],
+      ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny/data`],
+      ['line breaks throughout', (n: number) => `x${'  \r\n'.repeat(n / 4)}x/data`],
+    ])(
+      'stays linear on %s',
+      async (_name, shape) => {
+        stubApiPaths(BODIES);
+        for (let n = 5_000; n <= 320_000; n *= 2) {
+          const ms = await cpuMs(shape(n));
+          expect(ms, `one refusal at ${n} characters`).toBeLessThan(500);
+        }
+        let growth = Number.POSITIVE_INFINITY;
+        for (let pair = 0; pair < 3; pair++) {
+          const small = Math.max(await cpuMs(shape(5_000)), 0.05);
+          growth = Math.min(growth, (await cpuMs(shape(320_000))) / small);
+        }
+        expect(growth).toBeLessThan(256);
+      },
+      120_000,
+    );
   });
 });
 
@@ -4989,7 +5433,7 @@ describe('EiaApiService — named-series facets indexed whole (#57)', () => {
     return getIndexEntries().filter((e) => e.filter_hint?.[facetId] !== undefined).length;
   }
 
-  it('indexes a STEO series in the shape it has always had', async () => {
+  it('indexes a STEO series with its seriesId filter hint and its id in terms', async () => {
     stubHeldApiPaths(warmBodies());
 
     await getEiaApiService().search('Brent', 5, createMockContext());
@@ -5001,6 +5445,7 @@ describe('EiaApiService — named-series facets indexed whole (#57)', () => {
       isLeaf: true,
       category: 'steo',
       filter_hint: { seriesId: 'BREPUUS' },
+      terms: ['BREPUUS'],
     });
   });
 

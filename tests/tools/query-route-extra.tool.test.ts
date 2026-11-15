@@ -499,6 +499,146 @@ describe('queryRouteTool — additional coverage', () => {
     });
   });
 
+  /**
+   * #106 — a weekly bound with hour 24–99 is sent as written; EIA reads it as a
+   * later day, and the answer's periods say whether that day stepped over a
+   * week-ending date. The reading table lives in period-bounds.test.ts; these
+   * cases prove the wiring: each side, a crossing and none, the zero-row
+   * branch, and the frequency EIA reports rather than the one requested.
+   */
+  describe('weekly bound with an hour past 23 (#106)', () => {
+    const weekly = (periods: string[], total = periods.length) => ({
+      route: 'petroleum/sum/sndw',
+      total,
+      dateFormat: 'YYYY-MM-DD',
+      frequency: 'weekly',
+      data: periods.map((period) => ({ period, series: 'WCESTUS1', value: '1', units: 'MBBL' })),
+      warnings: undefined,
+    });
+    const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+
+    it('sends the bound as written and echoes it (characterization)', async () => {
+      mockQuery.mockResolvedValue(weekly(['2024-02-02', '2024-02-09']));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'petroleum/sum/sndw',
+        filters: { series: 'WCESTUS1' },
+        frequency: 'weekly',
+        start: '2024-02-01T24',
+        end: '2024-02-09T24',
+      });
+      expect(result.isError).not.toBe(true);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery.mock.calls[0]?.[1]).toMatchObject({
+        start: '2024-02-01T24',
+        end: '2024-02-09T24',
+      });
+      expect(result.structuredContent).toMatchObject({
+        appliedStart: '2024-02-01T24',
+        appliedEnd: '2024-02-09T24',
+        returned_count: 2,
+      });
+      // Neither rolled day steps over a Friday.
+      expect(result.structuredContent).not.toHaveProperty('notice');
+    });
+
+    it('discloses a start that left a week out, on both surfaces', async () => {
+      mockQuery.mockResolvedValue(weekly(['2024-02-09', '2024-02-16']));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'petroleum/sum/sndw',
+        filters: { series: 'WCESTUS1' },
+        frequency: 'weekly',
+        start: '2024-02-02T24',
+        end: '2024-02-20',
+      });
+      expect(result.isError).not.toBe(true);
+      const sc = result.structuredContent as { notice: string; data: unknown[] };
+      expect(sc.data).toHaveLength(2);
+      for (const fragment of [
+        'read start "2024-02-02T24" as 2024-02-03',
+        'left out any period dated 2024-02-02',
+        'pass start "2024-02-02"',
+      ]) {
+        expect(sc.notice).toContain(fragment);
+        expect(textOf(result)).toContain(fragment);
+      }
+      expect(result.structuredContent).toMatchObject({ appliedStart: '2024-02-02T24' });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('discloses both sides when each steps over a period date', async () => {
+      mockQuery.mockResolvedValue(weekly(['2024-02-09']));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'petroleum/sum/sndw',
+        filters: { series: 'WCESTUS1' },
+        frequency: 'weekly',
+        start: '2024-01-30T99',
+        end: '2024-02-05T99',
+      });
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain('read start "2024-01-30T99" as 2024-02-03');
+      expect(notice).toContain('left out any period dated 2024-02-02');
+      expect(notice).toContain('read end "2024-02-05T99" as 2024-02-09');
+      expect(notice).toContain('took in any period dated 2024-02-09; pass end "2024-02-05"');
+    });
+
+    it('reads the frequency EIA reports when none was requested', async () => {
+      mockQuery.mockResolvedValue(weekly(['2024-02-09', '2024-02-16']));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'petroleum/sum/sndw',
+        filters: { series: 'WCESTUS1' },
+        start: '2024-02-02T24',
+      });
+      expect((result.structuredContent as { notice: string }).notice).toContain(
+        'At the effective weekly frequency, EIA read start "2024-02-02T24" as 2024-02-03',
+      );
+      expect(mockQuery.mock.calls[0]?.[1]).not.toHaveProperty('frequency');
+    });
+
+    it('adds nothing when the same bounds step over no period date', async () => {
+      // petroleum/pri/gnd weeks end on Monday.
+      mockQuery.mockResolvedValue({ ...weekly(['2024-02-05']), route: 'petroleum/pri/gnd' });
+      const result = await runToolContract(queryRouteTool, {
+        route: 'petroleum/pri/gnd',
+        frequency: 'weekly',
+        start: '2024-02-02T24',
+        end: '2024-02-08T24',
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(textOf(result)).not.toContain('EIA read');
+    });
+
+    it('names EIA’s reading beside the empty-result notice when no rows came back', async () => {
+      mockQuery.mockResolvedValue(weekly([]));
+      const result = await runToolContract(queryRouteTool, {
+        route: 'petroleum/sum/sndw',
+        filters: { series: 'WCESTUS1' },
+        frequency: 'weekly',
+        start: '2024-02-02T24',
+        end: '2024-02-08',
+      });
+      expect(result.isError).not.toBe(true);
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain('No rows matched');
+      expect(notice).toContain(
+        'EIA read start "2024-02-02T24" as 2024-02-03 (hour 24 carries into the next day); pass start "2024-02-02" to have it read as the day it names.',
+      );
+      expect(textOf(result)).toContain('EIA read start "2024-02-02T24" as 2024-02-03');
+    });
+
+    it('adds nothing at a frequency #101 already checks before the request', async () => {
+      mockQuery.mockResolvedValue({ ...BASE_RESPONSE, frequency: 'monthly' });
+      const result = await runToolContract(queryRouteTool, {
+        route: 'electricity/retail-sales',
+        frequency: 'monthly',
+        start: '2024-01-15T99',
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).not.toHaveProperty('notice');
+    });
+  });
+
   // ------------------------------------------------------------------
   // Enrichment: appliedFilters when filters are provided
   // ------------------------------------------------------------------

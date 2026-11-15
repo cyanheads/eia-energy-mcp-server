@@ -4,7 +4,9 @@
  * search. Exposes browse, describe, query, and search methods consumed by MCP
  * tool handlers. All three route-taking methods normalize the path first, so
  * one route resolves the same way however it is spelled and the node map and
- * per-route metadata cache hold a single entry for it. `query()` also walks
+ * per-route metadata cache hold a single entry for it; a path naming an EIA
+ * endpoint (`{route}/data`, `{route}/facet[/{id}]`, `seriesid/{id}`) is refused
+ * there, before any request. `query()` also walks
  * `offset` pages past the inline preview when the caller asks for a
  * canvas-bound row set, bounded by EIA_CANVAS_MAX_ROWS.
  * Facet values reach the search index from three directions: a bounded pass
@@ -279,28 +281,114 @@ function awaitShared(
   });
 }
 
+/** Where `route_not_found` sends a caller with nothing more specific to try. */
+const ROOT_HINT = 'Call eia_browse_routes without a path to see valid top-level categories.';
+
+/** A stand-in for the configured base URL, one path segment deep like `/v2`. */
+const ROUTE_BASE = 'https://route.invalid/v2';
+const ROUTE_BASE_PATH = new URL(ROUTE_BASE).pathname;
+
 /**
- * Canonical spelling of a route path: trim whitespace, normalize slashes, then
- * remove exactly one complete leading v2 segment. EIA's docs write routes as
- * `/v2/electricity/retail-sales/`, so those spellings reach the tools verbatim,
- * while the node map and the per-route metadata cache are keyed on the bare
- * form. Normalizing at the service boundary is what makes every spelling resolve
- * against the cached tree — and what keeps one route from occupying three cache
- * entries and costing three facet fan-outs.
+ * The route a caller's path names: whitespace trimmed, empty and blank segments
+ * dropped, then exactly one complete leading v2 segment removed. EIA's docs
+ * write routes as `/v2/electricity/retail-sales/`, so those spellings reach the
+ * tools verbatim, while the node map and the per-route metadata cache are keyed
+ * on the bare form. Normalizing at the service boundary is what makes every
+ * spelling resolve against the cached tree — and what keeps one route from
+ * occupying three cache entries and costing three facet fan-outs.
+ *
+ * The path is read as `buildUrl` sends it: the URL parser turns `\` into `/`,
+ * drops tabs and line breaks, resolves `.` and `..` segments, and cuts the path
+ * at `?` or `#`, so the route checked and cached is the one EIA receives. A path
+ * that `..` takes above the API root names no route.
+ *
+ * A path naming one of EIA's endpoints instead of a route — a `data` or `facet`
+ * segment, or a leading `seriesid` segment, compared percent-decoded — is
+ * refused here as `route_not_found` (`endpointPathRefused`), so nothing is
+ * fetched or cached for it: EIA answers `{route}/data`, `{route}/facet[/{id}]`,
+ * and `seriesid/{id}` with rows or value lists that read as leaf metadata. No
+ * route in the taxonomy has such a segment, and a segment that only contains
+ * one of those words is a route segment like any other.
  */
-function normalizeRoutePath(path: string): string {
-  const normalized = path
-    .trim()
-    .replace(/\/{2,}/g, '/')
-    .replace(/^\/+|\/+$/g, '');
-  return normalized === 'v2' ? '' : normalized.startsWith('v2/') ? normalized.slice(3) : normalized;
+function canonicalRoute(path: string): string {
+  const trimmed = path.trim();
+  // The same parse `buildUrl` applies to `${baseUrl}/${path}`, under a base of the same depth.
+  const { pathname } = new URL(`${ROUTE_BASE}/${trimmed}`);
+  if (pathname !== ROUTE_BASE_PATH && !pathname.startsWith(`${ROUTE_BASE_PATH}/`)) {
+    throw routeNotFound(trimmed);
+  }
+  const segments = pathname
+    .slice(ROUTE_BASE_PATH.length)
+    .split('/')
+    .filter((segment) => decodeSegment(segment).trim() !== '');
+  if (segments[0] === 'v2') segments.shift();
+  const names = segments.map(decodeSegment);
+  const at =
+    names[0] === 'seriesid' ? 0 : names.findIndex((name) => name === 'data' || name === 'facet');
+  if (at !== -1) throw endpointPathRefused(segments, names, at);
+  return segments.join('/');
+}
+
+/** A path segment percent-decoded, or as written when its escapes are malformed. */
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+/**
+ * The `route_not_found` failure for a path whose segment `at` names an EIA
+ * endpoint (`names` holds the segments percent-decoded). The hint names what to
+ * send instead: the route before the segment, with the facet to describe for a
+ * facet path, or the series ID to search for a `seriesid` path. Each value the
+ * hint quotes renders as code.
+ */
+function endpointPathRefused(segments: string[], names: string[], at: number): McpError {
+  const route = segments.join('/');
+  const refuse = (hint: string, sendBack: string[] = []) =>
+    notFound(
+      `Route ${route} is an EIA API endpoint, not a route in the EIA taxonomy.`,
+      { reason: 'route_not_found', recovery: { hint } },
+      // The refused path contains the route the hint quotes. Listing the path
+      // too lets its longer match win, so the message renders the whole path
+      // as code rather than the route inside it.
+      sendBack.length > 0 ? { literals: [route, ...sendBack] } : undefined,
+    );
+  const base = segments.slice(0, at).join('/');
+  const next = segments[at + 1];
+
+  if (names[at] === 'seriesid') {
+    return next
+      ? refuse(
+          `Pass the series ID ${next} to eia_search_routes, which resolves it to its route, filters, frequency, and columns.`,
+          [next],
+        )
+      : refuse(
+          'Pass a legacy APIv1 series ID such as PET.RWTC.W to eia_search_routes, which resolves it to its route, filters, frequency, and columns.',
+        );
+  }
+  if (!base) return refuse(ROOT_HINT);
+  if (names[at] === 'data') {
+    return refuse(
+      `Resend the same call with route ${base}, the route before /data; the server requests EIA's /data endpoint itself.`,
+      [base],
+    );
+  }
+  return next
+    ? refuse(
+        `Pass route ${base}, the route before /facet. To list the values of facet ${next}, call eia_describe_route with route ${base} and facet ${next}.`,
+        [base, next],
+      )
+    : refuse(
+        `Pass route ${base}, the route before /facet. eia_describe_route with route ${base} lists its facets and their values.`,
+        [base],
+      );
 }
 
 /** The `route_not_found` failure for a route absent from the EIA taxonomy. */
-function routeNotFound(
-  route: string,
-  hint = 'Call eia_browse_routes without a path to see valid top-level categories.',
-): McpError {
+function routeNotFound(route: string, hint = ROOT_HINT): McpError {
   return notFound(`Route "${route}" not found in the EIA taxonomy.`, {
     reason: 'route_not_found',
     recovery: { hint },
@@ -1362,10 +1450,11 @@ class EiaApiService {
   /**
    * Browse child routes at a given path. Returns list of children with leaf
    * classification. The path is normalized first, so a leading, trailing, or
-   * doubled slash resolves against the node map instead of missing it. A path
-   * the warm left incomplete is re-fetched here rather than answered from its
-   * stub, which would report no children and a leaf classification the server
-   * never established.
+   * doubled slash resolves against the node map instead of missing it, and an
+   * EIA endpoint path is refused before the tree is awaited or a live browse
+   * could call it a leaf. A path the warm left incomplete is re-fetched here
+   * rather than answered from its stub, which would report no children and a
+   * leaf classification the server never established.
    */
   async browse(
     path: string | undefined,
@@ -1376,7 +1465,7 @@ class EiaApiService {
     isLeaf: boolean;
   }> {
     const deadlineAt = Date.now() + CALL_DEADLINE_MS;
-    const normalizedPath = normalizeRoutePath(path ?? '');
+    const normalizedPath = canonicalRoute(path ?? '');
     if (!(await this.ensureTreeWarmed(ctx))) {
       return this.browseLive(normalizedPath, ctx, deadlineAt);
     }
@@ -1452,7 +1541,8 @@ class EiaApiService {
    * Describe a leaf route — returns full metadata including facets with values.
    * The route is normalized first, so every spelling of one path shares a
    * single metadata cache entry and a single facet fan-out; `meta.route` is
-   * therefore the canonical form, which is what the tool echoes back.
+   * therefore the canonical form, which is what the tool echoes back. An EIA
+   * endpoint path is refused before the cache is read or anything is fetched.
    *
    * Facet value lists are fetched for every facet the entry names in
    * `unfetchedFacets`: all of them on a first describe, and afterwards only the
@@ -1480,7 +1570,7 @@ class EiaApiService {
     opts: { facet?: string } = {},
   ): Promise<RouteMetadata> {
     const deadlineAt = Date.now() + CALL_DEADLINE_MS;
-    const normalizedRoute = normalizeRoutePath(route);
+    const normalizedRoute = canonicalRoute(route);
 
     const cached = _routeMetaCache.get(normalizedRoute);
     if (cached && !isExpired(cached.fetchedAt, Date.now())) {
@@ -1713,7 +1803,9 @@ class EiaApiService {
    * values per EIA API), total count, the canonical `route` the query resolved
    * to, and any top-level EIA warnings. The route is normalized first, so the
    * cached leaf/category pre-flight and the metadata cache apply to every
-   * spelling rather than only the bare one.
+   * spelling rather than only the bare one, and an EIA endpoint path is refused
+   * before any request. A query on `{route}/data` would send `{route}/data/data`,
+   * which EIA answers with the route's own rows under a path that is no route.
    *
    * With `accumulate`, additional offset pages are fetched and returned under
    * `accumulated` for canvas registration — bounded by `EIA_CANVAS_MAX_ROWS`
@@ -1736,7 +1828,7 @@ class EiaApiService {
     ctx: Context,
   ): Promise<DataResponse> {
     const deadlineAt = Date.now() + CALL_DEADLINE_MS;
-    const normalizedRoute = normalizeRoutePath(route);
+    const normalizedRoute = canonicalRoute(route);
     /**
      * Bounds are checked before any request, the warm included: in full at an
      * explicit frequency, and without one for the month or hour no frequency reads.

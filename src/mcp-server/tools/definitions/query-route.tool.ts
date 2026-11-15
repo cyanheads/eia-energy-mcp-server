@@ -17,7 +17,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { type ColumnRename, getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 import { getEiaApiService } from '@/services/eia/eia-service.js';
-import { invertedRange } from '@/services/eia/period-bounds.js';
+import { invertedRange, rolledWeekBound } from '@/services/eia/period-bounds.js';
 import type { EiaWarning } from '@/services/eia/types.js';
 import { clampCount, countSchema, modeDescription } from '../count-limit.js';
 import { literalTableCell, tableRow } from '../literal-table-cell.js';
@@ -194,7 +194,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .min(1)
       .describe(
-        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales". Full URLs and /data suffixes are not normalized.',
+        'Leaf route path (e.g. "electricity/retail-sales", "steo"). Discoverable via eia_browse_routes or eia_search_routes. Whitespace and slashes are normalized, then one complete leading v2 segment is removed: "/v2/electricity/retail-sales/" resolves to "electricity/retail-sales". A path naming an EIA endpoint is refused: pass the route before its data or facet segment ("petroleum/pri/spt", not "petroleum/pri/spt/data" or "petroleum/pri/spt/facet/series"), and give the ID of a seriesid/{id} path to eia_search_routes. Full URLs are not normalized.',
       ),
     filters: z
       .record(z.string(), z.union([z.string(), z.array(z.string())]))
@@ -294,7 +294,7 @@ export const queryRouteTool = tool('eia_query_route', {
       .string()
       .optional()
       .describe(
-        'Composed guidance for empty results or an offset past total, unmatched filter values in complete cached vocabularies, year-only bounds on effective monthly YYYY-MM data, and requested/effective length when clamped. Submitted filters and date bounds are preserved.',
+        'Composed guidance for empty results or an offset past total, unmatched filter values in complete cached vocabularies, year-only bounds on effective monthly YYYY-MM data, a weekly or four-week-average bound whose hour past 23 EIA read as a later day past a period date, which moves the range by a week (or, with no rows, how EIA read it), and requested/effective length when clamped. Submitted filters and date bounds are preserved.',
       ),
     dataset: z
       .string()
@@ -398,7 +398,7 @@ export const queryRouteTool = tool('eia_query_route', {
       reason: 'route_not_found',
       thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Route does not exist in the EIA taxonomy.',
+      when: 'Route does not exist in the EIA taxonomy, or names an EIA endpoint rather than a route: a data or facet segment, or a leading seriesid segment.',
       recovery: 'Use eia_browse_routes or eia_search_routes to find a valid leaf route path.',
     },
     {
@@ -559,6 +559,17 @@ export const queryRouteTool = tool('eia_query_route', {
 
     const notices = [...(dataResp.notices ?? [])];
     if (length.notice) notices.push(length.notice);
+    /**
+     * A weekly bound with an hour 24–99 was sent as written; whether EIA's
+     * reading of it stepped over a week-ending date shows only in the periods
+     * it answered with, so it is disclosed here, never refused.
+     */
+    const periods = fetched.map((row) => row.period);
+    for (const side of ['start', 'end'] as const) {
+      const value = input[side];
+      const rolled = value && rolledWeekBound(side, value, dataResp.frequency, periods);
+      if (rolled) notices.push(rolled);
+    }
     // Only monthly year-bound interpretation has been verified against EIA.
     if (dataResp.frequency === 'monthly' && dataResp.dateFormat === 'YYYY-MM') {
       for (const bound of ['start', 'end'] as const) {
